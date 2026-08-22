@@ -1,8 +1,12 @@
 package session
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
 
-import "github.com/satoricorp/demux/capture"
+	"github.com/satoricorp/demux/capture"
+)
 
 func TestIndexObserveSummarizesEdits(t *testing.T) {
 	index := NewIndex()
@@ -38,4 +42,60 @@ func TestSessionsMostRecentFirst(t *testing.T) {
 	if len(sessions) != 2 || sessions[0].ID != "new" {
 		t.Fatalf("sessions = %v, want most recently active first", sessions)
 	}
+}
+
+func TestStateFromSilence(t *testing.T) {
+	now := int64(10_000_000)
+	cases := []struct {
+		age  int64
+		want State
+	}{
+		{0, StateLive},
+		{LiveWindow - 1, StateLive},
+		{LiveWindow + 1, StateIdle},
+		{IdleWindow + 1, StateEnded},
+	}
+	for _, testCase := range cases {
+		got := Session{LastActiveAt: now - testCase.age}.State(now)
+		if got != testCase.want {
+			t.Errorf("session silent for %dms = %q, want %q", testCase.age, got, testCase.want)
+		}
+	}
+}
+
+func TestObserveRecordsRepoRootAndSummary(t *testing.T) {
+	index := NewIndex()
+	index.Observe(capture.SessionEvent{
+		SessionID:     "s1",
+		Kind:          capture.KindMessage,
+		TS:            1,
+		PromptContext: "fix the billing rounding bug\nsecond line ignored",
+		Raw:           rawCWD("/repo"),
+	})
+	got, _ := index.Get("s1")
+	if got.RepoRoot != "/repo" {
+		t.Errorf("repo root = %q, want /repo", got.RepoRoot)
+	}
+	if got.Summary != "fix the billing rounding bug" {
+		t.Errorf("summary = %q, want the first prompt line only", got.Summary)
+	}
+}
+
+func TestSummaryRedactsSecrets(t *testing.T) {
+	index := NewIndex()
+	index.Observe(capture.SessionEvent{
+		SessionID:     "s1",
+		Kind:          capture.KindMessage,
+		TS:            1,
+		PromptContext: "deploy with ghp_012345678901234567890123456789012345",
+	})
+	got, _ := index.Get("s1")
+	if strings.Contains(got.Summary, "ghp_012345678901234567890123456789012345") {
+		t.Fatalf("summary = %q; a session summary rides onto plans and must be redacted", got.Summary)
+	}
+}
+
+func rawCWD(dir string) map[string]json.RawMessage {
+	encoded, _ := json.Marshal(dir)
+	return map[string]json.RawMessage{"cwd": encoded}
 }

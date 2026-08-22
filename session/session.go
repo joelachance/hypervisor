@@ -11,6 +11,28 @@ import (
 	"strings"
 
 	"github.com/satoricorp/demux/capture"
+	"github.com/satoricorp/demux/redact"
+	"github.com/satoricorp/hv/parse"
+)
+
+// State is how alive a session is, judged by how recently it wrote to its log.
+type State string
+
+const (
+	// StateLive means the session wrote within LiveWindow - an agent is
+	// probably working in it right now.
+	StateLive State = "live"
+	// StateIdle means it wrote within IdleWindow: still open, between turns.
+	StateIdle State = "idle"
+	// StateEnded means it has been quiet longer than that.
+	StateEnded State = "ended"
+)
+
+// The windows separating those states. A session log is written on every turn,
+// so silence is the only liveness signal available without asking the tool.
+const (
+	LiveWindow = 3 * 60 * 1000      // 3 minutes in milliseconds
+	IdleWindow = 2 * 60 * 60 * 1000 // 2 hours in milliseconds
 )
 
 // Session is one agent coding session, summarized for selection.
@@ -37,6 +59,18 @@ type Session struct {
 	// Summary is a short human label for the session, taken from its first
 	// prompt. It is secret-redacted before it is ever carried onto a plan.
 	Summary string `json:"summary,omitempty"`
+}
+
+// State reports how alive the session is at the given time, in unix millis.
+func (s Session) State(now int64) State {
+	switch age := now - s.LastActiveAt; {
+	case age <= LiveWindow:
+		return StateLive
+	case age <= IdleWindow:
+		return StateIdle
+	default:
+		return StateEnded
+	}
 }
 
 // Active reports whether the session was touched within the last window
@@ -94,6 +128,12 @@ func (i *Index) Observe(event capture.SessionEvent) {
 	if model := strings.TrimSpace(event.Model); model != "" {
 		current.Model = model
 	}
+	if root := strings.TrimSpace(parse.CWD(event)); root != "" && current.RepoRoot == "" {
+		current.RepoRoot = root
+	}
+	if current.Summary == "" && event.Kind == capture.KindMessage {
+		current.Summary = summarize(event.PromptContext)
+	}
 	current.EventCount++
 	if event.IsEditEvent() {
 		current.EditCount++
@@ -101,8 +141,24 @@ func (i *Index) Observe(event capture.SessionEvent) {
 			i.files[id][file] = struct{}{}
 		}
 	}
-	// TODO(hv): derive RepoRoot from the edited paths, and Summary from the
-	// first KindMessage event, redacted via demux/redact before it is stored.
+}
+
+// summarize turns a prompt into a one-line label. It redacts first: session
+// text rides onto plans, and a leaked key there outlives the session.
+func summarize(prompt string) string {
+	prompt = strings.TrimSpace(redact.Redact(prompt))
+	if prompt == "" {
+		return ""
+	}
+	if index := strings.IndexByte(prompt, '\n'); index >= 0 {
+		prompt = prompt[:index]
+	}
+	prompt = strings.Join(strings.Fields(prompt), " ")
+	const limit = 72
+	if len(prompt) > limit {
+		return prompt[:limit-1] + "\u2026"
+	}
+	return prompt
 }
 
 // Get returns one session by ID.
