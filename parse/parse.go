@@ -34,6 +34,20 @@ type Parser interface {
 	ParseLine(path string, line []byte) ([]capture.SessionEvent, error)
 }
 
+// Untimed is implemented by parsers whose format carries no per-record
+// timestamps. Only for those may a caller substitute the log file's
+// modification time; doing it for a timed format would turn "this file was
+// touched" into "this session is active", which is a different claim.
+type Untimed interface {
+	Untimed() bool
+}
+
+// IsUntimed reports whether a parser's format lacks record timestamps.
+func IsUntimed(parser Parser) bool {
+	untimed, ok := parser.(Untimed)
+	return ok && untimed.Untimed()
+}
+
 // Registry dispatches log files to the parser that owns them.
 type Registry struct {
 	parsers []Parser
@@ -138,6 +152,35 @@ func home(parts ...string) string {
 		return ""
 	}
 	return filepath.Join(append([]string{dir}, parts...)...)
+}
+
+// RawTitle is the key under which parsers stash a session's own title - the
+// name its tool shows for it. A title is a property of the session, not of the
+// record that happens to announce it, so it travels the same way cwd does.
+const RawTitle = "title"
+
+// Title returns the session title a parser recorded on an event.
+func Title(event capture.SessionEvent) string {
+	var title string
+	if encoded, ok := event.Raw[RawTitle]; ok {
+		if err := json.Unmarshal(encoded, &title); err == nil {
+			return title
+		}
+	}
+	return ""
+}
+
+// rawTitle builds the Raw bag carrying a session title.
+func rawTitle(title string) map[string]json.RawMessage {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return nil
+	}
+	encoded, err := json.Marshal(title)
+	if err != nil {
+		return nil
+	}
+	return map[string]json.RawMessage{RawTitle: encoded}
 }
 
 // RawCWD is the key under which parsers stash a session's working directory on

@@ -144,9 +144,9 @@ func Interactive(in io.Reader, out io.Writer, sessions []session.Session, now in
 		return nil, nil
 	}
 	for index, current := range sessions {
-		fmt.Fprintf(out, "  %2d  %-5s %-8s %3d edits  %-12s %s\n",
-			index+1, current.State(now), current.Tool, current.EditCount,
-			shortID(current.ID), summaryOf(current))
+		fmt.Fprintf(out, "  %2d  %-6s %-7s %-13s %3d edits  %s\n",
+			index+1, current.State(now), current.Tool, shortID(current.ID),
+			current.EditCount, current.Label())
 	}
 	fmt.Fprintf(out, "\nselect sessions to merge [1-%d, comma separated, or all]: ", len(sessions))
 
@@ -203,19 +203,9 @@ func parseRange(field string, count int) (int, int, error) {
 	return low, high, nil
 }
 
-// Live restricts a filter to sessions an agent is plausibly still working in.
-func Live(now time.Time) Filter {
-	return Filter{Since: now.Add(-session.LiveWindow * time.Millisecond).UnixMilli()}
-}
-
-func summaryOf(current session.Session) string {
-	if summary := strings.TrimSpace(current.Summary); summary != "" {
-		return summary
-	}
-	if root := strings.TrimSpace(current.RepoRoot); root != "" {
-		return root
-	}
-	return "(no prompt recorded)"
+// Active restricts a filter to sessions written within session.ActiveWindow.
+func Active(now time.Time) Filter {
+	return Filter{Since: now.Add(-session.ActiveWindow * time.Millisecond).UnixMilli()}
 }
 
 func shortID(id string) string {

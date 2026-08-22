@@ -44,6 +44,11 @@ type cursorRecord struct {
 	Message json.RawMessage `json:"message"`
 }
 
+// Untimed implements the Untimed interface: Cursor transcripts carry no
+// timestamps at all, so the log file's modification time is the only clock
+// available for them.
+func (c *Cursor) Untimed() bool { return true }
+
 // ParseLine implements Parser.
 func (c *Cursor) ParseLine(path string, line []byte) ([]capture.SessionEvent, error) {
 	var record cursorRecord
@@ -59,9 +64,8 @@ func (c *Cursor) ParseLine(path string, line []byte) ([]capture.SessionEvent, er
 		Kind:      capture.KindMessage,
 		Raw:       rawContext(CursorRepoRoot(path)),
 	}
-	// TODO(hv): transcripts carry no timestamp. The watcher stamps sessions
-	// from the log file's modification time instead; per-record timing would
-	// need the SQLite store.
+	// Transcripts carry no timestamp; the watcher stamps them from the log
+	// file's modification time. Per-record timing needs the SQLite store.
 	return []capture.SessionEvent{event}, nil
 }
 

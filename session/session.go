@@ -15,25 +15,24 @@ import (
 	"github.com/satoricorp/hv/parse"
 )
 
-// State is how alive a session is, judged by how recently it wrote to its log.
+// State is whether a session is being worked in right now.
 type State string
 
 const (
-	// StateLive means the session wrote within LiveWindow - an agent is
-	// probably working in it right now.
-	StateLive State = "live"
-	// StateIdle means it wrote within IdleWindow: still open, between turns.
-	StateIdle State = "idle"
-	// StateEnded means it has been quiet longer than that.
-	StateEnded State = "ended"
+	// StateActive means the session wrote to its log within ActiveWindow.
+	StateActive State = "active"
+	// StateStale means it has been quiet longer than that.
+	StateStale State = "stale"
 )
 
-// The windows separating those states. A session log is written on every turn,
-// so silence is the only liveness signal available without asking the tool.
-const (
-	LiveWindow = 3 * 60 * 1000      // 3 minutes in milliseconds
-	IdleWindow = 2 * 60 * 60 * 1000 // 2 hours in milliseconds
-)
+// ActiveWindow is how recently a session must have written to count as active.
+//
+// A log is written on every turn, so silence is the only signal available
+// without asking the tool - and it cannot separate a session someone still has
+// open from one they finished with. Ten minutes is long enough to survive a
+// person reading output or thinking, and short enough that yesterday's work
+// does not claim to be live.
+const ActiveWindow = 10 * 60 * 1000 // milliseconds
 
 // Session is one agent coding session, summarized for selection.
 type Session struct {
@@ -56,27 +55,40 @@ type Session struct {
 	// Files are the paths the session edited, repo-relative when RepoRoot is
 	// known, sorted and deduplicated.
 	Files []string `json:"files,omitempty"`
+	// Title is the name the tool gave the session - what its own UI shows.
+	// Claude Code names a session once it knows what it is about; the other
+	// tools do not name sessions at all.
+	Title string `json:"title,omitempty"`
 	// Summary is a short human label for the session, taken from its first
-	// prompt. It is secret-redacted before it is ever carried onto a plan.
+	// prompt. It is the fallback when the tool supplied no Title, and it is
+	// secret-redacted before it is ever carried onto a plan.
 	Summary string `json:"summary,omitempty"`
 }
 
-// State reports how alive the session is at the given time, in unix millis.
+// State reports whether the session is active at the given time, in unix
+// millis, using ActiveWindow.
 func (s Session) State(now int64) State {
-	switch age := now - s.LastActiveAt; {
-	case age <= LiveWindow:
-		return StateLive
-	case age <= IdleWindow:
-		return StateIdle
-	default:
-		return StateEnded
-	}
+	return s.StateWithin(now, ActiveWindow)
 }
 
-// Active reports whether the session was touched within the last window
-// milliseconds relative to now.
-func (s Session) Active(now, window int64) bool {
-	return now-s.LastActiveAt <= window
+// StateWithin reports activity against a caller-chosen window.
+func (s Session) StateWithin(now, window int64) State {
+	if now-s.LastActiveAt <= window {
+		return StateActive
+	}
+	return StateStale
+}
+
+// Label is what to call this session: the tool's own title when it has one,
+// the first prompt when it does not.
+func (s Session) Label() string {
+	if title := strings.TrimSpace(s.Title); title != "" {
+		return title
+	}
+	if summary := strings.TrimSpace(s.Summary); summary != "" {
+		return summary
+	}
+	return "(untitled)"
 }
 
 // Touched reports whether the session edited the given path.
@@ -122,7 +134,7 @@ func (i *Index) Observe(event capture.SessionEvent) {
 	if event.TS > current.LastActiveAt {
 		current.LastActiveAt = event.TS
 	}
-	if event.TS < current.StartedAt || current.StartedAt == 0 {
+	if event.TS > 0 && (event.TS < current.StartedAt || current.StartedAt == 0) {
 		current.StartedAt = event.TS
 	}
 	if model := strings.TrimSpace(event.Model); model != "" {
@@ -130,6 +142,10 @@ func (i *Index) Observe(event capture.SessionEvent) {
 	}
 	if root := strings.TrimSpace(parse.CWD(event)); root != "" && current.RepoRoot == "" {
 		current.RepoRoot = root
+	}
+	// A session can be renamed, and the last name is the one its UI shows.
+	if title := strings.TrimSpace(parse.Title(event)); title != "" {
+		current.Title = title
 	}
 	if current.Summary == "" && event.Kind == capture.KindMessage {
 		current.Summary = summarize(event.PromptContext)

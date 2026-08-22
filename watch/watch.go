@@ -157,13 +157,18 @@ func (w *Watcher) tail(path string) ([]capture.SessionEvent, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Not every format timestamps its records - Cursor transcripts carry no
-	// time at all. The file's modification time is the best available stamp,
-	// and without one the session sorts and filters as if it were epoch.
-	stamp := info.ModTime().UnixMilli()
-	for index := range events {
-		if events[index].TS == 0 {
-			events[index].TS = stamp
+	// Cursor transcripts carry no time at all, so their events are stamped
+	// from the log file instead - without a stamp they sort as if they had
+	// happened at epoch. This is deliberately limited to formats that declare
+	// themselves untimed: a timed format's zero-timestamp records are records
+	// that carry no time *on purpose* (a rename, a mode switch), and stamping
+	// them would report a touched file as a working agent.
+	if parse.IsUntimed(parser) {
+		stamp := info.ModTime().UnixMilli()
+		for index := range events {
+			if events[index].TS == 0 {
+				events[index].TS = stamp
+			}
 		}
 	}
 	// TODO(hv): a sweep can land mid-write and cut the final line in half.

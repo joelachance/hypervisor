@@ -157,3 +157,30 @@ func TestStripHeredocsRemovesBodies(t *testing.T) {
 		t.Fatalf("writes = %v, want [real.go after.go] - the body must not count", writes)
 	}
 }
+
+// Claude Code names a session once it knows what it is about, and that name is
+// what its UI shows. A rename carries no timestamp: it is not activity.
+func TestClaudeAITitleCarriesTheSessionName(t *testing.T) {
+	line := claudeLine(`{"type":"ai-title","sessionId":"s1","aiTitle":"How demux works"}`)
+	events, err := (&Claude{}).ParseLine("/logs/s1.jsonl", line)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("ParseLine() = %v, %v; want the title event", events, err)
+	}
+	if Title(events[0]) != "How demux works" {
+		t.Errorf("title = %q, want the aiTitle", Title(events[0]))
+	}
+	if events[0].TS != 0 {
+		t.Errorf("ts = %d, want zero - a rename is not activity", events[0].TS)
+	}
+}
+
+// Only a format that declares itself untimed may borrow the log file's
+// modification time; a touched file is not a working agent.
+func TestOnlyCursorDeclaresItselfUntimed(t *testing.T) {
+	if IsUntimed(NewClaude()) || IsUntimed(NewCodex()) {
+		t.Error("a timestamped format must not be treated as untimed")
+	}
+	if !IsUntimed(NewCursor()) {
+		t.Error("Cursor transcripts carry no timestamps and must declare it")
+	}
+}

@@ -73,8 +73,8 @@ func scan(maxAge time.Duration) (*watch.Watcher, []capture.SessionEvent, error) 
 func sessionsCmd(args []string) error {
 	flags := flag.NewFlagSet("sessions", flag.ExitOnError)
 	tool := flags.String("tool", "", "restrict to one tool (claude, codex, cursor)")
-	since := flags.Duration("since", 24*time.Hour, "only sessions active within this window")
-	state := flags.String("state", "", "restrict to live, idle, or ended sessions")
+	since := flags.Duration("since", 7*24*time.Hour, "only sessions that wrote within this window")
+	state := flags.String("state", "", "restrict to active or stale sessions")
 	repo := flags.String("repo", "", "restrict to sessions that worked in this directory")
 	limit := flags.Int("limit", 25, "maximum sessions to list")
 	asJSON := flags.Bool("json", false, "print sessions as JSON")
@@ -103,14 +103,14 @@ func sessionsCmd(args []string) error {
 		return json.NewEncoder(os.Stdout).Encode(sessions)
 	}
 	if len(sessions) == 0 {
-		fmt.Printf("no coding sessions active in the last %s\n", *since)
+		fmt.Printf("no coding sessions wrote a log in the last %s\n", *since)
 		return nil
 	}
 	for _, current := range sessions {
-		fmt.Printf("%-5s %-7s %-13s %3d edits  %-19s %s\n",
-			current.State(now.UnixMilli()), current.Tool, shortID(current.ID), current.EditCount,
-			time.UnixMilli(current.LastActiveAt).Format("01-02 15:04:05"),
-			firstNonEmpty(current.Summary, current.RepoRoot))
+		fmt.Printf("%-6s %-7s %-38s %-13s %3d edits  %s\n",
+			current.State(now.UnixMilli()), current.Tool, truncate(current.Label(), 38),
+			current.ID[:min(13, len(current.ID))], current.EditCount,
+			humanAge(now.UnixMilli()-current.LastActiveAt))
 	}
 	return nil
 }
@@ -268,11 +268,25 @@ func shortID(id string) string {
 	return id
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
+// humanAge renders how long ago a session last wrote, which is the evidence
+// behind its active/stale label.
+func humanAge(millis int64) string {
+	age := time.Duration(millis) * time.Millisecond
+	switch {
+	case age < time.Minute:
+		return "just now"
+	case age < time.Hour:
+		return fmt.Sprintf("%dm ago", int(age.Minutes()))
+	case age < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(age.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(age.Hours()/24))
 	}
-	return ""
+}
+
+func truncate(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit-1] + "\u2026"
 }

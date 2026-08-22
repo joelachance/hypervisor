@@ -40,6 +40,7 @@ type claudeRecord struct {
 	Timestamp string          `json:"timestamp"`
 	CWD       string          `json:"cwd"`
 	Message   json.RawMessage `json:"message"`
+	AITitle   string          `json:"aiTitle"`
 }
 
 type claudeMessage struct {
@@ -94,6 +95,15 @@ func (c *Claude) ParseLine(path string, line []byte) ([]capture.SessionEvent, er
 		return c.assistantEvents(base, record)
 	case "user":
 		return c.userEvents(base, record)
+	case "ai-title":
+		// Claude Code names a session once it knows what it is about, and that
+		// name is what the app shows. It is worth far more as a label than the
+		// first prompt, which is often a paste, a caveat block, or a slash
+		// command. The record carries no timestamp: a rename is not activity.
+		base.Kind = capture.KindMessage
+		base.TS = 0
+		base.Raw = rawTitle(record.AITitle)
+		return []capture.SessionEvent{base}, nil
 	default:
 		return nil, nil
 	}
