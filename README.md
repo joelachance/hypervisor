@@ -19,37 +19,78 @@ session logs (claude/codex/cursor)
 
 ## Status
 
-Scaffold. Every package has its types and function signatures; the bodies are
-stubs marked `TODO(hv)`. Nothing parses a real log yet.
+Working end to end against real session logs. `hv merge` finds the sessions
+that edited this repo, asks which to merge, attributes their edits to hunks,
+and prints demux's revision plan with provenance stamped on each revision.
 
 ## Commands
 
 ```bash
 go build -o hv ./cmd/hv
 
-hv sessions          # list known coding sessions
-hv watch             # tail session logs and print events as they land
-hv plan -session ID  # plan the working tree, attributing hunks to a session
+hv sessions                  # live / idle / ended sessions, newest first
+hv sessions -tool codex      # one tool; -state live; -since 6h; -json
+hv watch                     # tail edits as they land
+hv merge                     # pick sessions in this repo, plan their changes
+hv merge -session a1b2,c3d4  # merge named sessions without the picker
+hv merge -all -repair -json  # every candidate, repaired, as a plan packet
 ```
 
-## Packages
+## How sessions register
+
+There is no daemon and no registry. Every sweep walks the log roots, tails
+what each file appended since last time, and folds the events into an index.
+A session exists because its log does.
+
+| Tool | Store | Edits visible | Repo resolved from |
+|---|---|---|---|
+| Claude Code | `~/.claude/projects/<slug>/<uuid>.jsonl` | Edit, Write, MultiEdit, NotebookEdit, and Bash writes | `cwd` on each record |
+| Codex | `~/.codex/sessions/<date>/rollout-*.jsonl` | shell commands only | `cwd` on `session_meta` |
+| Cursor | `~/.cursor/projects/<slug>/agent-transcripts/**.jsonl` | none | project slug, verified against the filesystem |
+
+Liveness is inferred from silence, because a log is written on every turn:
+**live** under 3 minutes, **idle** under 2 hours, **ended** after that.
+
+Two findings from the real stores worth knowing:
+
+- **Codex has no edit tool.** Every file it writes goes through
+  `exec_command`. Claude Code does the same whenever it prefers Bash. So
+  `parse/shell.go` reads the commands themselves, recognizing only
+  unambiguous write forms and stripping heredoc bodies first. Those writes
+  carry no text, so only the temporal match tier can claim them - a shell
+  write can never produce a false exact match.
+- **Cursor transcripts are conversation only.** No timestamps, no tool calls,
+  no file paths. A Cursor session registers and resolves its repo, but
+  contributes no edit evidence; selecting one scopes nothing. Real Cursor
+  attribution needs its SQLite store, and therefore a SQLite dependency.
+
+## Merging n sessions
 
 ```
-session/     Session + SessionIndex: the selectable unit
-parse/       per-tool session log parsers -> capture.SessionEvent
-watch/       filesystem watcher over session log roots
-selection/   filters that turn "which sessions?" into a set
-match/       working-tree hunks -> matcher.HunkLink (exact/fuzzy/temporal)
-plan/        demux handoff: ComposeCaptureResult + Planner invocation
-cmd/hv/      CLI
+$ hv merge -C ~/git/hv
+   1  live  claude    34 edits  0be860ce-689 pull demux logic into ~/git/hv
+   2  idle  codex      6 edits  019ff782-de0 fix the rounding bug
+
+select sessions to merge [1-2, comma separated, or all]: 1,2
+
+plan demux-b301279c  state=ready_to_apply  hunks=34  revisions=8  sessions=2  attributed=100%
+
+u1   update parse/claude.go                 -> feature/parse
+       parse/claude.go
+       session 0be860ce-689 (matched)
 ```
+
+The selected sessions' files scope the diff; their events attribute each hunk;
+demux groups, orders, and routes. Selecting nothing plans the tree
+unattributed, which is what demux alone would do.
 
 ## The two-pass handoff
 
-Demux assigns hunk IDs (`h1`, `h2`, …) positionally while parsing the diff, and
-those IDs are what a `matcher.HunkLink` points at. hv therefore plans twice:
+Demux assigns hunk IDs (`h1`, `h2`, ...) positionally while parsing the diff,
+and those IDs are what a `matcher.HunkLink` points at. hv therefore plans
+twice:
 
-1. `ProposeFromDiff` with no capture — to learn the hunk catalog;
+1. `ProposeFromDiff` with no capture - to learn the hunk catalog;
 2. match the catalog's hunks against the selected sessions' events;
 3. `ProposeFromDiff` again, same diff, now carrying the links as evidence.
 
@@ -57,29 +98,18 @@ The second pass must receive a byte-identical diff and otherwise identical
 options, or the links land on the wrong hunks. `plan.Run` enforces this by
 building the diff once.
 
-## What is stubbed
+## What is still stubbed
 
-| Package | State |
+| Piece | State |
 |---|---|
-| `session` | working |
-| `selection` | working; `Interactive` is the identity function |
-| `watch` | working; can cut a record in half if a sweep lands mid-write |
-| `parse` | dispatch works; **no tool's records are decoded yet** |
-| `match` | temporal tier works; exact and fuzzy return no match |
-| `plan` | working end to end, including the git `ContentProbe` |
-| `cmd/hv` | working |
+| `match` exact tier | not implemented - returns no match |
+| `match` fuzzy tier | not implemented - returns no match |
+| temporal tier | works; attribution is by file and recency |
+| Cursor edit evidence | needs the SQLite store |
+| watcher mid-write records | a sweep landing mid-append can cut the last record |
 
-Until `parse` decodes real logs, `hv sessions` lists nothing and `hv plan`
-falls back to planning the whole working tree unattributed — which is exactly
-what `demux` alone does.
-
-## Next
-
-1. Decode Claude Code records (`parse/claude.go`) — the mapping is written down
-   in the TODO there; sidechain records carry their own session ID and must not
-   fold into the parent.
-2. Recover the repo root from Claude's project slug. The encoding is lossy, so
-   candidates need verifying against the filesystem.
-3. Implement the exact and fuzzy match tiers. They must stay deterministic —
-   everything downstream in the planner is.
-4. Build the interactive picker.
+Only the temporal tier runs today, so a hunk is attributed to whichever
+selected session last edited that file. That is right far more often than not
+and wrong in exactly one situation worth caring about: two sessions editing
+the same file in the same window. The exact tier is what fixes it - it must
+stay deterministic, because everything downstream in the planner is.
