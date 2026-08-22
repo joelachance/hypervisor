@@ -31,6 +31,12 @@ type Watcher struct {
 	registry *parse.Registry
 	interval time.Duration
 
+	// MaxAge skips log files untouched for longer than this. Session log
+	// roots accumulate for years - hundreds of files and hundreds of
+	// megabytes - and reading all of it to answer "what is running now" is
+	// waste. Zero reads everything.
+	MaxAge time.Duration
+
 	mu      sync.Mutex
 	index   *session.Index
 	offsets map[string]int64
@@ -151,6 +157,15 @@ func (w *Watcher) tail(path string) ([]capture.SessionEvent, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Not every format timestamps its records - Cursor transcripts carry no
+	// time at all. The file's modification time is the best available stamp,
+	// and without one the session sorts and filters as if it were epoch.
+	stamp := info.ModTime().UnixMilli()
+	for index := range events {
+		if events[index].TS == 0 {
+			events[index].TS = stamp
+		}
+	}
 	// TODO(hv): a sweep can land mid-write and cut the final line in half.
 	// Advance the offset only to the last newline actually consumed, so the
 	// partial record is re-read whole on the next sweep.
@@ -179,9 +194,16 @@ func (w *Watcher) logFiles() ([]string, error) {
 			if entry.IsDir() {
 				return nil
 			}
-			if _, ok := w.registry.For(path); ok {
-				paths = append(paths, path)
+			if _, ok := w.registry.For(path); !ok {
+				return nil
 			}
+			if w.MaxAge > 0 {
+				info, err := entry.Info()
+				if err != nil || time.Since(info.ModTime()) > w.MaxAge {
+					return nil
+				}
+			}
+			paths = append(paths, path)
 			return nil
 		})
 		if err != nil && !os.IsNotExist(err) {
