@@ -1,22 +1,30 @@
 package parse
 
 import (
+	"encoding/json"
+	"path/filepath"
 	"strings"
 
 	"github.com/satoricorp/demux/capture"
 )
 
-// Cursor parses Cursor session logs.
+// Cursor parses Cursor agent transcripts.
 //
-// Cursor stores conversation state in a SQLite workspace database rather than
-// JSONL, so this parser is the odd one out: Roots points at the workspace
-// storage directory and the reader will need to be database-aware. It is
-// registered now so the seam exists; it recognizes nothing yet.
+// Cursor keeps two stores. Chats under ~/.cursor/chats are SQLite, which hv
+// does not open; agent transcripts under
+// ~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl are JSONL and are
+// what this parser reads.
+//
+// Those transcripts are conversation only: {role, message} records with no
+// timestamps, no tool calls, and no file paths. So a Cursor session registers -
+// hv knows it exists, which repo it belongs to (from the project slug), and
+// when it was last written (from the file) - but contributes no edit evidence.
+// Selecting one scopes nothing, and demux plans its repo's tree unattributed.
 type Cursor struct{ roots []string }
 
 // NewCursor returns the Cursor parser.
 func NewCursor() *Cursor {
-	return &Cursor{roots: []string{home("Library", "Application Support", "Cursor", "User", "workspaceStorage")}}
+	return &Cursor{roots: []string{home(".cursor", "projects")}}
 }
 
 // Tool implements Parser.
@@ -27,14 +35,54 @@ func (c *Cursor) Roots() []string { return append([]string(nil), c.roots...) }
 
 // Owns implements Parser.
 func (c *Cursor) Owns(path string) bool {
-	// TODO(hv): Cursor's store is state.vscdb, a SQLite file. Owning it here
-	// would promise a line-oriented ParseLine that cannot exist; claim it only
-	// once the reader can open a database.
-	_ = strings.TrimSpace(path)
-	return false
+	return ownedByRoot(path, c.roots, ".jsonl") && strings.Contains(path, "agent-transcripts")
+}
+
+type cursorRecord struct {
+	Type    string          `json:"type"`
+	Role    string          `json:"role"`
+	Message json.RawMessage `json:"message"`
 }
 
 // ParseLine implements Parser.
-func (c *Cursor) ParseLine(string, []byte) ([]capture.SessionEvent, error) {
-	return nil, nil
+func (c *Cursor) ParseLine(path string, line []byte) ([]capture.SessionEvent, error) {
+	var record cursorRecord
+	if err := json.Unmarshal(line, &record); err != nil {
+		return nil, malformed(path, err)
+	}
+	if record.Role == "" && record.Type == "" {
+		return nil, nil
+	}
+	event := capture.SessionEvent{
+		SessionID: strings.TrimSuffix(pathBase(path), ".jsonl"),
+		Tool:      capture.ToolCursor,
+		Kind:      capture.KindMessage,
+		Raw:       rawContext(CursorRepoRoot(path)),
+	}
+	// TODO(hv): transcripts carry no timestamp. The watcher stamps sessions
+	// from the log file's modification time instead; per-record timing would
+	// need the SQLite store.
+	return []capture.SessionEvent{event}, nil
 }
+
+// CursorRepoRoot recovers the worktree from a Cursor project slug directory,
+// which encodes an absolute path with separators replaced by dashes.
+//
+// The encoding is lossy - a real dash is indistinguishable from a separator -
+// so candidates are verified against the filesystem and an unverifiable slug
+// yields nothing rather than a guess.
+func CursorRepoRoot(path string) string {
+	slug := ""
+	for dir := filepath.Dir(path); dir != "/" && dir != "."; dir = filepath.Dir(dir) {
+		if filepath.Base(filepath.Dir(dir)) == "projects" {
+			slug = filepath.Base(dir)
+			break
+		}
+	}
+	if slug == "" {
+		return ""
+	}
+	return verifiedPathFromSlug(slug)
+}
+
+func pathBase(path string) string { return filepath.Base(path) }

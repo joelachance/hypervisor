@@ -130,15 +130,6 @@ func ParseReader(parser Parser, path string, reader io.Reader) ([]capture.Sessio
 // in edit events, so the default bufio limit is far too small.
 const maxLogLineBytes = 16 * 1024 * 1024
 
-// rawLine is the shared envelope decode every parser starts from.
-func rawLine(line []byte) (map[string]json.RawMessage, error) {
-	raw := map[string]json.RawMessage{}
-	if err := json.Unmarshal(line, &raw); err != nil {
-		return nil, fmt.Errorf("malformed session log line: %w", err)
-	}
-	return raw, nil
-}
-
 // home expands a path relative to the user's home directory. An unresolvable
 // home yields an empty root, which the walker treats as absent.
 func home(parts ...string) string {
@@ -147,4 +138,124 @@ func home(parts ...string) string {
 		return ""
 	}
 	return filepath.Join(append([]string{dir}, parts...)...)
+}
+
+// RawCWD is the key under which parsers stash a session's working directory on
+// capture.SessionEvent.Raw. The event type is demux's and has no field for it,
+// but the worktree is exactly what decides which repo a session belongs to, so
+// it travels in the raw bag rather than being dropped.
+const RawCWD = "cwd"
+
+// rawContext builds the Raw bag carrying a record's working directory.
+func rawContext(cwd string) map[string]json.RawMessage {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return nil
+	}
+	encoded, err := json.Marshal(cwd)
+	if err != nil {
+		return nil
+	}
+	return map[string]json.RawMessage{RawCWD: encoded}
+}
+
+// CWD returns the working directory a parser recorded on an event.
+func CWD(event capture.SessionEvent) string {
+	return cwdOf(event.Raw)
+}
+
+func cwdOf(raw map[string]json.RawMessage) string {
+	encoded, ok := raw[RawCWD]
+	if !ok {
+		return ""
+	}
+	var cwd string
+	if err := json.Unmarshal(encoded, &cwd); err != nil {
+		return ""
+	}
+	return cwd
+}
+
+// resolvePath makes a recorded path absolute against the session's working
+// directory, so a relative shell write and an absolute tool edit compare equal.
+func resolvePath(path, cwd string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	// Shell commands say ~/git/x constantly. Left unexpanded it matches no
+	// repo prefix, and the session silently looks like it edited nothing.
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if dir, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(dir, strings.TrimPrefix(path, "~"))
+		}
+	}
+	if filepath.IsAbs(path) || strings.TrimSpace(cwd) == "" {
+		return path
+	}
+	return filepath.Join(cwd, path)
+}
+
+// ownedByRoot reports whether a path lies under any root with the given suffix.
+func ownedByRoot(path string, roots []string, suffix string) bool {
+	if suffix != "" && filepath.Ext(path) != suffix {
+		return false
+	}
+	for _, root := range roots {
+		if root != "" && strings.HasPrefix(path, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func malformed(path string, err error) error {
+	return fmt.Errorf("%s: %w", filepath.Base(path), err)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// verifiedPathFromSlug inverts a dash-encoded absolute path.
+//
+// The encoding replaces every separator with a dash, so a directory whose real
+// name contains a dash is ambiguous: "Users-joe-git-yeet-term" is either
+// /Users/joe/git/yeet/term or /Users/joe/git/yeet-term. The ambiguity is
+// resolved against the filesystem, longest real directory first, and a slug
+// that resolves to nothing returns empty rather than a guess.
+func verifiedPathFromSlug(slug string) string {
+	slug = strings.Trim(strings.TrimSpace(slug), "-")
+	if slug == "" {
+		return ""
+	}
+	return resolveSlugParts(string(filepath.Separator), strings.Split(slug, "-"))
+}
+
+func resolveSlugParts(base string, parts []string) string {
+	if len(parts) == 0 {
+		return base
+	}
+	candidate := ""
+	for index, part := range parts {
+		if candidate == "" {
+			candidate = part
+		} else {
+			candidate += "-" + part
+		}
+		next := filepath.Join(base, candidate)
+		info, err := os.Stat(next)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if resolved := resolveSlugParts(next, parts[index+1:]); resolved != "" {
+			return resolved
+		}
+	}
+	return ""
 }
