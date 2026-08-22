@@ -11,6 +11,7 @@ package plan
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/satoricorp/demux"
@@ -37,6 +38,10 @@ type Request struct {
 	Stacks []demux.StackContext
 	// Matcher configures hunk attribution; the zero value uses the defaults.
 	Matcher match.Matcher
+	// Repair applies demux's deterministic repair hints before returning.
+	// It never reaches for the model round - that stays an explicit call to
+	// Repair with planOnly false.
+	Repair bool
 }
 
 // Result is a plan plus the attribution that shaped it.
@@ -52,7 +57,7 @@ func Run(ctx context.Context, request Request) (Result, error) {
 	if root == "" {
 		return Result{}, fmt.Errorf("plan: RepoRoot is required")
 	}
-	files := selection.Files(request.Sessions)
+	files := scopedFiles(root, selection.Files(request.Sessions))
 	diff, err := WorkingDiff(ctx, root, request.Staged, files)
 	if err != nil {
 		return Result{}, err
@@ -79,7 +84,7 @@ func Run(ctx context.Context, request Request) (Result, error) {
 		return Result{}, err
 	}
 	if len(request.Events) == 0 {
-		packet, err := planner.PlanPacket(ctx, catalog)
+		packet, err := finish(ctx, planner, catalog, request.Repair)
 		return Result{Packet: packet, Diff: diff}, err
 	}
 
@@ -94,11 +99,25 @@ func Run(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	packet, err := planner.PlanPacket(ctx, proposal)
+	packet, err := finish(ctx, planner, proposal, request.Repair)
 	if err != nil {
 		return Result{}, err
 	}
 	return Result{Packet: packet, Attributed: attributed, Diff: diff}, nil
+}
+
+// finish reviews a proposal, optionally converging it with demux's
+// deterministic repair hints first.
+func finish(ctx context.Context, planner *demux.Planner, proposal demux.DemuxProposal, repair bool) (demux.DemuxPlanPacket, error) {
+	if repair {
+		repaired, err := Repair(ctx, planner, proposal, true)
+		// A repair that cannot reach ready_to_apply still returns its best
+		// proposal alongside the error; keeping it beats discarding the work.
+		if err == nil || repaired.Proposal.ID != "" {
+			proposal = repaired.Proposal
+		}
+	}
+	return planner.PlanPacket(ctx, proposal)
 }
 
 // Repair converges a proposal toward ready_to_apply. With planOnly set it uses
@@ -106,6 +125,28 @@ func Run(ctx context.Context, request Request) (Result, error) {
 // bounded model round, which needs OPENAI_API_KEY set.
 func Repair(ctx context.Context, planner *demux.Planner, proposal demux.DemuxProposal, planOnly bool) (demux.DemuxAIReviewResult, error) {
 	return planner.RepairDemuxProposal(ctx, proposal, demux.DemuxAIReviewOptions{PlanOnly: planOnly})
+}
+
+// scopedFiles keeps the selected sessions' files that live in this repo and
+// makes them repo-relative.
+//
+// A session edits wherever it likes - other checkouts, worktrees, scratch
+// directories - and git refuses a pathspec outside the repository, so the
+// files have to be narrowed to this tree before they can scope a diff. An
+// empty result means the session did work, just not here, and the caller
+// plans the whole tree rather than nothing.
+func scopedFiles(root string, files []string) []string {
+	root = strings.TrimSuffix(root, "/")
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		switch {
+		case !filepath.IsAbs(file):
+			out = append(out, file)
+		case strings.HasPrefix(file, root+"/"):
+			out = append(out, strings.TrimPrefix(file, root+"/"))
+		}
+	}
+	return out
 }
 
 // eventsFor keeps only the events belonging to the selected sessions. An empty
