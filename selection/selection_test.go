@@ -97,7 +97,7 @@ func TestParseRejectsOutOfRange(t *testing.T) {
 
 func TestInteractiveReadsAChoice(t *testing.T) {
 	var out strings.Builder
-	got, err := Interactive(strings.NewReader("2\n"), &out, sessions(), 0)
+	got, err := Interactive(strings.NewReader("2\n"), &out, sessions(), 0, nil)
 	if err != nil {
 		t.Fatalf("Interactive() error = %v", err)
 	}
@@ -110,7 +110,7 @@ func TestInteractiveReadsAChoice(t *testing.T) {
 }
 
 func TestInteractiveEmptyLineSelectsNothing(t *testing.T) {
-	got, err := Interactive(strings.NewReader("\n"), io.Discard, sessions(), 0)
+	got, err := Interactive(strings.NewReader("\n"), io.Discard, sessions(), 0, nil)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("Interactive() = %v, %v; want an empty selection and no error", got, err)
 	}
@@ -126,5 +126,40 @@ func TestTouchedUnderMatchesFilesNotCWD(t *testing.T) {
 	}
 	if got := Apply(list, Filter{TouchedUnder: "/other"}); len(got) != 0 {
 		t.Fatal("TouchedUnder matched a directory the session never edited")
+	}
+}
+
+func TestInteractiveOpenKeyOpensWithoutMerging(t *testing.T) {
+	var opened []string
+	var out strings.Builder
+	got, err := Interactive(strings.NewReader("o2\n1\n"), &out, sessions(), 0, func(s session.Session) error {
+		opened = append(opened, s.ID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Interactive() error = %v", err)
+	}
+	if len(opened) != 1 || opened[0] != "bbb222" {
+		t.Fatalf("opened = %v, want the second session", opened)
+	}
+	if len(got) != 1 || got[0].ID != "aaa111" {
+		t.Fatalf("selection = %v, want the picker to continue after an open", IDs(got))
+	}
+}
+
+func TestInteractiveOpenKeyRejectsOutOfRange(t *testing.T) {
+	var out strings.Builder
+	opened := 0
+	if _, err := Interactive(strings.NewReader("o9\n\n"), &out, sessions(), 0, func(session.Session) error {
+		opened++
+		return nil
+	}); err != nil {
+		t.Fatalf("Interactive() error = %v", err)
+	}
+	if opened != 0 {
+		t.Error("an out-of-range open must not reach the launcher")
+	}
+	if !strings.Contains(out.String(), "outside 1-3") {
+		t.Errorf("output = %q, want a range complaint", out.String())
 	}
 }

@@ -15,6 +15,23 @@ import (
 	"github.com/satoricorp/hv/parse"
 )
 
+// Origin is where a session runs. Claude Code records it as "entrypoint".
+const (
+	OriginCLI = "cli"
+	OriginApp = "claude-desktop"
+)
+
+// PullRequest is a pull request the desktop app associated with a session.
+type PullRequest struct {
+	Number  int    `json:"prNumber"`
+	URL     string `json:"url"`
+	Repo    string `json:"repo"`
+	Host    string `json:"host"`
+	Branch  string `json:"branch"`
+	BaseRef string `json:"baseRef"`
+	State   string `json:"state"`
+}
+
 // State is whether a session is being worked in right now.
 type State string
 
@@ -55,10 +72,25 @@ type Session struct {
 	// Files are the paths the session edited, repo-relative when RepoRoot is
 	// known, sorted and deduplicated.
 	Files []string `json:"files,omitempty"`
-	// Title is the name the tool gave the session - what its own UI shows.
-	// Claude Code names a session once it knows what it is about; the other
-	// tools do not name sessions at all.
-	Title string `json:"title,omitempty"`
+	// Title is the name the session goes by. The desktop app's registry wins
+	// when it has one, because that is the name the person has been looking
+	// at - and may have written themselves; otherwise it is the tool's own
+	// generated title. TitleSource is "user" or "auto" when known.
+	Title       string `json:"title,omitempty"`
+	TitleSource string `json:"title_source,omitempty"`
+	// Origin is where the session runs: OriginCLI or OriginApp.
+	Origin string `json:"origin,omitempty"`
+	// AppSessionID is the desktop app's own id for this session, when the app
+	// knows about it. It is what a deep link addresses.
+	AppSessionID string `json:"app_session_id,omitempty"`
+	// Archived sessions are hidden in the app's list; hv hides them too
+	// unless asked, since archiving is the person saying they are done.
+	Archived bool `json:"archived,omitempty"`
+	// Branch is the branch the session wrote to, when the app recorded one.
+	Branch string `json:"branch,omitempty"`
+	// PRs are the pull requests the app associated with the session - the
+	// cheapest available answer to "did this work land?".
+	PRs []PullRequest `json:"prs,omitempty"`
 	// Summary is a short human label for the session, taken from its first
 	// prompt. It is the fallback when the tool supplied no Title, and it is
 	// secret-redacted before it is ever carried onto a plan.
@@ -146,6 +178,10 @@ func (i *Index) Observe(event capture.SessionEvent) {
 	// A session can be renamed, and the last name is the one its UI shows.
 	if title := strings.TrimSpace(parse.Title(event)); title != "" {
 		current.Title = title
+		current.TitleSource = "auto"
+	}
+	if origin := strings.TrimSpace(parse.Origin(event)); origin != "" {
+		current.Origin = origin
 	}
 	if current.Summary == "" && event.Kind == capture.KindMessage {
 		current.Summary = summarize(event.PromptContext)

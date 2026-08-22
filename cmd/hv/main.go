@@ -14,6 +14,8 @@ import (
 
 	"github.com/satoricorp/demux"
 	"github.com/satoricorp/demux/capture"
+	"github.com/satoricorp/hv/desktop"
+	"github.com/satoricorp/hv/launch"
 	hvplan "github.com/satoricorp/hv/plan"
 	"github.com/satoricorp/hv/selection"
 	"github.com/satoricorp/hv/session"
@@ -36,6 +38,8 @@ func main() {
 		err = watchCmd(ctx, os.Args[2:])
 	case "merge", "plan":
 		err = mergeCmd(ctx, os.Args[2:])
+	case "open":
+		err = openCmd(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -55,6 +59,7 @@ func usage() {
   hv sessions [-tool t] [-since d] [-state s]   list coding sessions
   hv watch [-interval d]                        tail session edits as they land
   hv merge [-session IDs] [-C dir] [-json]      plan the changes n sessions made
+  hv open <session>                             reopen a session where it lives
 
 With no -session, merge lists the sessions that touched this repo and asks
 which to merge. Selected sessions' edits are attributed to their hunks and
@@ -70,12 +75,26 @@ func scan(maxAge time.Duration) (*watch.Watcher, []capture.SessionEvent, error) 
 	return watcher, events, err
 }
 
+// sessionsOf returns the indexed sessions with the desktop app's registry
+// overlaid, which is where user-chosen titles, archive state, and PRs live.
+func sessionsOf(watcher *watch.Watcher) []session.Session {
+	records, err := desktop.Load()
+	if err != nil {
+		// The registry is a bonus, never a requirement: a machine with no
+		// desktop app has none, and a broken one should not hide sessions.
+		fmt.Fprintf(os.Stderr, "hv: could not read the desktop session registry: %v\n", err)
+		return watcher.Sessions()
+	}
+	return desktop.Apply(watcher.Sessions(), records)
+}
+
 func sessionsCmd(args []string) error {
 	flags := flag.NewFlagSet("sessions", flag.ExitOnError)
 	tool := flags.String("tool", "", "restrict to one tool (claude, codex, cursor)")
 	since := flags.Duration("since", 7*24*time.Hour, "only sessions that wrote within this window")
 	state := flags.String("state", "", "restrict to active or stale sessions")
 	repo := flags.String("repo", "", "restrict to sessions that worked in this directory")
+	archived := flags.Bool("archived", false, "include sessions archived in the app")
 	limit := flags.Int("limit", 25, "maximum sessions to list")
 	asJSON := flags.Bool("json", false, "print sessions as JSON")
 	if err := flags.Parse(args); err != nil {
@@ -88,14 +107,15 @@ func sessionsCmd(args []string) error {
 	}
 	now := time.Now()
 	filter := selection.Filter{
-		Since:    now.Add(-*since).UnixMilli(),
-		RepoRoot: *repo,
-		Limit:    *limit,
+		Since:           now.Add(-*since).UnixMilli(),
+		RepoRoot:        *repo,
+		IncludeArchived: *archived,
+		Limit:           *limit,
 	}
 	if *tool != "" {
 		filter.Tools = []string{*tool}
 	}
-	sessions := selection.Apply(watcher.Sessions(), filter)
+	sessions := selection.Apply(sessionsOf(watcher), filter)
 	if *state != "" {
 		sessions = withState(sessions, session.State(*state), now.UnixMilli())
 	}
@@ -107,10 +127,10 @@ func sessionsCmd(args []string) error {
 		return nil
 	}
 	for _, current := range sessions {
-		fmt.Printf("%-6s %-7s %-38s %-13s %3d edits  %s\n",
-			current.State(now.UnixMilli()), current.Tool, truncate(current.Label(), 38),
+		fmt.Printf("%-6s %-4s %-34s %-13s %3d edits  %-9s %s\n",
+			current.State(now.UnixMilli()), originLabel(current), truncate(current.Label(), 34),
 			current.ID[:min(13, len(current.ID))], current.EditCount,
-			humanAge(now.UnixMilli()-current.LastActiveAt))
+			humanAge(now.UnixMilli()-current.LastActiveAt), landedLabel(current))
 	}
 	return nil
 }
@@ -211,7 +231,14 @@ func chooseSessions(watcher *watch.Watcher, root, ids string, since time.Duratio
 	if all {
 		return candidates, nil
 	}
-	return selection.Interactive(os.Stdin, os.Stdout, candidates, now.UnixMilli())
+	return selection.Interactive(os.Stdin, os.Stdout, candidates, now.UnixMilli(), func(current session.Session) error {
+		target, err := launch.Plan(context.Background(), current)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "%s: %s\n", target.Method, target.Detail)
+		return launch.Run(context.Background(), target)
+	})
 }
 
 func printPlan(result hvplan.Result, sessions []session.Session) {
@@ -266,6 +293,80 @@ func shortID(id string) string {
 		return id[:12]
 	}
 	return id
+}
+
+// originLabel is where the session runs, short enough for a column.
+func originLabel(current session.Session) string {
+	switch current.Origin {
+	case session.OriginApp:
+		return "app"
+	case session.OriginCLI:
+		return "cli"
+	default:
+		return current.Tool
+	}
+}
+
+// landedLabel reports what became of the session's work, using the pull
+// requests the desktop app already tracked. It says nothing when the app knows
+// nothing - an absent PR is not evidence that the work never landed.
+func landedLabel(current session.Session) string {
+	if len(current.PRs) == 0 {
+		if branch := strings.TrimSpace(current.Branch); branch != "" {
+			return branch
+		}
+		return ""
+	}
+	states := map[string]int{}
+	for _, pr := range current.PRs {
+		states[strings.ToUpper(pr.State)]++
+	}
+	parts := []string{}
+	for _, state := range []string{"MERGED", "OPEN", "CLOSED", "DRAFT"} {
+		if count := states[state]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", count, strings.ToLower(state)))
+		}
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("%d PRs", len(current.PRs))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func openCmd(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("open", flag.ExitOnError)
+	dryRun := flags.Bool("n", false, "print the command instead of running it")
+	since := flags.Duration("since", 30*24*time.Hour, "how far back to look for the session")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return fmt.Errorf("usage: hv open <session id or prefix>")
+	}
+	watcher, _, err := scan(*since)
+	if err != nil {
+		return err
+	}
+	matches := selection.Apply(sessionsOf(watcher), selection.Filter{
+		IDs:             []string{flags.Arg(0)},
+		IncludeArchived: true,
+	})
+	if len(matches) == 0 {
+		return fmt.Errorf("no session matches %q", flags.Arg(0))
+	}
+	if len(matches) > 1 {
+		return fmt.Errorf("%q matches %d sessions; use a longer prefix", flags.Arg(0), len(matches))
+	}
+	target, err := launch.Plan(ctx, matches[0])
+	if err != nil {
+		return err
+	}
+	if *dryRun {
+		fmt.Printf("%s: %s\n%s\n", target.Method, target.Detail, target)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "%s: %s\n", target.Method, target.Detail)
+	return launch.Run(ctx, target)
 }
 
 // humanAge renders how long ago a session last wrote, which is the evidence

@@ -35,12 +35,13 @@ func (c *Claude) Owns(path string) bool {
 
 // claudeRecord is the subset of a Claude Code record hv reads.
 type claudeRecord struct {
-	Type      string          `json:"type"`
-	SessionID string          `json:"sessionId"`
-	Timestamp string          `json:"timestamp"`
-	CWD       string          `json:"cwd"`
-	Message   json.RawMessage `json:"message"`
-	AITitle   string          `json:"aiTitle"`
+	Type       string          `json:"type"`
+	SessionID  string          `json:"sessionId"`
+	Timestamp  string          `json:"timestamp"`
+	CWD        string          `json:"cwd"`
+	Message    json.RawMessage `json:"message"`
+	AITitle    string          `json:"aiTitle"`
+	Entrypoint string          `json:"entrypoint"`
 }
 
 type claudeMessage struct {
@@ -88,7 +89,7 @@ func (c *Claude) ParseLine(path string, line []byte) ([]capture.SessionEvent, er
 		SessionID: sessionID,
 		Tool:      capture.ToolClaude,
 		TS:        millis(record.Timestamp),
-		Raw:       rawContext(record.CWD),
+		Raw:       rawContext(record.CWD, [2]string{RawOrigin, record.Entrypoint}),
 	}
 	switch record.Type {
 	case "assistant":
