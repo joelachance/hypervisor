@@ -28,8 +28,8 @@ and prints demux's revision plan with provenance stamped on each revision.
 ```bash
 go build -o hv ./cmd/hv
 
-hv sessions                  # live / idle / ended sessions, newest first
-hv sessions -tool codex      # one tool; -state live; -since 6h; -json
+hv sessions                  # title, id, active/stale - newest first, 7 days
+hv sessions -tool codex      # one tool; -state active; -since 6h; -json
 hv watch                     # tail edits as they land
 hv merge                     # pick sessions in this repo, plan their changes
 hv merge -session a1b2,c3d4  # merge named sessions without the picker
@@ -48,8 +48,19 @@ A session exists because its log does.
 | Codex | `~/.codex/sessions/<date>/rollout-*.jsonl` | shell commands only | `cwd` on `session_meta` |
 | Cursor | `~/.cursor/projects/<slug>/agent-transcripts/**.jsonl` | none | project slug, verified against the filesystem |
 
-Liveness is inferred from silence, because a log is written on every turn:
-**live** under 3 minutes, **idle** under 2 hours, **ended** after that.
+Each session is listed by **the title its own tool gave it** - Claude Code
+writes an `ai-title` record once it knows what a session is about - falling
+back to the first prompt, then to `(untitled)`. Claude Code is currently the
+only tool that names sessions.
+
+Activity is inferred from silence, because a log is written on every turn:
+**active** if it wrote within ten minutes, **stale** otherwise. That signal
+cannot tell a session someone still has open from one they walked away from -
+nothing in the logs distinguishes them - so hv does not pretend to.
+
+Only a format that declares itself untimed may borrow its log file's
+modification time for a stamp. That is Cursor alone; for a timed format, a
+touched file is not a working agent.
 
 Two findings from the real stores worth knowing:
 
@@ -68,8 +79,8 @@ Two findings from the real stores worth knowing:
 
 ```
 $ hv merge -C ~/git/hv
-   1  live  claude    34 edits  0be860ce-689 pull demux logic into ~/git/hv
-   2  idle  codex      6 edits  019ff782-de0 fix the rounding bug
+   1  active claude  0be860ce-6892   37 edits  How demux works
+   2  stale  claude  07696390-a38b  425 edits  Setup gx review script for Code Review Bench
 
 select sessions to merge [1-2, comma separated, or all]: 1,2
 
