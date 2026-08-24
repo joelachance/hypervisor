@@ -354,20 +354,38 @@ func (m model) selected() []session.Session {
 	return chosen
 }
 
-// listHeight is the rows available after the header, detail panel, and footer.
+// listHeight is the rows left after the chrome.
+//
+// Getting this wrong by one costs the header: the terminal scrolls to fit the
+// extra line and the top of the frame is gone, which looks like hv rendered
+// nothing useful.
 func (m model) listHeight() int {
-	height := m.height - detailHeight - 3
+	height := m.height - chromeHeight
 	if height < 1 {
 		return 1
 	}
 	return height
 }
 
-const detailHeight = 6
+const (
+	// detailHeight is the panel's own rows; it also draws a top border.
+	detailHeight = 6
+	// chromeHeight is every row the list does not get: the header and its
+	// border, the detail panel plus its border, and the footer.
+	chromeHeight = 2 + detailHeight + 1 + 1
+)
+
+// defaultWidth and defaultHeight stand in until the terminal reports its size.
+// Some terminals and multiplexers are slow to answer, and a browser that shows
+// nothing until they do looks broken rather than patient.
+const (
+	defaultWidth  = 100
+	defaultHeight = 24
+)
 
 func (m model) View() string {
-	if m.width == 0 {
-		return "starting…"
+	if m.width == 0 || m.height == 0 {
+		m.width, m.height = defaultWidth, defaultHeight
 	}
 	if m.err != nil {
 		return styleError.Render("hv: " + m.err.Error())

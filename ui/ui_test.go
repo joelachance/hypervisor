@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/satoricorp/hv/session"
 )
 
@@ -111,4 +112,32 @@ func firstLine(text string) string {
 		return text[:index]
 	}
 	return text
+}
+
+// The frame must fit the terminal exactly. One line too many makes the
+// terminal scroll, the header disappears off the top, and every later repaint
+// paints over the wrong rows - which reads as "hv showed me nothing".
+func TestViewFitsTheTerminalExactly(t *testing.T) {
+	for _, size := range []struct{ width, height int }{{100, 24}, {80, 30}, {120, 14}} {
+		m := NewForTest(fixture())
+		m, _ = m.Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
+		lines := strings.Split(m.View(), "\n")
+		if len(lines) != size.height {
+			t.Errorf("at %dx%d the frame is %d lines, want exactly %d",
+				size.width, size.height, len(lines), size.height)
+		}
+		for index, line := range lines {
+			if width := lipgloss.Width(line); width > size.width {
+				t.Errorf("at %dx%d line %d is %d columns wide", size.width, size.height, index, width)
+			}
+		}
+	}
+}
+
+// A terminal that has not reported its size yet must still render something.
+func TestViewRendersBeforeTheSizeArrives(t *testing.T) {
+	view := NewForTest(fixture()).View()
+	if !strings.Contains(view, "benchmarks") {
+		t.Fatalf("view before WindowSizeMsg showed no sessions:\n%s", view)
+	}
 }
