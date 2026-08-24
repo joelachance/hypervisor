@@ -144,6 +144,21 @@ The second pass must receive a byte-identical diff and otherwise identical
 options, or the links land on the wrong hunks. `plan.Run` enforces this by
 building the diff once.
 
+## Testing against a synthetic store
+
+`HV_HOME` moves every log root and the desktop registry under another
+directory, so hv can be exercised without writing fake sessions into the real
+store:
+
+```bash
+HV_HOME=~/git/fake/.hv-home hv sessions
+HV_HOME=~/git/fake/.hv-home hv merge -C ~/git/fake/alpha
+```
+
+The layout beneath it is exactly what the tools produce
+(`.claude/projects/<slug>/<uuid>.jsonl`, and
+`Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json`).
+
 ## What is still stubbed
 
 | Piece | State |
