@@ -21,6 +21,7 @@ import (
 
 	"github.com/satoricorp/hv/desktop"
 	"github.com/satoricorp/hv/launch"
+	"github.com/satoricorp/hv/parse"
 	"github.com/satoricorp/hv/selection"
 	"github.com/satoricorp/hv/session"
 	"github.com/satoricorp/hv/watch"
@@ -63,6 +64,7 @@ type model struct {
 	archived bool
 	repoOnly bool
 	repoRoot string
+	short    map[string]string
 	status   string
 	err      error
 	outcome  Outcome
@@ -290,6 +292,7 @@ func (m *model) applyFilter() {
 		return rows[left].LastActiveAt > rows[right].LastActiveAt
 	})
 	m.rows = rows
+	m.short = session.Abbreviate(rows, 8)
 	m.clampCursor()
 }
 
@@ -391,7 +394,7 @@ func archivedNote(archived bool) string {
 func (m model) list() string {
 	if len(m.rows) == 0 {
 		return lipgloss.NewStyle().Height(m.listHeight()).Padding(1, 2).
-			Render(styleDim.Render("no sessions match"))
+			Render(m.emptyReason())
 	}
 	height := m.listHeight()
 	lines := make([]string, 0, height)
@@ -402,6 +405,24 @@ func (m model) list() string {
 		lines = append(lines, "")
 	}
 	return strings.Join(lines, "\n")
+}
+
+// emptyReason says which filter emptied the list, because "no sessions" reads
+// as "hv found nothing" when the truth is usually "nothing edited this repo".
+func (m model) emptyReason() string {
+	switch {
+	case len(m.all) == 0:
+		return styleDim.Render("no session logs found under " + shortPath(parse.Home()))
+	case strings.TrimSpace(m.filter) != "":
+		return styleDim.Render(fmt.Sprintf("nothing matches %q  ·  ", m.filter)) +
+			styleKey.Render("/") + styleDim.Render(" to edit the filter")
+	case m.repoOnly && m.repoRoot != "":
+		return styleDim.Render(fmt.Sprintf("none of the %d sessions edited ", len(m.all))) +
+			styleValue.Render(shortPath(m.repoRoot)) + "\n\n" +
+			styleKey.Render("r") + styleDim.Render(" shows sessions from every repository")
+	default:
+		return styleDim.Render(fmt.Sprintf("no sessions in the last sweep  ·  %d known", len(m.all)))
+	}
 }
 
 func (m model) row(current session.Session, highlighted bool) string {
@@ -437,7 +458,9 @@ func (m model) row(current session.Session, highlighted bool) string {
 
 	// The title gets whatever the terminal has left after the fixed columns,
 	// so a narrow window loses the title's tail rather than wrapping the row.
-	fixed := 2 + 2 + 2 + 4 + 11 + 10 + 14
+	// cursor, mark, dot, origin, id, age, and the PR badge each take a fixed
+	// column; the title takes what is left.
+	fixed := 2 + 2 + 2 + 4 + 14 + 9 + 16
 	titleWidth := m.width - fixed
 	if titleWidth < 12 {
 		titleWidth = 12
@@ -446,7 +469,7 @@ func (m model) row(current session.Session, highlighted bool) string {
 	line := fmt.Sprintf("%s%s%s %s %s %s %s %s",
 		cursor, mark, dot, origin,
 		titleStyle.Width(titleWidth).Render(truncate(current.Label(), titleWidth)),
-		styleDim.Render(fmt.Sprintf("%9s", shortID(current.ID))),
+		styleDim.Render(fmt.Sprintf("%13s", m.label(current))),
 		styleDim.Render(fmt.Sprintf("%8s", humanAge(m.now-current.LastActiveAt))),
 		prBadge(current))
 	if highlighted {
@@ -533,16 +556,26 @@ func (m model) footer() string {
 		return styleFilter.Width(m.width).Render("/" + m.filter + "█")
 	}
 	key := func(k, label string) string { return styleKey.Render(k) + styleDim.Render(" "+label) }
+	// Ordered by how often they are needed: a narrow terminal loses the tail
+	// rather than wrapping the footer onto a second line, which would eat a
+	// session row.
 	keys := []string{
 		key("↑↓", "move"),
 		key("space", "mark"),
 		key("enter", "merge"),
 		key("o", "open"),
 		key("/", "filter"),
+		key("r", "all repos"),
 		key("a", "archived"),
 		key("q", "quit"),
 	}
-	return styleFooter.Width(m.width).Render(strings.Join(keys, styleDim.Render("  ·  ")))
+	separator := styleDim.Render("  ·  ")
+	line := strings.Join(keys, separator)
+	for len(keys) > 1 && lipgloss.Width(line)+2 > m.width {
+		keys = keys[:len(keys)-1]
+		line = strings.Join(keys, separator)
+	}
+	return styleFooter.Width(m.width).Render(line)
 }
 
 func humanAge(millis int64) string {
@@ -559,11 +592,11 @@ func humanAge(millis int64) string {
 	}
 }
 
-func shortID(id string) string {
-	if len(id) > 8 {
-		return id[:8]
+func (m model) label(current session.Session) string {
+	if short, ok := m.short[current.ID]; ok {
+		return short
 	}
-	return id
+	return current.ID
 }
 
 func shortPath(path string) string {
@@ -596,6 +629,15 @@ func homeDir() string {
 // for rendering a frame without a terminal.
 func NewForTest(sessions []session.Session) tea.Model {
 	built := model{chosen: map[string]bool{}, now: time.Now().UnixMilli(), all: sessions}
+	built.applyFilter()
+	return built
+}
+
+// NewForTestScoped builds a browser model already scoped to a repository, for
+// exercising the empty state.
+func NewForTestScoped(sessions []session.Session, repoRoot string) tea.Model {
+	built := model{chosen: map[string]bool{}, now: time.Now().UnixMilli(), all: sessions,
+		repoRoot: repoRoot, repoOnly: true}
 	built.applyFilter()
 	return built
 }

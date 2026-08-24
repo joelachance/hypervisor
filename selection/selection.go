@@ -274,8 +274,21 @@ func matchesAnyID(id string, candidates []string) bool {
 	id = strings.TrimSpace(id)
 	for _, candidate := range candidates {
 		candidate = strings.TrimSpace(candidate)
-		if candidate != "" && strings.HasPrefix(id, candidate) {
+		if candidate == "" {
+			continue
+		}
+		if strings.HasPrefix(id, candidate) {
 			return true
+		}
+		// Accept the elided label hv prints for near-identical ids
+		// ("aaaaaaaa…a001"): what is displayed should be paste-able back in.
+		// Three dots means the same thing, because that is what people type
+		// when the ellipsis is awkward to reach.
+		normalized := strings.ReplaceAll(candidate, "...", "\u2026")
+		if head, tail, ok := strings.Cut(normalized, "\u2026"); ok {
+			if strings.HasPrefix(id, head) && strings.HasSuffix(id, tail) {
+				return true
+			}
 		}
 	}
 	return false

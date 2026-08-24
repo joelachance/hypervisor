@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/satoricorp/hv/parse"
 	"github.com/satoricorp/hv/session"
 )
 
@@ -47,10 +48,12 @@ type Record struct {
 // UserNamed reports whether a person chose this session's title.
 func (r Record) UserNamed() bool { return strings.EqualFold(r.TitleSource, "user") }
 
-// Root is the directory the app keeps its session registry in.
+// Root is the directory the app keeps its session registry in. It follows
+// parse.Home, so pointing hv at a synthetic store moves the registry with the
+// logs rather than mixing fake sessions with real titles.
 func Root() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
+	home := parse.Home()
+	if home == "" {
 		return ""
 	}
 	return filepath.Join(home, "Library", "Application Support", "Claude", "claude-code-sessions")

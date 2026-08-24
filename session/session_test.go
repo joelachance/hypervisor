@@ -132,3 +132,58 @@ func rawCWD(dir string) map[string]json.RawMessage {
 	encoded, _ := json.Marshal(dir)
 	return map[string]json.RawMessage{"cwd": encoded}
 }
+
+func TestAbbreviateGrowsUntilUnique(t *testing.T) {
+	sessions := []Session{
+		{ID: "abcd1111-0000-4000-8000-00000000a001"},
+		{ID: "abcd2222-0000-4000-8000-00000000a002"},
+		{ID: "bbbbbbbb-0000-4000-8000-00000000b001"},
+	}
+	short := Abbreviate(sessions, 4)
+	seen := map[string]bool{}
+	for _, current := range sessions {
+		prefix := short[current.ID]
+		if !strings.HasPrefix(current.ID, prefix) {
+			t.Fatalf("%q is not a prefix of %q", prefix, current.ID)
+		}
+		if seen[prefix] {
+			t.Fatalf("prefix %q collides; abbreviation must stay unique", prefix)
+		}
+		seen[prefix] = true
+	}
+}
+
+// Ids that share a long head keep both ends rather than spelling out all 36
+// characters - the tail is the only part that distinguishes them.
+func TestAbbreviateElidesInsteadOfGrowingWithoutBound(t *testing.T) {
+	sessions := []Session{
+		{ID: "aaaaaaaa-0000-4000-8000-00000000a001"},
+		{ID: "aaaaaaaa-0000-4000-8000-00000000a002"},
+	}
+	short := Abbreviate(sessions, 8)
+	first := short["aaaaaaaa-0000-4000-8000-00000000a001"]
+	second := short["aaaaaaaa-0000-4000-8000-00000000a002"]
+	if first == second {
+		t.Fatalf("both ids rendered as %q; the label must stay unique", first)
+	}
+	if len([]rune(first)) > AbbreviateMax+5 {
+		t.Errorf("label %q is too long to sit in a column", first)
+	}
+	if !strings.HasSuffix(first, "a001") || !strings.HasPrefix(first, "aaaaaaaa") {
+		t.Errorf("label = %q, want both ends of the id kept", first)
+	}
+}
+
+func TestAbbreviateStopsWhenIDsAreIdentical(t *testing.T) {
+	sessions := []Session{{ID: "same"}, {ID: "same"}}
+	if short := Abbreviate(sessions, 8); short["same"] != "same" {
+		t.Fatalf("abbreviation = %q; identical ids cannot be separated and must not loop", short["same"])
+	}
+}
+
+func TestAbbreviateRespectsTheMinimum(t *testing.T) {
+	sessions := []Session{{ID: "abcdef123456"}, {ID: "zzzzzz999999"}}
+	if got := Abbreviate(sessions, 8)["abcdef123456"]; len(got) != 8 {
+		t.Fatalf("abbreviation = %q, want the 8-character minimum even when 1 would do", got)
+	}
+}

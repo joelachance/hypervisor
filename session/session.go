@@ -247,3 +247,72 @@ func (i *Index) snapshot(current *Session) Session {
 	out.Files = files
 	return out
 }
+
+// AbbreviateMax caps how long a plain prefix may grow before Abbreviate
+// switches to eliding the middle. Session ids are random enough that eight
+// characters usually separate them; ids sharing a long head are near-identical
+// by construction, and spelling out all 36 characters to separate them costs
+// every other row its readability.
+const AbbreviateMax = 12
+
+// Abbreviate returns a short, unique label for each session id, the way git
+// abbreviates commits - except that when ids share a long head it keeps both
+// ends and elides the middle ("aaaaaaaa…a001") rather than growing without
+// bound or giving up on uniqueness.
+//
+// A fixed truncation is a trap: sessions started by the same tool in the same
+// place can share a long prefix, and a list where three rows read "aaaaaaaa"
+// tells the reader nothing and gives them no id they can pass back.
+func Abbreviate(sessions []Session, minimum int) map[string]string {
+	if minimum < 4 {
+		minimum = 4
+	}
+	ids := make([]string, 0, len(sessions))
+	for _, current := range sessions {
+		ids = append(ids, current.ID)
+	}
+	for length := minimum; length <= AbbreviateMax; length++ {
+		if labels, ok := labelled(ids, func(id string) string { return prefixOf(id, length) }); ok {
+			return labels
+		}
+	}
+	for tail := 4; tail <= 12; tail++ {
+		if labels, ok := labelled(ids, func(id string) string { return elide(id, 8, tail) }); ok {
+			return labels
+		}
+	}
+	labels, _ := labelled(ids, func(id string) string { return id })
+	return labels
+}
+
+// labelled applies a labelling function and reports whether it separated every
+// distinct id. Two entries for the same id are not a collision.
+func labelled(ids []string, label func(string) string) (map[string]string, bool) {
+	labels := make(map[string]string, len(ids))
+	owner := map[string]string{}
+	unique := true
+	for _, id := range ids {
+		text := label(id)
+		if previous, taken := owner[text]; taken && previous != id {
+			unique = false
+		}
+		owner[text] = id
+		labels[id] = text
+	}
+	return labels, unique
+}
+
+// elide keeps both ends of an id, which is where near-identical ids differ.
+func elide(id string, head, tail int) string {
+	if len(id) <= head+tail+1 {
+		return id
+	}
+	return id[:head] + "\u2026" + id[len(id)-tail:]
+}
+
+func prefixOf(id string, length int) string {
+	if len(id) <= length {
+		return id
+	}
+	return id[:length]
+}

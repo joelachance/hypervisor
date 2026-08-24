@@ -144,11 +144,32 @@ func ParseReader(parser Parser, path string, reader io.Reader) ([]capture.Sessio
 // in edit events, so the default bufio limit is far too small.
 const maxLogLineBytes = 16 * 1024 * 1024
 
-// home expands a path relative to the user's home directory. An unresolvable
-// home yields an empty root, which the walker treats as absent.
-func home(parts ...string) string {
+// HomeEnv overrides the directory session logs are looked for under.
+//
+// Every tool writes its logs beneath the user's home, which makes hv
+// untestable against anything but the real machine and gives no way to try it
+// on a copied or synthetic store. Pointing this at another directory moves
+// every root at once, so the layout under it stays exactly what the tools
+// produce.
+const HomeEnv = "HV_HOME"
+
+// Home is the directory hv reads session logs under.
+func Home() string {
+	if override := strings.TrimSpace(os.Getenv(HomeEnv)); override != "" {
+		return override
+	}
 	dir, err := os.UserHomeDir()
 	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+// home expands a path relative to Home. An unresolvable home yields an empty
+// root, which the walker treats as absent.
+func home(parts ...string) string {
+	dir := Home()
+	if dir == "" {
 		return ""
 	}
 	return filepath.Join(append([]string{dir}, parts...)...)

@@ -93,8 +93,8 @@ func Run(ctx context.Context, request Request) (Result, error) {
 	// Second pass: same diff, same options, now carrying the evidence. Session
 	// links refine grouping and stamp provenance - they never pick a branch.
 	options.Capture = attributed.Capture()
-	options.SessionIDs = selection.IDs(request.Sessions)
 	options.ProvenanceStatus = attributed.Status()
+	options.SessionIDs = fallbackSessionIDs(request.Sessions)
 	proposal, err := planner.ProposeFromDiff(ctx, diff, options)
 	if err != nil {
 		return Result{}, err
@@ -125,6 +125,25 @@ func finish(ctx context.Context, planner *demux.Planner, proposal demux.DemuxPro
 // bounded model round, which needs OPENAI_API_KEY set.
 func Repair(ctx context.Context, planner *demux.Planner, proposal demux.DemuxProposal, planOnly bool) (demux.DemuxAIReviewResult, error) {
 	return planner.RepairDemuxProposal(ctx, proposal, demux.DemuxAIReviewOptions{PlanOnly: planOnly})
+}
+
+// fallbackSessionIDs is the provenance demux stamps on a revision no hunk link
+// claims.
+//
+// Only one session may be named there. demux stamps from links only when they
+// are exact or fuzzy - a temporal link is too weak to assert authorship - and
+// hv's matcher currently produces temporal links alone, so nearly every
+// revision takes this path. Listing every selected session there would credit
+// all of them with all of the work: merge three sessions and each revision
+// claims all three, which reads as fact and is wrong.
+//
+// One session is different: the person named it, and everything in the plan is
+// scoped to what it touched. Beyond one, hv says nothing rather than guessing.
+func fallbackSessionIDs(sessions []session.Session) []string {
+	if len(sessions) != 1 {
+		return nil
+	}
+	return selection.IDs(sessions)
 }
 
 // scopedFiles keeps the selected sessions' files that live in this repo and

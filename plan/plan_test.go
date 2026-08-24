@@ -101,3 +101,66 @@ func write(t *testing.T, repo, name, body string) {
 		t.Fatal(err)
 	}
 }
+
+// A coding session's most characteristic act is creating a file, and `git
+// diff` alone does not see one. Planning a fraction of the work silently is
+// worse than failing.
+func TestRunIncludesUntrackedFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := newRepo(t)
+	write(t, repo, "limiter.go", "package billing\n\nfunc Limit() int { return 1 }\n")
+
+	result, err := Run(context.Background(), Request{RepoRoot: repo})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	found := false
+	for _, hunk := range result.Packet.Proposal.Hunks {
+		if hunk.File == "limiter.go" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the new file never reached the plan; hunks = %+v", result.Packet.Proposal.Hunks)
+	}
+}
+
+func TestUntrackedFilesRespectTheSessionScope(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := newRepo(t)
+	write(t, repo, "wanted.go", "package billing\n\nfunc Wanted() int { return 1 }\n")
+	write(t, repo, "unwanted.go", "package billing\n\nfunc Unwanted() int { return 2 }\n")
+
+	result, err := Run(context.Background(), Request{
+		RepoRoot: repo,
+		Sessions: []session.Session{{ID: "s1", Files: []string{filepath.Join(repo, "wanted.go")}}},
+		Events: []capture.SessionEvent{{SessionID: "s1", Kind: capture.KindEdit, TS: 1,
+			FilePath: filepath.Join(repo, "wanted.go")}},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, hunk := range result.Packet.Proposal.Hunks {
+		if hunk.File == "unwanted.go" {
+			t.Fatal("a file the session never touched reached the plan")
+		}
+	}
+}
+
+// demux stamps provenance from exact and fuzzy links only, so with hv's
+// temporal links nearly every revision takes the fallback. Naming every
+// selected session there would credit all of them with all of the work.
+func TestFallbackProvenanceNamesAtMostOneSession(t *testing.T) {
+	one := []session.Session{{ID: "s1"}}
+	if got := fallbackSessionIDs(one); len(got) != 1 || got[0] != "s1" {
+		t.Errorf("fallback for one session = %v, want it named", got)
+	}
+	two := []session.Session{{ID: "s1"}, {ID: "s2"}}
+	if got := fallbackSessionIDs(two); len(got) != 0 {
+		t.Errorf("fallback for two sessions = %v, want silence rather than crediting both", got)
+	}
+}

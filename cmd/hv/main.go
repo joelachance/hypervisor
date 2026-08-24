@@ -14,6 +14,7 @@ import (
 
 	"github.com/satoricorp/demux"
 	"github.com/satoricorp/demux/capture"
+	"github.com/satoricorp/demux/matcher"
 	"github.com/satoricorp/hv/desktop"
 	"github.com/satoricorp/hv/launch"
 	hvplan "github.com/satoricorp/hv/plan"
@@ -184,10 +185,11 @@ func sessionsCmd(args []string) error {
 		fmt.Printf("no coding sessions wrote a log in the last %s\n", *since)
 		return nil
 	}
+	short := session.Abbreviate(sessions, 8)
 	for _, current := range sessions {
 		fmt.Printf("%-6s %-4s %-34s %-13s %3d edits  %-9s %s\n",
 			current.State(now.UnixMilli()), originLabel(current), truncate(current.Label(), 34),
-			current.ID[:min(13, len(current.ID))], current.EditCount,
+			short[current.ID], current.EditCount,
 			humanAge(now.UnixMilli()-current.LastActiveAt), landedLabel(current))
 	}
 	return nil
@@ -236,9 +238,15 @@ func mergeCmd(ctx context.Context, args []string) error {
 		return err
 	}
 
-	sessions, err := chooseSessions(watcher, root, *sessionIDs, *since, *all)
+	sessions, cancelled, err := chooseSessions(watcher, root, *sessionIDs, *since, *all)
 	if err != nil {
 		return err
+	}
+	if cancelled {
+		// The picker was shown and nothing was chosen. That is an answer, not
+		// an invitation to plan the whole tree on their behalf.
+		fmt.Fprintln(os.Stderr, "nothing selected")
+		return nil
 	}
 
 	if len(sessions) == 0 {
@@ -268,28 +276,35 @@ func mergeCmd(ctx context.Context, args []string) error {
 
 // chooseSessions resolves which sessions to merge: named explicitly, taken
 // wholesale, or picked interactively from the ones that worked in this repo.
-func chooseSessions(watcher *watch.Watcher, root, ids string, since time.Duration, all bool) ([]session.Session, error) {
+// chooseSessions resolves the sessions to merge. The second return reports
+// that a person was asked and declined, which is different from there being
+// nothing to ask about.
+func chooseSessions(watcher *watch.Watcher, root, ids string, since time.Duration, all bool) ([]session.Session, bool, error) {
 	now := time.Now()
 	if named := splitIDs(ids); len(named) > 0 {
-		chosen := selection.Apply(watcher.Sessions(), selection.Filter{IDs: named})
+		// Naming a session is intent: an archived one is still what was asked
+		// for, so the archive filter does not apply here.
+		chosen := selection.Apply(sessionsOf(watcher), selection.Filter{IDs: named, IncludeArchived: true})
 		if len(chosen) == 0 {
-			return nil, fmt.Errorf("no session matches %q", ids)
+			return nil, false, fmt.Errorf("no session matches %q", ids)
 		}
-		return chosen, nil
+		return chosen, false, nil
 	}
-	candidates := selection.Apply(watcher.Sessions(), selection.Filter{
+	candidates := selection.Apply(sessionsOf(watcher), selection.Filter{
 		TouchedUnder: root,
 		Since:        now.Add(-since).UnixMilli(),
 		EditsOnly:    true,
 	})
 	if len(candidates) == 0 {
 		fmt.Fprintf(os.Stderr, "no sessions edited %s in the last %s; planning the tree unattributed\n", root, since)
-		return nil, nil
+		return nil, false, nil
 	}
 	if all {
-		return candidates, nil
+		return candidates, false, nil
 	}
-	return selection.Interactive(os.Stdin, os.Stdout, candidates, now.UnixMilli(), func(current session.Session) error {
+	// The picker prints to stderr: stdout is the plan, and a prompt written
+	// there corrupts -json for anything downstream.
+	chosen, err := selection.Interactive(os.Stdin, os.Stderr, candidates, now.UnixMilli(), func(current session.Session) error {
 		target, err := launch.Plan(context.Background(), current)
 		if err != nil {
 			return err
@@ -297,10 +312,12 @@ func chooseSessions(watcher *watch.Watcher, root, ids string, since time.Duratio
 		fmt.Fprintf(os.Stderr, "%s: %s\n", target.Method, target.Detail)
 		return launch.Run(context.Background(), target)
 	})
+	return chosen, len(chosen) == 0, err
 }
 
 func printPlan(result hvplan.Result, sessions []session.Session) {
 	proposal := result.Packet.Proposal
+	short := session.Abbreviate(sessions, 8)
 	fmt.Printf("plan %s  state=%s  hunks=%d  revisions=%d  sessions=%d  attributed=%.0f%%\n",
 		proposal.ID, result.Packet.State, len(proposal.Hunks), len(proposal.Revisions),
 		len(sessions), result.Attributed.Coverage*100)
@@ -309,9 +326,18 @@ func printPlan(result hvplan.Result, sessions []session.Session) {
 		for _, file := range revision.Files {
 			fmt.Printf("       %s\n", file)
 		}
-		if len(revision.SessionIDs) > 0 {
-			fmt.Printf("       session %s (%s)\n",
-				shortID(revision.SessionIDs[0]), revision.ProvenanceStatus)
+		// Attribution comes from hv's own links rather than the revision's
+		// provenance field: demux stamps that field only from exact or fuzzy
+		// links, and hv's matcher produces temporal ones, so the field is
+		// usually empty even when every hunk is accounted for. A revision can
+		// also draw on several sessions - demux pairs a test with its source,
+		// and those are routinely different sessions.
+		if contributors := revisionSessions(revision, result.Attributed.Links); len(contributors) > 0 {
+			names := make([]string, 0, len(contributors))
+			for _, id := range contributors {
+				names = append(names, sessionName(id, short, sessions))
+			}
+			fmt.Printf("       from %s\n", strings.Join(names, ", "))
 		}
 	}
 	for _, warning := range proposal.FeasibilityWarnings {
@@ -327,6 +353,60 @@ func withState(sessions []session.Session, want session.State, now int64) []sess
 		}
 	}
 	return out
+}
+
+// revisionSessions returns the sessions whose edits landed in a revision, in
+// the order their hunks appear.
+func revisionSessions(revision demux.RevisionProposal, links []matcher.HunkLink) []string {
+	if len(links) == 0 {
+		return nil
+	}
+	bySession := map[string]string{}
+	for _, link := range links {
+		bySession[link.HunkID] = link.SessionID
+	}
+	ids := revision.HunkIDs
+	if len(ids) == 0 {
+		for _, hunk := range revision.Hunks {
+			ids = append(ids, hunk.ID)
+		}
+	}
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, id := range ids {
+		sessionID := bySession[id]
+		if sessionID == "" {
+			continue
+		}
+		if _, ok := seen[sessionID]; ok {
+			continue
+		}
+		seen[sessionID] = struct{}{}
+		out = append(out, sessionID)
+	}
+	return out
+}
+
+// sessionName labels a session id with the title it goes by, so a plan reads
+// in the same terms as the picker that produced it.
+func sessionName(id string, short map[string]string, sessions []session.Session) string {
+	abbreviated, ok := short[id]
+	if !ok {
+		abbreviated = shortID(id)
+	}
+	for _, current := range sessions {
+		if current.ID == id && strings.TrimSpace(current.Title) != "" {
+			return fmt.Sprintf("%s (%s)", current.Title, abbreviated)
+		}
+	}
+	return abbreviated
+}
+
+func plural(word string, count int) string {
+	if count == 1 {
+		return word
+	}
+	return word + "s"
 }
 
 func routeOf(revision demux.RevisionProposal) string {
