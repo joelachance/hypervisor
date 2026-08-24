@@ -23,17 +23,52 @@ Working end to end against real session logs. `hv merge` finds the sessions
 that edited this repo, asks which to merge, attributes their edits to hunks,
 and prints demux's revision plan with provenance stamped on each revision.
 
+## The browser
+
+Bare `hv` opens a fullscreen session browser (Bubble Tea + Lipgloss), scoped to
+the repository you are standing in:
+
+```
+ hv  21 sessions  ·  3 active  ·  ~/git/hv
+────────────────────────────────────────────────────────────────────────────────
+❯   ● cli How demux works                          0be860ce      now
+    ● app Matias Bug                               0ef82004       8m
+    ○ app benchmarks                               07696390      24m  1 merged 1 open
+    ○ app Topo codebase indexing product plan      c687636d       3d
+────────────────────────────────────────────────────────────────────────────────
+ benchmarks (user-named)
+ id 07696390-a38b-4346-a415-056548f21fd1
+ repo ~/git/yeet   branch claude/gx-review-code-bench-f18173
+ edits 425 in 217 files   model claude-opus-5   prs #1 open
+
+ ↑↓ move  ·  space mark  ·  enter merge  ·  o open  ·  / filter  ·  a archived  ·  q quit
+```
+
+Colors carry state rather than decorate it: a filled green dot for active
+against a hollow grey one, purple for app sessions and blue for CLI, PR badges
+colored by state. The palette is adaptive, so it renders into the terminal
+theme already in use instead of assuming a dark background.
+
+The browser owns no session logic - it reads through the same packages the
+flags do, and collects an intent rather than acting. `enter` exits with the
+chosen sessions and planning happens on the normal path, where the output can
+be scrolled and piped. **Everything it does has a flag**, because a feature
+reachable only by hand cannot be scripted or run over ssh in a hurry.
+
 ## Commands
 
 ```bash
 go build -o hv ./cmd/hv
 
+hv                           # the browser, scoped to this repo
+hv -all-repos                # …unscoped
 hv sessions                  # title, id, active/stale - newest first, 7 days
 hv sessions -tool codex      # one tool; -state active; -since 6h; -json
 hv watch                     # tail edits as they land
 hv merge                     # pick sessions in this repo, plan their changes
 hv merge -session a1b2,c3d4  # merge named sessions without the picker
 hv merge -all -repair -json  # every candidate, repaired, as a plan packet
+hv open <session>            # reopen a session where it lives
 ```
 
 ## How sessions register
