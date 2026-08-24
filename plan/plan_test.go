@@ -164,3 +164,48 @@ func TestFallbackProvenanceNamesAtMostOneSession(t *testing.T) {
 		t.Errorf("fallback for two sessions = %v, want silence rather than crediting both", got)
 	}
 }
+
+// hv watches every session on the machine, so a selection can span
+// repositories - a plan cannot, and each group gets its own.
+func TestGroupByRepoSplitsSelectionsAcrossRepositories(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	first, second := newRepo(t), newRepo(t)
+	sessions := []session.Session{
+		{ID: "s1", Files: []string{filepath.Join(first, "billing.go")}},
+		{ID: "s2", Files: []string{filepath.Join(second, "billing.go")}},
+		{ID: "s3", Files: []string{filepath.Join(first, "billing.go")}},
+	}
+	order, groups, problems := GroupByRepo(context.Background(), sessions)
+	if len(problems) != 0 {
+		t.Fatalf("problems = %v", problems)
+	}
+	if len(order) != 2 {
+		t.Fatalf("order = %v, want one entry per repository", order)
+	}
+	if len(groups[order[0]]) != 2 || len(groups[order[1]]) != 1 {
+		t.Fatalf("groups = %v, want the two sessions in the first repo together", groups)
+	}
+}
+
+// A session's recorded directory is where the agent started, which may be a
+// parent of the repository or a worktree; the files it edited are better
+// evidence.
+func TestRepoOfPrefersEditedFilesOverTheRecordedDirectory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := newRepo(t)
+	got, err := RepoOf(context.Background(), session.Session{
+		ID:       "s1",
+		RepoRoot: filepath.Dir(repo), // the parent, which is not a repository
+		Files:    []string{filepath.Join(repo, "billing.go")},
+	})
+	if err != nil {
+		t.Fatalf("RepoOf() error = %v", err)
+	}
+	if filepath.Base(got) != filepath.Base(repo) {
+		t.Fatalf("RepoOf() = %q, want the repository the file lives in", got)
+	}
+}

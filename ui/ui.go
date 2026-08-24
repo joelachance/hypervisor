@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -39,8 +40,12 @@ type Outcome struct {
 type Options struct {
 	// MaxAge bounds how far back the log sweep reads.
 	MaxAge time.Duration
-	// RepoRoot, when set, preselects the filter to this repository.
+	// RepoRoot is the repository hv was started in, if any. It is not a
+	// filter - the browser shows every session by default - it is what the
+	// scope key toggles to when someone wants to narrow to where they are.
 	RepoRoot string
+	// ScopeToRepo starts narrowed to RepoRoot instead of showing everything.
+	ScopeToRepo bool
 }
 
 type mode int
@@ -87,7 +92,7 @@ func Run(ctx context.Context, options Options) (Outcome, error) {
 		watcher:  watcher,
 		chosen:   map[string]bool{},
 		repoRoot: options.RepoRoot,
-		repoOnly: options.RepoRoot != "",
+		repoOnly: options.ScopeToRepo && options.RepoRoot != "",
 		now:      time.Now().UnixMilli(),
 		status:   "reading session logs…",
 	}
@@ -228,7 +233,11 @@ func (m model) updateBrowse(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.archived = !m.archived
 		m.applyFilter()
 	case "r":
-		m.repoOnly = !m.repoOnly && m.repoRoot != ""
+		if m.repoRoot == "" {
+			m.status = "not inside a repository, so there is nothing to narrow to"
+			break
+		}
+		m.repoOnly = !m.repoOnly
 		m.applyFilter()
 	case "/":
 		m.mode = modeFilter
@@ -374,9 +383,9 @@ func (m model) header() string {
 			active++
 		}
 	}
-	scope := "all repos"
+	scope := "every repo"
 	if m.repoOnly && m.repoRoot != "" {
-		scope = shortPath(m.repoRoot)
+		scope = shortPath(m.repoRoot) + " only"
 	}
 	left := lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render("hv")
 	counts := styleCount.Render(fmt.Sprintf(
@@ -440,7 +449,9 @@ func (m model) row(current session.Session, highlighted bool) string {
 		dot = styleActiveDot.Render("●")
 	}
 
-	origin := styleDim.Render("   ")
+	// Where it runs when that is known, otherwise which tool it is - Codex and
+	// Cursor record no entrypoint, and a blank column looks like missing data.
+	origin := styleDim.Render(fmt.Sprintf("%-3s", toolBadge(current.Tool)))
 	switch current.Origin {
 	case session.OriginApp:
 		origin = styleBadgeApp.Render("app")
@@ -458,16 +469,19 @@ func (m model) row(current session.Session, highlighted bool) string {
 
 	// The title gets whatever the terminal has left after the fixed columns,
 	// so a narrow window loses the title's tail rather than wrapping the row.
-	// cursor, mark, dot, origin, id, age, and the PR badge each take a fixed
-	// column; the title takes what is left.
-	fixed := 2 + 2 + 2 + 4 + 14 + 9 + 16
+	// cursor, mark, dot, origin, repo, id, age, and the PR badge each take a
+	// fixed column; the title takes what is left.
+	fixed := 2 + 2 + 2 + 4 + 14 + 14 + 9 + 16
 	titleWidth := m.width - fixed
 	if titleWidth < 12 {
 		titleWidth = 12
 	}
 
-	line := fmt.Sprintf("%s%s%s %s %s %s %s %s",
+	line := fmt.Sprintf("%s%s%s %s %s %s %s %s %s",
 		cursor, mark, dot, origin,
+		// The repo is a column now that the browser spans all of them: a
+		// title alone does not say where the work is.
+		styleDim.Render(fmt.Sprintf("%-13s", truncate(repoName(current), 13))),
 		titleStyle.Width(titleWidth).Render(truncate(current.Label(), titleWidth)),
 		styleDim.Render(fmt.Sprintf("%13s", m.label(current))),
 		styleDim.Render(fmt.Sprintf("%8s", humanAge(m.now-current.LastActiveAt))),
@@ -565,7 +579,7 @@ func (m model) footer() string {
 		key("enter", "merge"),
 		key("o", "open"),
 		key("/", "filter"),
-		key("r", "all repos"),
+		m.scopeKey(),
 		key("a", "archived"),
 		key("q", "quit"),
 	}
@@ -576,6 +590,15 @@ func (m model) footer() string {
 		line = strings.Join(keys, separator)
 	}
 	return styleFooter.Width(m.width).Render(line)
+}
+
+// scopeKey names what r will do next rather than what is on, so the footer
+// reads as an action.
+func (m model) scopeKey() string {
+	if m.repoOnly {
+		return styleKey.Render("r") + styleDim.Render(" every repo")
+	}
+	return styleKey.Render("r") + styleDim.Render(" this repo")
 }
 
 func humanAge(millis int64) string {
@@ -590,6 +613,25 @@ func humanAge(millis int64) string {
 	default:
 		return fmt.Sprintf("%dd", int(age.Hours()/24))
 	}
+}
+
+// toolBadge is a three-letter tool name, cut rather than elided: an ellipsis
+// in a three-character column costs a third of the word to say nothing.
+func toolBadge(tool string) string {
+	if len(tool) <= 3 {
+		return tool
+	}
+	return tool[:3]
+}
+
+// repoName is the last path element of a session's directory, which is what
+// people call the repository.
+func repoName(current session.Session) string {
+	root := strings.TrimSpace(current.RepoRoot)
+	if root == "" {
+		return ""
+	}
+	return filepath.Base(root)
 }
 
 func (m model) label(current session.Session) string {

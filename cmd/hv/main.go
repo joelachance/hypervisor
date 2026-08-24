@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -66,7 +67,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `hv - watch coding sessions, merge their changes into a demux plan
 
-  hv                                            open the session browser
+  hv [-repo]                                    open the session browser
   hv sessions [-tool t] [-since d] [-state s]   list coding sessions
   hv watch [-interval d]                        tail session edits as they land
   hv merge [-session IDs] [-C dir] [-json]      plan the changes n sessions made
@@ -106,14 +107,15 @@ func uiCmd(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("ui", flag.ExitOnError)
 	dir := flags.String("C", ".", "run as if started in this directory")
 	since := flags.Duration("since", 7*24*time.Hour, "how far back to read session logs")
-	allRepos := flags.Bool("all-repos", false, "start unfiltered rather than scoped to this repository")
+	scoped := flags.Bool("repo", false, "start narrowed to this repository instead of showing every session")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	options := ui.Options{MaxAge: *since}
-	// Being in a repository is a strong hint about what the person means; if
-	// they are somewhere else entirely, the browser opens unscoped.
-	if root, err := hvplan.RepoRoot(ctx, *dir); err == nil && !*allRepos {
+	options := ui.Options{MaxAge: *since, ScopeToRepo: *scoped}
+	// The repository is remembered so the scope key has something to narrow
+	// to, not to filter by: hv watches every session on the machine, and a
+	// browser that hid the others would be lying about what it is.
+	if root, err := hvplan.RepoRoot(ctx, *dir); err == nil {
 		options.RepoRoot = root
 	}
 	outcome, err := ui.Run(ctx, options)
@@ -123,27 +125,43 @@ func uiCmd(ctx context.Context, args []string) error {
 	if len(outcome.Merge) == 0 {
 		return nil
 	}
-	root := options.RepoRoot
-	if root == "" {
-		root, err = hvplan.RepoRoot(ctx, *dir)
-		if err != nil {
-			return err
+	_, events, err := scan(*since)
+	if err != nil {
+		return err
+	}
+	return planPerRepo(ctx, outcome.Merge, events)
+}
+
+// planPerRepo plans each repository the chosen sessions worked in.
+//
+// A plan is per repository by construction - it is a diff of one worktree -
+// but a selection is not: hv lists every session on the machine, so picking
+// three of them can reach three different repositories. Each gets its own
+// plan rather than one being silently chosen.
+func planPerRepo(ctx context.Context, sessions []session.Session, events []capture.SessionEvent) error {
+	order, groups, problems := hvplan.GroupByRepo(ctx, sessions)
+	for _, problem := range problems {
+		fmt.Fprintf(os.Stderr, "hv: %v\n", problem)
+	}
+	for index, root := range order {
+		if len(order) > 1 {
+			if index > 0 {
+				fmt.Println()
+			}
+			fmt.Printf("=== %s ===\n", root)
 		}
+		result, err := hvplan.Run(ctx, hvplan.Request{
+			RepoRoot: root,
+			Sessions: groups[root],
+			Events:   events,
+		})
+		if err != nil {
+			// One repository with nothing to plan must not lose the others.
+			fmt.Fprintf(os.Stderr, "hv: %s: %v\n", root, err)
+			continue
+		}
+		printPlan(result, groups[root])
 	}
-	watcher, events, err := scan(*since)
-	if err != nil {
-		return err
-	}
-	_ = watcher
-	result, err := hvplan.Run(ctx, hvplan.Request{
-		RepoRoot: root,
-		Sessions: outcome.Merge,
-		Events:   events,
-	})
-	if err != nil {
-		return err
-	}
-	printPlan(result, outcome.Merge)
 	return nil
 }
 
@@ -187,8 +205,9 @@ func sessionsCmd(args []string) error {
 	}
 	short := session.Abbreviate(sessions, 8)
 	for _, current := range sessions {
-		fmt.Printf("%-6s %-4s %-34s %-13s %3d edits  %-9s %s\n",
-			current.State(now.UnixMilli()), originLabel(current), truncate(current.Label(), 34),
+		fmt.Printf("%-6s %-3s %-12s %-30s %-13s %3d edits  %-9s %s\n",
+			current.State(now.UnixMilli()), originLabel(current),
+			truncate(repoName(current), 12), truncate(current.Label(), 30),
 			short[current.ID], current.EditCount,
 			humanAge(now.UnixMilli()-current.LastActiveAt), landedLabel(current))
 	}
@@ -229,13 +248,20 @@ func mergeCmd(ctx context.Context, args []string) error {
 		return err
 	}
 
-	root, err := hvplan.RepoRoot(ctx, *dir)
-	if err != nil {
-		return err
-	}
 	watcher, events, err := scan(*since)
 	if err != nil {
 		return err
+	}
+
+	// The repository is only needed for the paths that plan here: naming
+	// sessions by id plans each one where it lives, and hv is routinely run
+	// from outside any repository at all.
+	named := splitIDs(*sessionIDs)
+	root := ""
+	if len(named) == 0 {
+		if root, err = hvplan.RepoRoot(ctx, *dir); err != nil {
+			return err
+		}
 	}
 
 	sessions, cancelled, err := chooseSessions(watcher, root, *sessionIDs, *since, *all)
@@ -253,6 +279,12 @@ func mergeCmd(ctx context.Context, args []string) error {
 		// Attributing hunks to sessions nobody selected would stamp provenance
 		// the person never asked for. An unattributed plan says so honestly.
 		events = nil
+	}
+	// Sessions named by id can come from anywhere - hv watches the whole
+	// machine - so they are planned in their own repositories rather than
+	// forced into whichever directory hv happens to be standing in.
+	if len(named) > 0 {
+		return planPerRepo(ctx, sessions, events)
 	}
 	result, err := hvplan.Run(ctx, hvplan.Request{
 		RepoRoot: root,
@@ -441,8 +473,23 @@ func originLabel(current session.Session) string {
 	case session.OriginCLI:
 		return "cli"
 	default:
+		// Codex and Cursor record no entrypoint; name the tool instead, cut to
+		// the same width so the column stays a column.
+		if len(current.Tool) > 3 {
+			return current.Tool[:3]
+		}
 		return current.Tool
 	}
+}
+
+// repoName is the last path element of a session's directory - hv lists every
+// session on the machine, so a title alone does not say where the work is.
+func repoName(current session.Session) string {
+	root := strings.TrimSpace(current.RepoRoot)
+	if root == "" {
+		return ""
+	}
+	return filepath.Base(root)
 }
 
 // landedLabel reports what became of the session's work, using the pull

@@ -25,16 +25,18 @@ and prints demux's revision plan with provenance stamped on each revision.
 
 ## The browser
 
-Bare `hv` opens a fullscreen session browser (Bubble Tea + Lipgloss), scoped to
-the repository you are standing in:
+Bare `hv` opens a fullscreen session browser (Bubble Tea + Lipgloss). It shows
+**every session on the machine**, whatever directory you started it in - it is
+a hypervisor, not a repository tool. `r` narrows to the repo you are standing
+in when you want that; `-repo` starts narrowed.
 
 ```
- hv  21 sessions  ·  3 active  ·  ~/git/hv
+ hv  21 sessions  ·  3 active  ·  every repo
 ────────────────────────────────────────────────────────────────────────────────
-❯   ● cli How demux works                          0be860ce      now
-    ● app Matias Bug                               0ef82004       8m
-    ○ app benchmarks                               07696390      24m  1 merged 1 open
-    ○ app Topo codebase indexing product plan      c687636d       3d
+❯   ● cli hv        How demux works                0be860ce      now
+    ● app console   Matias Bug                     0ef82004       8m
+    ○ app yeet      benchmarks                     07696390      24m  1 merged 1 open
+    ○ cod topo      (untitled)                     c687636d       3d
 ────────────────────────────────────────────────────────────────────────────────
  benchmarks (user-named)
  id 07696390-a38b-4346-a415-056548f21fd1
@@ -60,13 +62,13 @@ reachable only by hand cannot be scripted or run over ssh in a hurry.
 ```bash
 go build -o hv ./cmd/hv
 
-hv                           # the browser, scoped to this repo
-hv -all-repos                # …unscoped
+hv                           # the browser: every session, every repo
+hv -repo                     # …narrowed to this repository
 hv sessions                  # title, id, active/stale - newest first, 7 days
 hv sessions -tool codex      # one tool; -state active; -since 6h; -json
 hv watch                     # tail edits as they land
 hv merge                     # pick sessions in this repo, plan their changes
-hv merge -session a1b2,c3d4  # merge named sessions without the picker
+hv merge -session a1b2,c3d4  # named sessions, each planned in its own repo
 hv merge -all -repair -json  # every candidate, repaired, as a plan packet
 hv open <session>            # reopen a session where it lives
 ```
@@ -143,6 +145,12 @@ twice:
 The second pass must receive a byte-identical diff and otherwise identical
 options, or the links land on the wrong hunks. `plan.Run` enforces this by
 building the diff once.
+
+## A demo you can run
+
+`~/git/fake` holds three throwaway repositories and a synthetic session store
+with five sessions across them. See its README; `./hv` there is a wrapper that
+points the binary at the fake store, and `./reset.sh` puts it back.
 
 ## Testing against a synthetic store
 

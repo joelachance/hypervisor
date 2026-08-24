@@ -186,3 +186,49 @@ func eventsFor(sessions []session.Session, events []capture.SessionEvent) []capt
 	}
 	return out
 }
+
+// RepoOf resolves the repository a session's work belongs to.
+//
+// A session's recorded directory is where the agent was started, which is not
+// always the repository: it may be a parent directory, or a worktree whose
+// root differs from the checkout it was launched from. The files it actually
+// edited are the better evidence, so they are asked first and the recorded
+// directory is the fallback.
+func RepoOf(ctx context.Context, current session.Session) (string, error) {
+	for _, file := range current.Files {
+		if !filepath.IsAbs(file) {
+			continue
+		}
+		if root, err := RepoRoot(ctx, filepath.Dir(file)); err == nil {
+			return root, nil
+		}
+	}
+	if root := strings.TrimSpace(current.RepoRoot); root != "" {
+		return RepoRoot(ctx, root)
+	}
+	return "", fmt.Errorf("session %s is not in a repository", current.ID)
+}
+
+// GroupByRepo sorts sessions into the repositories their work lives in,
+// returning the roots in the order they were first seen.
+//
+// Selecting across repositories is normal for hv - it watches every session on
+// the machine, not the one directory it was started in - and a plan is
+// necessarily per repository, so the caller runs one per group.
+func GroupByRepo(ctx context.Context, sessions []session.Session) ([]string, map[string][]session.Session, []error) {
+	order := []string{}
+	groups := map[string][]session.Session{}
+	problems := []error{}
+	for _, current := range sessions {
+		root, err := RepoOf(ctx, current)
+		if err != nil {
+			problems = append(problems, err)
+			continue
+		}
+		if _, ok := groups[root]; !ok {
+			order = append(order, root)
+		}
+		groups[root] = append(groups[root], current)
+	}
+	return order, groups, problems
+}
