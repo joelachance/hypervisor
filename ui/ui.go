@@ -20,6 +20,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/satoricorp/demux/capture"
 	"github.com/satoricorp/hv/desktop"
 	"github.com/satoricorp/hv/launch"
 	"github.com/satoricorp/hv/parse"
@@ -32,7 +33,9 @@ import (
 // plans or merges itself: it collects an intent and hands it back, so the
 // planning path stays identical whether a person clicked or typed flags.
 type Outcome struct {
-	// Merge holds the sessions chosen for merging, empty if none.
+	// Merge holds the sessions whose plan should be printed on exit, empty if
+	// none. The browser plans on screen; this is only for carrying the same
+	// plan out to a normal terminal where it can be scrolled back to or piped.
 	Merge []session.Session
 }
 
@@ -55,6 +58,17 @@ const (
 	modeFilter
 )
 
+// screen is which view is on top. The browser picks sessions; the plan screen
+// shows what demux made of them, which is the part that answers "what did it
+// actually do".
+type screen int
+
+const (
+	screenSessions screen = iota
+	screenPlanning
+	screenPlan
+)
+
 type model struct {
 	watcher  *watch.Watcher
 	all      []session.Session
@@ -65,6 +79,10 @@ type model struct {
 	width    int
 	height   int
 	mode     mode
+	screen   screen
+	events   []capture.SessionEvent
+	plans    []planGroup
+	plan     planCursor
 	filter   string
 	archived bool
 	repoOnly bool
@@ -78,7 +96,13 @@ type model struct {
 
 type refreshedMsg struct {
 	sessions []session.Session
+	events   []capture.SessionEvent
 	err      error
+}
+
+type plannedMsg struct {
+	groups []planGroup
+	err    error
 }
 
 type tickMsg time.Time
@@ -114,16 +138,17 @@ func (m model) Init() tea.Cmd {
 // like a hang.
 func refresh(watcher *watch.Watcher) tea.Cmd {
 	return func() tea.Msg {
-		if _, err := watcher.Scan(); err != nil {
+		events, err := watcher.Scan()
+		if err != nil {
 			return refreshedMsg{err: err}
 		}
 		records, err := desktop.Load()
 		if err != nil {
 			// The registry is an enhancement; losing it costs titles, not
 			// sessions.
-			return refreshedMsg{sessions: watcher.Sessions()}
+			return refreshedMsg{sessions: watcher.Sessions(), events: events}
 		}
-		return refreshedMsg{sessions: desktop.Apply(watcher.Sessions(), records)}
+		return refreshedMsg{sessions: desktop.Apply(watcher.Sessions(), records), events: events}
 	}
 }
 
@@ -145,8 +170,22 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.all = msg.sessions
+		if len(msg.events) > 0 {
+			m.events = msg.events
+		}
 		m.status = ""
 		m.applyFilter()
+		return m, nil
+
+	case plannedMsg:
+		if msg.err != nil {
+			m.screen = screenSessions
+			m.status = "could not plan: " + msg.err.Error()
+			return m, nil
+		}
+		m.plans = msg.groups
+		m.plan = planCursor{}
+		m.screen = screenPlan
 		return m, nil
 
 	case tickMsg:
@@ -162,10 +201,19 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		if m.mode == modeFilter {
+		switch {
+		case m.mode == modeFilter:
 			return m.updateFilter(msg)
+		case m.screen == screenPlan:
+			return m.updatePlan(msg)
+		case m.screen == screenPlanning:
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			return m, nil
+		default:
+			return m.updateBrowse(msg)
 		}
-		return m.updateBrowse(msg)
 	}
 	return m, nil
 }
@@ -219,12 +267,14 @@ func (m model) updateBrowse(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "enter":
-		m.outcome = Outcome{Merge: m.selected()}
-		if len(m.outcome.Merge) == 0 {
+		chosen := m.selected()
+		if len(chosen) == 0 {
 			m.status = "nothing selected - space marks a session, enter merges"
 			return m, nil
 		}
-		return m, tea.Quit
+		m.outcome = Outcome{Merge: chosen}
+		m.screen = screenPlanning
+		return m, planCmd(chosen, m.events)
 
 	case "o":
 		return m.openCurrent()
@@ -389,6 +439,12 @@ func (m model) View() string {
 	}
 	if m.err != nil {
 		return styleError.Render("hv: " + m.err.Error())
+	}
+	switch m.screen {
+	case screenPlanning:
+		return m.planningView()
+	case screenPlan:
+		return m.planView()
 	}
 	sections := []string{m.header(), m.list(), m.detail(), m.footer()}
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)

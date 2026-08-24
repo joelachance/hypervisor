@@ -51,11 +51,36 @@ against a hollow grey one, purple for app sessions and blue for CLI, PR badges
 colored by state. The palette is adaptive, so it renders into the terminal
 theme already in use instead of assuming a dark background.
 
+`enter` plans the marked sessions and opens the plan on screen:
+
+```
+ plan  ~/git/fake/alpha  ·  2 revisions  ·  3 hunks  ·  ready_to_apply
+────────────────────────────────────────────────────────────────────────────────
+❯ u1  internal/alpha.go                     → feature/internal    rate limiter
+  u2  internal/limiter.go, limiter_test.go  → feature/internal    rate limiter, tests
+────────────────────────────────────────────────────────────────────────────────
+ diff --git a/internal/alpha.go b/internal/alpha.go
+ @@ -1,3 +1,3 @@
+  package alpha
+ -func Version() string { return "0.1" }
+ +func Version() string { return "0.2" }
+
+ ↑↓ move  ·  tab diff  ·  esc back  ·  enter print & exit  ·  q quit   nothing applied
+```
+
+Each revision names the files it owns, the branch it would be routed to, and
+the sessions whose edits are in it; the pane below is that revision's exact
+patch. `tab` moves the keys into the diff to scroll it, `esc` goes back to the
+sessions with your marks intact, `[` and `]` switch repositories when the
+selection spanned several. `enter` leaves with the plan on stdout.
+
+**Nothing is applied.** No branch is created, no commit is written, the working
+tree is untouched - `feature/internal` above is a proposed name, not an
+existing branch. Applying is out of scope for this module; see below.
+
 The browser owns no session logic - it reads through the same packages the
-flags do, and collects an intent rather than acting. `enter` exits with the
-chosen sessions and planning happens on the normal path, where the output can
-be scrolled and piped. **Everything it does has a flag**, because a feature
-reachable only by hand cannot be scripted or run over ssh in a hurry.
+flags do. **Everything it does has a flag**, because a feature reachable only
+by hand cannot be scripted or run over ssh in a hurry.
 
 ## Commands
 
