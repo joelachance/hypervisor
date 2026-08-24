@@ -19,19 +19,28 @@ import (
 	hvplan "github.com/satoricorp/hv/plan"
 	"github.com/satoricorp/hv/selection"
 	"github.com/satoricorp/hv/session"
+	"github.com/satoricorp/hv/ui"
 	"github.com/satoricorp/hv/watch"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	// Bare `hv` opens the browser. Every one of its actions is also a flag,
+	// so nothing here is reachable only by hand.
+	if len(os.Args) < 2 {
+		if err := uiCmd(ctx, nil); err != nil && err != context.Canceled {
+			fmt.Fprintf(os.Stderr, "hv: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	var err error
 	switch os.Args[1] {
+	case "ui":
+		err = uiCmd(ctx, os.Args[2:])
 	case "sessions":
 		err = sessionsCmd(os.Args[2:])
 	case "watch":
@@ -56,6 +65,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `hv - watch coding sessions, merge their changes into a demux plan
 
+  hv                                            open the session browser
   hv sessions [-tool t] [-since d] [-state s]   list coding sessions
   hv watch [-interval d]                        tail session edits as they land
   hv merge [-session IDs] [-C dir] [-json]      plan the changes n sessions made
@@ -86,6 +96,54 @@ func sessionsOf(watcher *watch.Watcher) []session.Session {
 		return watcher.Sessions()
 	}
 	return desktop.Apply(watcher.Sessions(), records)
+}
+
+// uiCmd runs the browser, then carries out whatever it was asked for. The TUI
+// collects an intent and exits; planning happens on the normal path, with its
+// output on a normal terminal where it can be read, scrolled, and piped.
+func uiCmd(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("ui", flag.ExitOnError)
+	dir := flags.String("C", ".", "run as if started in this directory")
+	since := flags.Duration("since", 7*24*time.Hour, "how far back to read session logs")
+	allRepos := flags.Bool("all-repos", false, "start unfiltered rather than scoped to this repository")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	options := ui.Options{MaxAge: *since}
+	// Being in a repository is a strong hint about what the person means; if
+	// they are somewhere else entirely, the browser opens unscoped.
+	if root, err := hvplan.RepoRoot(ctx, *dir); err == nil && !*allRepos {
+		options.RepoRoot = root
+	}
+	outcome, err := ui.Run(ctx, options)
+	if err != nil {
+		return err
+	}
+	if len(outcome.Merge) == 0 {
+		return nil
+	}
+	root := options.RepoRoot
+	if root == "" {
+		root, err = hvplan.RepoRoot(ctx, *dir)
+		if err != nil {
+			return err
+		}
+	}
+	watcher, events, err := scan(*since)
+	if err != nil {
+		return err
+	}
+	_ = watcher
+	result, err := hvplan.Run(ctx, hvplan.Request{
+		RepoRoot: root,
+		Sessions: outcome.Merge,
+		Events:   events,
+	})
+	if err != nil {
+		return err
+	}
+	printPlan(result, outcome.Merge)
+	return nil
 }
 
 func sessionsCmd(args []string) error {

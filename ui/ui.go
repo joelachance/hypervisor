@@ -1,0 +1,601 @@
+// Package ui is hv's fullscreen session browser.
+//
+// It is a view over the same packages the CLI uses - watch indexes the logs,
+// desktop overlays the app's registry, selection filters, launch reopens - and
+// it owns no session logic of its own. Anything the browser can do, a flag can
+// do too, because a TUI that is the only way to reach a feature cannot be
+// scripted, piped, or run over ssh in a hurry.
+package ui
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"sort"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/satoricorp/hv/desktop"
+	"github.com/satoricorp/hv/launch"
+	"github.com/satoricorp/hv/selection"
+	"github.com/satoricorp/hv/session"
+	"github.com/satoricorp/hv/watch"
+)
+
+// Outcome is what the browser was asked to do once it exits. The TUI never
+// plans or merges itself: it collects an intent and hands it back, so the
+// planning path stays identical whether a person clicked or typed flags.
+type Outcome struct {
+	// Merge holds the sessions chosen for merging, empty if none.
+	Merge []session.Session
+}
+
+// Options configure a browser run.
+type Options struct {
+	// MaxAge bounds how far back the log sweep reads.
+	MaxAge time.Duration
+	// RepoRoot, when set, preselects the filter to this repository.
+	RepoRoot string
+}
+
+type mode int
+
+const (
+	modeBrowse mode = iota
+	modeFilter
+)
+
+type model struct {
+	watcher  *watch.Watcher
+	all      []session.Session
+	rows     []session.Session
+	chosen   map[string]bool
+	cursor   int
+	offset   int
+	width    int
+	height   int
+	mode     mode
+	filter   string
+	archived bool
+	repoOnly bool
+	repoRoot string
+	status   string
+	err      error
+	outcome  Outcome
+	now      int64
+}
+
+type refreshedMsg struct {
+	sessions []session.Session
+	err      error
+}
+
+type tickMsg time.Time
+
+// Run opens the browser and returns what the person asked for.
+func Run(ctx context.Context, options Options) (Outcome, error) {
+	watcher := watch.New(nil, 0)
+	watcher.MaxAge = options.MaxAge
+
+	initial := model{
+		watcher:  watcher,
+		chosen:   map[string]bool{},
+		repoRoot: options.RepoRoot,
+		repoOnly: options.RepoRoot != "",
+		now:      time.Now().UnixMilli(),
+		status:   "reading session logs…",
+	}
+	program := tea.NewProgram(initial, tea.WithAltScreen(), tea.WithContext(ctx))
+	final, err := program.Run()
+	if err != nil {
+		return Outcome{}, err
+	}
+	done, _ := final.(model)
+	return done.outcome, done.err
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(refresh(m.watcher), tick())
+}
+
+// refresh sweeps the logs off the UI thread; a first sweep over a year of
+// transcripts takes seconds, and blocking the render loop for it would look
+// like a hang.
+func refresh(watcher *watch.Watcher) tea.Cmd {
+	return func() tea.Msg {
+		if _, err := watcher.Scan(); err != nil {
+			return refreshedMsg{err: err}
+		}
+		records, err := desktop.Load()
+		if err != nil {
+			// The registry is an enhancement; losing it costs titles, not
+			// sessions.
+			return refreshedMsg{sessions: watcher.Sessions()}
+		}
+		return refreshedMsg{sessions: desktop.Apply(watcher.Sessions(), records)}
+	}
+}
+
+// tick re-renders on a slow beat so "2m ago" and the active dot stay true
+// without the person pressing anything.
+func tick() tea.Cmd {
+	return tea.Tick(15*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := message.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+
+	case refreshedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.all = msg.sessions
+		m.status = ""
+		m.applyFilter()
+		return m, nil
+
+	case tickMsg:
+		m.now = time.Now().UnixMilli()
+		return m, tea.Batch(refresh(m.watcher), tick())
+
+	case launchedMsg:
+		if msg.err != nil {
+			m.status = "could not open: " + msg.err.Error()
+		} else {
+			m.status = "opened " + msg.detail
+		}
+		return m, nil
+
+	case tea.KeyMsg:
+		if m.mode == modeFilter {
+			return m.updateFilter(msg)
+		}
+		return m.updateBrowse(msg)
+	}
+	return m, nil
+}
+
+func (m model) updateFilter(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.Type {
+	case tea.KeyEnter, tea.KeyEscape:
+		m.mode = modeBrowse
+		if key.Type == tea.KeyEscape {
+			m.filter = ""
+			m.applyFilter()
+		}
+	case tea.KeyBackspace:
+		if m.filter != "" {
+			m.filter = m.filter[:len(m.filter)-1]
+			m.applyFilter()
+		}
+	case tea.KeyRunes, tea.KeySpace:
+		m.filter += string(key.Runes)
+		if key.Type == tea.KeySpace {
+			m.filter += " "
+		}
+		m.applyFilter()
+	}
+	return m, nil
+}
+
+func (m model) updateBrowse(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "q", "esc", "ctrl+c":
+		return m, tea.Quit
+
+	case "up", "k":
+		m.moveCursor(-1)
+	case "down", "j":
+		m.moveCursor(1)
+	case "pgup":
+		m.moveCursor(-m.listHeight())
+	case "pgdown":
+		m.moveCursor(m.listHeight())
+	case "home", "g":
+		m.cursor, m.offset = 0, 0
+	case "end", "G":
+		m.cursor = len(m.rows) - 1
+		m.clampCursor()
+
+	case " ":
+		if current, ok := m.current(); ok {
+			m.chosen[current.ID] = !m.chosen[current.ID]
+			m.moveCursor(1)
+		}
+
+	case "enter":
+		m.outcome = Outcome{Merge: m.selected()}
+		if len(m.outcome.Merge) == 0 {
+			m.status = "nothing selected - space marks a session, enter merges"
+			return m, nil
+		}
+		return m, tea.Quit
+
+	case "o":
+		return m.openCurrent()
+
+	case "a":
+		m.archived = !m.archived
+		m.applyFilter()
+	case "r":
+		m.repoOnly = !m.repoOnly && m.repoRoot != ""
+		m.applyFilter()
+	case "/":
+		m.mode = modeFilter
+	case "ctrl+r":
+		m.status = "rescanning…"
+		return m, refresh(m.watcher)
+	}
+	return m, nil
+}
+
+type launchedMsg struct {
+	detail string
+	err    error
+}
+
+// openCurrent hands the terminal to the session. An attach or a resume takes
+// over this process, so the browser releases the screen first; a deep link
+// hands off to another application and the browser stays up.
+func (m model) openCurrent() (tea.Model, tea.Cmd) {
+	current, ok := m.current()
+	if !ok {
+		return m, nil
+	}
+	target, err := launch.Plan(context.Background(), current)
+	if err != nil {
+		m.status = err.Error()
+		return m, nil
+	}
+	command := exec.Command(target.Command[0], target.Command[1:]...)
+	if target.Method == launch.MethodCLI {
+		command.Dir = current.RepoRoot
+	}
+	if !target.Replace {
+		return m, func() tea.Msg {
+			err := command.Run()
+			return launchedMsg{detail: current.Label() + " in the app", err: err}
+		}
+	}
+	return m, tea.ExecProcess(command, func(err error) tea.Msg {
+		return launchedMsg{detail: current.Label(), err: err}
+	})
+}
+
+func (m *model) applyFilter() {
+	filter := selection.Filter{IncludeArchived: m.archived}
+	if m.repoOnly && m.repoRoot != "" {
+		filter.TouchedUnder = m.repoRoot
+	}
+	rows := selection.Apply(m.all, filter)
+	if needle := strings.ToLower(strings.TrimSpace(m.filter)); needle != "" {
+		matched := rows[:0]
+		for _, row := range rows {
+			haystack := strings.ToLower(row.Label() + " " + row.ID + " " + row.RepoRoot + " " + row.Branch)
+			if strings.Contains(haystack, needle) {
+				matched = append(matched, row)
+			}
+		}
+		rows = matched
+	}
+	sort.SliceStable(rows, func(left, right int) bool {
+		return rows[left].LastActiveAt > rows[right].LastActiveAt
+	})
+	m.rows = rows
+	m.clampCursor()
+}
+
+func (m *model) moveCursor(delta int) {
+	m.cursor += delta
+	m.clampCursor()
+}
+
+func (m *model) clampCursor() {
+	if m.cursor >= len(m.rows) {
+		m.cursor = len(m.rows) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	height := m.listHeight()
+	if m.cursor < m.offset {
+		m.offset = m.cursor
+	}
+	if height > 0 && m.cursor >= m.offset+height {
+		m.offset = m.cursor - height + 1
+	}
+	if m.offset < 0 {
+		m.offset = 0
+	}
+}
+
+func (m model) current() (session.Session, bool) {
+	if m.cursor < 0 || m.cursor >= len(m.rows) {
+		return session.Session{}, false
+	}
+	return m.rows[m.cursor], true
+}
+
+// selected returns the marked sessions, falling back to the highlighted one -
+// pressing enter on a session you are looking at should merge that session,
+// not complain that you forgot to mark it.
+func (m model) selected() []session.Session {
+	chosen := []session.Session{}
+	for _, row := range m.rows {
+		if m.chosen[row.ID] {
+			chosen = append(chosen, row)
+		}
+	}
+	if len(chosen) == 0 {
+		if current, ok := m.current(); ok {
+			chosen = append(chosen, current)
+		}
+	}
+	return chosen
+}
+
+// listHeight is the rows available after the header, detail panel, and footer.
+func (m model) listHeight() int {
+	height := m.height - detailHeight - 3
+	if height < 1 {
+		return 1
+	}
+	return height
+}
+
+const detailHeight = 6
+
+func (m model) View() string {
+	if m.width == 0 {
+		return "starting…"
+	}
+	if m.err != nil {
+		return styleError.Render("hv: " + m.err.Error())
+	}
+	sections := []string{m.header(), m.list(), m.detail(), m.footer()}
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+func (m model) header() string {
+	active := 0
+	for _, row := range m.rows {
+		if row.State(m.now) == session.StateActive {
+			active++
+		}
+	}
+	scope := "all repos"
+	if m.repoOnly && m.repoRoot != "" {
+		scope = shortPath(m.repoRoot)
+	}
+	left := lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render("hv")
+	counts := styleCount.Render(fmt.Sprintf(
+		"  %d sessions  ·  %d active  ·  %s%s", len(m.rows), active, scope, archivedNote(m.archived)))
+	return styleTitleBar.Width(m.width).Render(left + counts)
+}
+
+func archivedNote(archived bool) string {
+	if archived {
+		return "  ·  including archived"
+	}
+	return ""
+}
+
+func (m model) list() string {
+	if len(m.rows) == 0 {
+		return lipgloss.NewStyle().Height(m.listHeight()).Padding(1, 2).
+			Render(styleDim.Render("no sessions match"))
+	}
+	height := m.listHeight()
+	lines := make([]string, 0, height)
+	for index := m.offset; index < len(m.rows) && len(lines) < height; index++ {
+		lines = append(lines, m.row(m.rows[index], index == m.cursor))
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) row(current session.Session, highlighted bool) string {
+	cursor := "  "
+	if highlighted {
+		cursor = styleCursor.Render("❯ ")
+	}
+	mark := "  "
+	if m.chosen[current.ID] {
+		mark = styleSelected.Render("● ")
+	}
+
+	dot := styleStaleDot.Render("○")
+	if current.State(m.now) == session.StateActive {
+		dot = styleActiveDot.Render("●")
+	}
+
+	origin := styleDim.Render("   ")
+	switch current.Origin {
+	case session.OriginApp:
+		origin = styleBadgeApp.Render("app")
+	case session.OriginCLI:
+		origin = styleBadgeCLI.Render("cli")
+	}
+
+	titleStyle := styleRow
+	if current.State(m.now) != session.StateActive {
+		titleStyle = styleRowDim
+	}
+	if highlighted {
+		titleStyle = titleStyle.Bold(true)
+	}
+
+	// The title gets whatever the terminal has left after the fixed columns,
+	// so a narrow window loses the title's tail rather than wrapping the row.
+	fixed := 2 + 2 + 2 + 4 + 11 + 10 + 14
+	titleWidth := m.width - fixed
+	if titleWidth < 12 {
+		titleWidth = 12
+	}
+
+	line := fmt.Sprintf("%s%s%s %s %s %s %s %s",
+		cursor, mark, dot, origin,
+		titleStyle.Width(titleWidth).Render(truncate(current.Label(), titleWidth)),
+		styleDim.Render(fmt.Sprintf("%9s", shortID(current.ID))),
+		styleDim.Render(fmt.Sprintf("%8s", humanAge(m.now-current.LastActiveAt))),
+		prBadge(current))
+	if highlighted {
+		return styleHighlight.Width(m.width).Render(line)
+	}
+	return line
+}
+
+func prBadge(current session.Session) string {
+	if len(current.PRs) == 0 {
+		return ""
+	}
+	counts := map[string]int{}
+	for _, pr := range current.PRs {
+		counts[strings.ToUpper(pr.State)]++
+	}
+	parts := []string{}
+	if count := counts["MERGED"]; count > 0 {
+		parts = append(parts, stylePRMerged.Render(fmt.Sprintf("%d merged", count)))
+	}
+	if count := counts["OPEN"]; count > 0 {
+		parts = append(parts, stylePROpen.Render(fmt.Sprintf("%d open", count)))
+	}
+	if count := counts["CLOSED"]; count > 0 {
+		parts = append(parts, stylePRClosed.Render(fmt.Sprintf("%d closed", count)))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (m model) detail() string {
+	current, ok := m.current()
+	if !ok {
+		return styleDetail.Width(m.width).Height(detailHeight).Render("")
+	}
+	field := func(label, value string) string {
+		if strings.TrimSpace(value) == "" {
+			return ""
+		}
+		return styleLabel.Render(label+" ") + styleValue.Render(value)
+	}
+	titleSource := ""
+	if current.TitleSource != "" {
+		titleSource = styleDim.Render(" (" + current.TitleSource + "-named)")
+	}
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(current.Label()) + titleSource,
+		field("id", current.ID),
+		strings.TrimSpace(strings.Join([]string{
+			field("repo", shortPath(current.RepoRoot)),
+			field("branch", current.Branch),
+		}, "   ")),
+		strings.TrimSpace(strings.Join([]string{
+			field("edits", fmt.Sprintf("%d in %d files", current.EditCount, len(current.Files))),
+			field("model", current.Model),
+			prLinks(current),
+		}, "   ")),
+	}
+	if m.status != "" {
+		lines = append(lines, styleDim.Render(m.status))
+	}
+	return styleDetail.Width(m.width).Height(detailHeight).Render(strings.Join(lines, "\n"))
+}
+
+func prLinks(current session.Session) string {
+	if len(current.PRs) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(current.PRs))
+	for _, pr := range current.PRs {
+		style := stylePROpen
+		switch strings.ToUpper(pr.State) {
+		case "MERGED":
+			style = stylePRMerged
+		case "CLOSED":
+			style = stylePRClosed
+		}
+		parts = append(parts, style.Render(fmt.Sprintf("#%d %s", pr.Number, strings.ToLower(pr.State))))
+	}
+	return styleLabel.Render("prs ") + strings.Join(parts, ", ")
+}
+
+func (m model) footer() string {
+	if m.mode == modeFilter {
+		return styleFilter.Width(m.width).Render("/" + m.filter + "█")
+	}
+	key := func(k, label string) string { return styleKey.Render(k) + styleDim.Render(" "+label) }
+	keys := []string{
+		key("↑↓", "move"),
+		key("space", "mark"),
+		key("enter", "merge"),
+		key("o", "open"),
+		key("/", "filter"),
+		key("a", "archived"),
+		key("q", "quit"),
+	}
+	return styleFooter.Width(m.width).Render(strings.Join(keys, styleDim.Render("  ·  ")))
+}
+
+func humanAge(millis int64) string {
+	age := time.Duration(millis) * time.Millisecond
+	switch {
+	case age < time.Minute:
+		return "now"
+	case age < time.Hour:
+		return fmt.Sprintf("%dm", int(age.Minutes()))
+	case age < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(age.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(age.Hours()/24))
+	}
+}
+
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+func shortPath(path string) string {
+	if home := homeDir(); home != "" && strings.HasPrefix(path, home) {
+		return "~" + strings.TrimPrefix(path, home)
+	}
+	return path
+}
+
+func truncate(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	if limit < 2 {
+		return string(runes[:limit])
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
+func homeDir() string {
+	dir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+// NewForTest builds a browser model over a fixed session list, for tests and
+// for rendering a frame without a terminal.
+func NewForTest(sessions []session.Session) tea.Model {
+	built := model{chosen: map[string]bool{}, now: time.Now().UnixMilli(), all: sessions}
+	built.applyFilter()
+	return built
+}
