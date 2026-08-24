@@ -56,3 +56,30 @@ func TestDefaultRegistryCoversEveryTool(t *testing.T) {
 		}
 	}
 }
+
+func TestSetHomeOverridesEnvironmentAndDefault(t *testing.T) {
+	t.Setenv(HomeEnv, "/from/env")
+	if Home() != "/from/env" {
+		t.Fatalf("Home() = %q, want the environment override", Home())
+	}
+	SetHome("/from/flag")
+	defer SetHome("")
+	if Home() != "/from/flag" {
+		t.Fatalf("Home() = %q, want the explicit override to win", Home())
+	}
+	if IsDefaultHome() {
+		t.Error("a store other than the home directory must not report as the default")
+	}
+}
+
+// Roots follow the store, so pointing hv elsewhere moves every tool's logs
+// together rather than mixing a synthetic store with the real one.
+func TestRootsFollowTheStore(t *testing.T) {
+	SetHome("/synthetic")
+	defer SetHome("")
+	for _, root := range Default().Roots() {
+		if !strings.HasPrefix(root, "/synthetic/") {
+			t.Errorf("root %q escaped the store", root)
+		}
+	}
+}

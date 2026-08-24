@@ -153,8 +153,17 @@ const maxLogLineBytes = 16 * 1024 * 1024
 // produce.
 const HomeEnv = "HV_HOME"
 
+var homeOverride string
+
+// SetHome points hv at another directory to read session logs under, taking
+// precedence over HomeEnv. An empty string restores the default.
+func SetHome(dir string) { homeOverride = strings.TrimSpace(dir) }
+
 // Home is the directory hv reads session logs under.
 func Home() string {
+	if homeOverride != "" {
+		return homeOverride
+	}
 	if override := strings.TrimSpace(os.Getenv(HomeEnv)); override != "" {
 		return override
 	}
@@ -163,6 +172,14 @@ func Home() string {
 		return ""
 	}
 	return dir
+}
+
+// IsDefaultHome reports whether hv is reading the real session store. When it
+// is not, every listing says so: two stores that look alike but hold different
+// sessions is the kind of confusion that wastes an afternoon.
+func IsDefaultHome() bool {
+	dir, err := os.UserHomeDir()
+	return err == nil && Home() == dir
 }
 
 // home expands a path relative to Home. An unresolvable home yields an empty

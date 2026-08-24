@@ -18,6 +18,7 @@ import (
 	"github.com/satoricorp/demux/matcher"
 	"github.com/satoricorp/hv/desktop"
 	"github.com/satoricorp/hv/launch"
+	"github.com/satoricorp/hv/parse"
 	hvplan "github.com/satoricorp/hv/plan"
 	"github.com/satoricorp/hv/selection"
 	"github.com/satoricorp/hv/session"
@@ -68,6 +69,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `hv - watch coding sessions, merge their changes into a demux plan
 
   hv [-repo]                                    open the session browser
+  hv -store DIR                                 read a different session store
   hv sessions [-tool t] [-since d] [-state s]   list coding sessions
   hv watch [-interval d]                        tail session edits as they land
   hv merge [-session IDs] [-C dir] [-json]      plan the changes n sessions made
@@ -103,14 +105,34 @@ func sessionsOf(watcher *watch.Watcher) []session.Session {
 // uiCmd runs the browser, then carries out whatever it was asked for. The TUI
 // collects an intent and exits; planning happens on the normal path, with its
 // output on a normal terminal where it can be read, scrolled, and piped.
+// storeFlag registers -store, which points hv at a session store other than
+// the real one. It exists so trying hv against a synthetic store needs no
+// wrapper script and no environment variable - the two things that made it
+// possible to run the wrong binary and conclude hv was broken.
+func storeFlag(flags *flag.FlagSet) *string {
+	return flags.String("store", "",
+		"read session logs from this directory instead of your home directory")
+}
+
+func applyStore(store string) {
+	if strings.TrimSpace(store) != "" {
+		parse.SetHome(store)
+	}
+	if !parse.IsDefaultHome() {
+		fmt.Fprintf(os.Stderr, "hv: reading sessions from %s\n", parse.Home())
+	}
+}
+
 func uiCmd(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("ui", flag.ExitOnError)
+	store := storeFlag(flags)
 	dir := flags.String("C", ".", "run as if started in this directory")
 	since := flags.Duration("since", 7*24*time.Hour, "how far back to read session logs")
 	scoped := flags.Bool("repo", false, "start narrowed to this repository instead of showing every session")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	applyStore(*store)
 	options := ui.Options{MaxAge: *since, ScopeToRepo: *scoped}
 	// The repository is remembered so the scope key has something to narrow
 	// to, not to filter by: hv watches every session on the machine, and a
@@ -167,6 +189,7 @@ func planPerRepo(ctx context.Context, sessions []session.Session, events []captu
 
 func sessionsCmd(args []string) error {
 	flags := flag.NewFlagSet("sessions", flag.ExitOnError)
+	store := storeFlag(flags)
 	tool := flags.String("tool", "", "restrict to one tool (claude, codex, cursor)")
 	since := flags.Duration("since", 7*24*time.Hour, "only sessions that wrote within this window")
 	state := flags.String("state", "", "restrict to active or stale sessions")
@@ -178,6 +201,7 @@ func sessionsCmd(args []string) error {
 		return err
 	}
 
+	applyStore(*store)
 	watcher, _, err := scan(*since)
 	if err != nil {
 		return err
@@ -216,11 +240,13 @@ func sessionsCmd(args []string) error {
 
 func watchCmd(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("watch", flag.ExitOnError)
+	store := storeFlag(flags)
 	interval := flags.Duration("interval", watch.DefaultInterval, "sweep interval")
 	since := flags.Duration("since", time.Hour, "ignore logs untouched for longer than this")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	applyStore(*store)
 	watcher := watch.New(nil, *interval)
 	watcher.MaxAge = *since
 	fmt.Fprintf(os.Stderr, "watching session logs every %s; ctrl-c to stop\n", *interval)
@@ -236,6 +262,7 @@ func watchCmd(ctx context.Context, args []string) error {
 
 func mergeCmd(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("merge", flag.ExitOnError)
+	store := storeFlag(flags)
 	dir := flags.String("C", ".", "run as if started in this directory")
 	sessionIDs := flags.String("session", "", "session IDs or prefixes to merge (comma separated)")
 	since := flags.Duration("since", 24*time.Hour, "only consider sessions active within this window")
@@ -248,6 +275,7 @@ func mergeCmd(ctx context.Context, args []string) error {
 		return err
 	}
 
+	applyStore(*store)
 	watcher, events, err := scan(*since)
 	if err != nil {
 		return err
@@ -520,6 +548,7 @@ func landedLabel(current session.Session) string {
 
 func openCmd(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("open", flag.ExitOnError)
+	store := storeFlag(flags)
 	dryRun := flags.Bool("n", false, "print the command instead of running it")
 	since := flags.Duration("since", 30*24*time.Hour, "how far back to look for the session")
 	if err := flags.Parse(args); err != nil {
@@ -528,6 +557,7 @@ func openCmd(ctx context.Context, args []string) error {
 	if flags.NArg() != 1 {
 		return fmt.Errorf("usage: hv open <session id or prefix>")
 	}
+	applyStore(*store)
 	watcher, _, err := scan(*since)
 	if err != nil {
 		return err

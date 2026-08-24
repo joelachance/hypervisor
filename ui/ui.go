@@ -408,6 +408,11 @@ func (m model) header() string {
 	left := lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render("hv")
 	counts := styleCount.Render(fmt.Sprintf(
 		"  %d sessions  ·  %d active  ·  %s%s", len(m.rows), active, scope, archivedNote(m.archived)))
+	// Say which store this is whenever it is not the real one. Two stores that
+	// look alike but hold different sessions is a confusing way to lose time.
+	if !parse.IsDefaultHome() {
+		counts += styleKey.Render("  ·  store " + shortPath(parse.Home()))
+	}
 	return styleTitleBar.Width(m.width).Render(left + counts)
 }
 
