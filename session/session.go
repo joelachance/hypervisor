@@ -183,6 +183,9 @@ func (i *Index) Observe(event capture.SessionEvent) {
 	if origin := strings.TrimSpace(parse.Origin(event)); origin != "" {
 		current.Origin = origin
 	}
+	if log := strings.TrimSpace(parse.LogPath(event)); log != "" {
+		current.LogPath = log
+	}
 	if current.Summary == "" && event.Kind == capture.KindMessage {
 		current.Summary = summarize(event.PromptContext)
 	}

@@ -192,21 +192,47 @@ func home(parts ...string) string {
 	return filepath.Join(append([]string{dir}, parts...)...)
 }
 
+// RawLog is the key under which the watcher stamps the file an event was read
+// from, so a session's transcript can be re-read on demand without searching
+// every root for it again.
+const RawLog = "log"
+
+// LogPath returns the file an event was read from.
+func LogPath(event capture.SessionEvent) string { return rawString(event, RawLog) }
+
+func rawString(event capture.SessionEvent, key string) string {
+	encoded, ok := event.Raw[key]
+	if !ok {
+		return ""
+	}
+	var value string
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		return ""
+	}
+	return value
+}
+
+// StampLog records the source file on a batch of events.
+func StampLog(events []capture.SessionEvent, path string) {
+	encoded, err := json.Marshal(path)
+	if err != nil {
+		return
+	}
+	for index := range events {
+		if events[index].Raw == nil {
+			events[index].Raw = map[string]json.RawMessage{}
+		}
+		events[index].Raw[RawLog] = encoded
+	}
+}
+
 // RawOrigin is the key under which parsers stash where a session is running -
 // Claude Code records this as "entrypoint": cli for a terminal, claude-desktop
 // for the app.
 const RawOrigin = "origin"
 
 // Origin returns where a parser recorded the session as running.
-func Origin(event capture.SessionEvent) string {
-	var origin string
-	if encoded, ok := event.Raw[RawOrigin]; ok {
-		if err := json.Unmarshal(encoded, &origin); err == nil {
-			return origin
-		}
-	}
-	return ""
-}
+func Origin(event capture.SessionEvent) string { return rawString(event, RawOrigin) }
 
 // RawTitle is the key under which parsers stash a session's own title - the
 // name its tool shows for it. A title is a property of the session, not of the
@@ -214,15 +240,7 @@ func Origin(event capture.SessionEvent) string {
 const RawTitle = "title"
 
 // Title returns the session title a parser recorded on an event.
-func Title(event capture.SessionEvent) string {
-	var title string
-	if encoded, ok := event.Raw[RawTitle]; ok {
-		if err := json.Unmarshal(encoded, &title); err == nil {
-			return title
-		}
-	}
-	return ""
-}
+func Title(event capture.SessionEvent) string { return rawString(event, RawTitle) }
 
 // rawTitle builds the Raw bag carrying a session title.
 func rawTitle(title string) map[string]json.RawMessage {

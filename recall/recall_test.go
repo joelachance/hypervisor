@@ -1,0 +1,115 @@
+package recall
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/satoricorp/hv/session"
+)
+
+func TestSummarizeIsExtractiveAndKeepsBothEnds(t *testing.T) {
+	current := session.Session{ID: "s1", Tool: "claude", Title: "rate limiter", RepoRoot: "/repo"}
+	items := []Item{
+		{Kind: KindUser, Text: "add a rate limiter to alpha"},
+		{Kind: KindTool, Tool: "edit", File: "internal/limiter.go"},
+		{Kind: KindTool, Tool: "read", File: "internal/other.go"},
+		{Kind: KindTool, Tool: "edit", File: "internal/limiter.go"},
+		{Kind: KindAssistant, Text: "added a token bucket limiter with tests"},
+	}
+	summary := Summarize(current, items)
+	if summary.Intent != "add a rate limiter to alpha" {
+		t.Errorf("intent = %q, want the first thing asked", summary.Intent)
+	}
+	if summary.Outcome != "added a token bucket limiter with tests" {
+		t.Errorf("outcome = %q, want the last thing said", summary.Outcome)
+	}
+	if len(summary.Files) != 1 || summary.Files[0] != "internal/limiter.go" {
+		t.Errorf("files = %v, want edits only, deduplicated", summary.Files)
+	}
+	if !strings.Contains(summary.Line, "rate limiter") || !strings.Contains(summary.Line, "token bucket") {
+		t.Errorf("line = %q, want title and outcome", summary.Line)
+	}
+}
+
+func TestSummarizeFallsBackToTheSessionsFileSet(t *testing.T) {
+	current := session.Session{ID: "s1", Title: "no transcript", Files: []string{"a.go", "b.go"}}
+	if summary := Summarize(current, nil); len(summary.Files) != 2 {
+		t.Fatalf("files = %v, want the session's own file set when no edits were parsed", summary.Files)
+	}
+}
+
+func storeAt(t *testing.T) *Store {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "recall.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func TestStoreKeepsTheNewestRecordPerSession(t *testing.T) {
+	store := storeAt(t)
+	if err := store.Put(Summary{SessionID: "s1", Line: "old", At: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(Summary{SessionID: "s1", Line: "new", At: 200}); err != nil {
+		t.Fatal(err)
+	}
+	all, err := store.All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].Line != "new" {
+		t.Fatalf("all = %+v, want one record, the newer", all)
+	}
+}
+
+// Same-repo first is the whole retrieval strategy: a past session in this
+// repository beats a better-worded one somewhere else.
+func TestSameRepoScopesAndExcludes(t *testing.T) {
+	store := storeAt(t)
+	store.Put(Summary{SessionID: "s1", Repo: "/repo", Line: "here", At: 300})
+	store.Put(Summary{SessionID: "s2", Repo: "/other", Line: "elsewhere", At: 400})
+	store.Put(Summary{SessionID: "s3", Repo: "/repo", Line: "also here", At: 500})
+
+	got, err := store.SameRepo("/repo", "s3", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SessionID != "s1" {
+		t.Fatalf("SameRepo() = %+v, want only s1 - s2 is another repo, s3 is excluded", got)
+	}
+}
+
+func TestSearchMatchesEveryTerm(t *testing.T) {
+	store := storeAt(t)
+	store.Put(Summary{SessionID: "s1", Line: "rate limiter for billing", At: 100})
+	store.Put(Summary{SessionID: "s2", Line: "retry bug in beta", At: 200})
+
+	if got, _ := store.Search("rate billing", 10); len(got) != 1 || got[0].SessionID != "s1" {
+		t.Errorf("Search() = %+v, want the session matching both terms", got)
+	}
+	if got, _ := store.Search("rate retry", 10); len(got) != 0 {
+		t.Errorf("Search() = %+v, want none - no summary has both terms", got)
+	}
+}
+
+// The retrieval a conflict needs: who else has been in these exact files.
+func TestTouchingFindsSessionsInTheSameFiles(t *testing.T) {
+	store := storeAt(t)
+	store.Put(Summary{SessionID: "s1", Files: []string{"/repo/internal/alpha.go"}, At: 100})
+	store.Put(Summary{SessionID: "s2", Files: []string{"/repo/internal/other.go"}, At: 200})
+
+	got, err := store.Touching([]string{"/repo/internal/alpha.go"}, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SessionID != "s1" {
+		t.Fatalf("Touching() = %+v, want only the session that edited that file", got)
+	}
+	// Absolute and relative paths for the same file must match each other.
+	if got, _ := store.Touching([]string{"internal/alpha.go"}, "", 10); len(got) != 1 {
+		t.Errorf("Touching() with a relative path = %+v, want the same session", got)
+	}
+}

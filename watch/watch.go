@@ -157,6 +157,7 @@ func (w *Watcher) tail(path string) ([]capture.SessionEvent, error) {
 	if err != nil {
 		return nil, err
 	}
+	parse.StampLog(events, path)
 	// Cursor transcripts carry no time at all, so their events are stamped
 	// from the log file instead - without a stamp they sort as if they had
 	// happened at epoch. This is deliberately limited to formats that declare
