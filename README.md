@@ -74,12 +74,12 @@ patch. `tab` moves the keys into the diff to scroll it, `esc` goes back to the
 sessions with your marks intact, `[` and `]` switch repositories when the
 selection spanned several. `enter` leaves with the plan on stdout.
 
-`a` commits the plan. `u` on the result undoes it.
+`enter` commits the plan. `u` on the result undoes it.
 
-## Applying
+## Committing
 
-`a` in the browser, or `hv merge -commit`, writes the plan as real branches and
-commits:
+`hv merge` commits. So does `enter` on the browser's plan screen. Both write
+real branches and commits:
 
 ```
   978973a1  feature/internal   update internal/alpha.go
@@ -134,11 +134,11 @@ hv -repo                     # …narrowed to this repository
 hv sessions                  # title, id, active/stale - newest first, 7 days
 hv sessions -tool codex      # one tool; -state active; -since 6h; -json
 hv watch                     # tail edits as they land
-hv merge                     # pick sessions in this repo, plan their changes
-hv merge -session a1b2,c3d4  # named sessions, each planned in its own repo
+hv merge                     # pick sessions in this repo, commit their changes
+hv merge -session a1b2,c3d4  # named sessions, each committed in its own repo
+hv merge -dry-run            # …show the plan without committing
 hv merge -all -repair -json  # every candidate, repaired, as a plan packet
-hv merge -commit             # write the plan as real branches and commits
-hv undo -C <repo>            # take the last applied plan back
+hv undo -C <repo>            # take the last merge back
 hv open <session>            # reopen a session where it lives
 ```
 

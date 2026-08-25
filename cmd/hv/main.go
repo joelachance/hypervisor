@@ -75,14 +75,15 @@ func usage() {
   hv -store DIR                                 read a different session store
   hv sessions [-tool t] [-since d] [-state s]   list coding sessions
   hv watch [-interval d]                        tail session edits as they land
-  hv merge [-session IDs] [-C dir] [-json]      plan the changes n sessions made
+  hv merge [-session IDs] [-C dir]              commit the changes n sessions made
+  hv merge -dry-run                             …show the plan without committing
   hv open <session>                             reopen a session where it lives
-  hv merge -commit                              write the plan as real commits
-  hv undo [-C dir] [-list]                      undo the last applied plan
+  hv undo [-C dir] [-list]                      undo the last merge
 
 With no -session, merge lists the sessions that touched this repo and asks
-which to merge. Selected sessions' edits are attributed to their hunks and
-demux groups, orders, and routes the result.
+which to merge. Their edits are attributed to hunks, grouped into revisions,
+routed onto branches, and committed. Nothing is checked out and the working
+tree is left exactly as it was; hv undo takes the commits back.
 `)
 }
 
@@ -188,11 +189,17 @@ func planPerRepo(ctx context.Context, sessions []session.Session, events []captu
 			continue
 		}
 		printPlan(result, groups[root])
-		if commit {
-			if err := commitPlan(ctx, root, result, groups[root]); err != nil {
-				fmt.Fprintf(os.Stderr, "hv: %s: %v\n", root, err)
-			}
+		if !commit {
+			continue
 		}
+		if err := commitPlan(ctx, root, result, groups[root]); err != nil {
+			// One repository failing to commit must not stop the others; the
+			// ones that succeeded each printed their own undo command.
+			fmt.Fprintf(os.Stderr, "hv: %s: %v\n", root, err)
+		}
+	}
+	if !commit {
+		fmt.Fprintln(os.Stderr, "\ndry run: nothing was committed")
 	}
 	return nil
 }
@@ -280,7 +287,7 @@ func mergeCmd(ctx context.Context, args []string) error {
 	staged := flags.Bool("staged", false, "plan staged changes only")
 	intent := flags.String("intent", "", "intent prefix for proposed revisions")
 	repair := flags.Bool("repair", false, "apply demux's deterministic repair hints to the plan")
-	commit := flags.Bool("commit", false, "write the plan as real branches and commits")
+	dryRun := flags.Bool("dry-run", false, "show the plan without committing anything")
 	asJSON := flags.Bool("json", false, "print the full demux plan packet as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -322,8 +329,11 @@ func mergeCmd(ctx context.Context, args []string) error {
 	// Sessions named by id can come from anywhere - hv watches the whole
 	// machine - so they are planned in their own repositories rather than
 	// forced into whichever directory hv happens to be standing in.
+	// merge commits. Reviewing without committing is what -dry-run is for, and
+	// -json is an inspection flag, so neither writes anything.
+	commit := !*dryRun && !*asJSON
 	if len(named) > 0 {
-		return planPerRepo(ctx, sessions, events, *commit)
+		return planPerRepo(ctx, sessions, events, commit)
 	}
 	result, err := hvplan.Run(ctx, hvplan.Request{
 		RepoRoot: root,
@@ -342,9 +352,10 @@ func mergeCmd(ctx context.Context, args []string) error {
 		return encoder.Encode(result.Packet)
 	}
 	printPlan(result, sessions)
-	if *commit {
+	if commit {
 		return commitPlan(ctx, root, result, sessions)
 	}
+	fmt.Fprintln(os.Stderr, "\ndry run: nothing was committed")
 	return nil
 }
 
