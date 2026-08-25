@@ -16,6 +16,7 @@ import (
 	"github.com/satoricorp/demux"
 	"github.com/satoricorp/demux/capture"
 	"github.com/satoricorp/demux/matcher"
+	"github.com/satoricorp/hv/apply"
 	"github.com/satoricorp/hv/desktop"
 	"github.com/satoricorp/hv/launch"
 	"github.com/satoricorp/hv/parse"
@@ -52,6 +53,8 @@ func main() {
 		err = mergeCmd(ctx, os.Args[2:])
 	case "open":
 		err = openCmd(ctx, os.Args[2:])
+	case "undo":
+		err = undoCmd(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -74,6 +77,8 @@ func usage() {
   hv watch [-interval d]                        tail session edits as they land
   hv merge [-session IDs] [-C dir] [-json]      plan the changes n sessions made
   hv open <session>                             reopen a session where it lives
+  hv merge -commit                              write the plan as real commits
+  hv undo [-C dir] [-list]                      undo the last applied plan
 
 With no -session, merge lists the sessions that touched this repo and asks
 which to merge. Selected sessions' edits are attributed to their hunks and
@@ -151,7 +156,7 @@ func uiCmd(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return planPerRepo(ctx, outcome.Merge, events)
+	return planPerRepo(ctx, outcome.Merge, events, false)
 }
 
 // planPerRepo plans each repository the chosen sessions worked in.
@@ -160,7 +165,7 @@ func uiCmd(ctx context.Context, args []string) error {
 // but a selection is not: hv lists every session on the machine, so picking
 // three of them can reach three different repositories. Each gets its own
 // plan rather than one being silently chosen.
-func planPerRepo(ctx context.Context, sessions []session.Session, events []capture.SessionEvent) error {
+func planPerRepo(ctx context.Context, sessions []session.Session, events []capture.SessionEvent, commit bool) error {
 	order, groups, problems := hvplan.GroupByRepo(ctx, sessions)
 	for _, problem := range problems {
 		fmt.Fprintf(os.Stderr, "hv: %v\n", problem)
@@ -183,6 +188,11 @@ func planPerRepo(ctx context.Context, sessions []session.Session, events []captu
 			continue
 		}
 		printPlan(result, groups[root])
+		if commit {
+			if err := commitPlan(ctx, root, result, groups[root]); err != nil {
+				fmt.Fprintf(os.Stderr, "hv: %s: %v\n", root, err)
+			}
+		}
 	}
 	return nil
 }
@@ -270,6 +280,7 @@ func mergeCmd(ctx context.Context, args []string) error {
 	staged := flags.Bool("staged", false, "plan staged changes only")
 	intent := flags.String("intent", "", "intent prefix for proposed revisions")
 	repair := flags.Bool("repair", false, "apply demux's deterministic repair hints to the plan")
+	commit := flags.Bool("commit", false, "write the plan as real branches and commits")
 	asJSON := flags.Bool("json", false, "print the full demux plan packet as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -312,7 +323,7 @@ func mergeCmd(ctx context.Context, args []string) error {
 	// machine - so they are planned in their own repositories rather than
 	// forced into whichever directory hv happens to be standing in.
 	if len(named) > 0 {
-		return planPerRepo(ctx, sessions, events)
+		return planPerRepo(ctx, sessions, events, *commit)
 	}
 	result, err := hvplan.Run(ctx, hvplan.Request{
 		RepoRoot: root,
@@ -331,6 +342,110 @@ func mergeCmd(ctx context.Context, args []string) error {
 		return encoder.Encode(result.Packet)
 	}
 	printPlan(result, sessions)
+	if *commit {
+		return commitPlan(ctx, root, result, sessions)
+	}
+	return nil
+}
+
+// commitPlan writes a plan to the repository and reports what it wrote.
+func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions []session.Session) error {
+	entry, err := apply.Apply(ctx, root, result.Packet, apply.Options{
+		SessionIDs: selection.IDs(sessions),
+		Trailers:   sessionTitles(sessions),
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	for _, commit := range entry.Commits {
+		fmt.Printf("  %s  %-24s %s\n", commit.SHA[:8], commit.Branch, commit.Subject)
+	}
+	created, extended := 0, 0
+	for _, branch := range entry.Branches {
+		if branch.Created() {
+			created++
+		} else {
+			extended++
+		}
+	}
+	fmt.Printf("\n%d commits on %d branches (%d new, %d extended); working tree untouched\n",
+		len(entry.Commits), len(entry.Branches), created, extended)
+	fmt.Printf("undo with: hv undo -C %s\n", root)
+	return nil
+}
+
+func sessionTitles(sessions []session.Session) map[string]string {
+	titles := map[string]string{}
+	for _, current := range sessions {
+		titles[current.ID] = current.Label()
+	}
+	return titles
+}
+
+func undoCmd(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("undo", flag.ExitOnError)
+	dir := flags.String("C", ".", "run as if started in this directory")
+	list := flags.Bool("list", false, "list applied plans instead of undoing one")
+	id := flags.String("id", "", "undo this entry rather than the most recent")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	root, err := hvplan.RepoRoot(ctx, *dir)
+	if err != nil {
+		return err
+	}
+	history, err := apply.History(ctx, root)
+	if err != nil {
+		return err
+	}
+	if *list {
+		if len(history) == 0 {
+			fmt.Println("no plans have been applied here")
+			return nil
+		}
+		for _, entry := range history {
+			state := "applied"
+			if entry.Undone() {
+				state = "undone"
+			}
+			fmt.Printf("%-24s %-8s %d commits  %s\n", entry.ID, state, len(entry.Commits),
+				time.UnixMilli(entry.AppliedAt).Format("01-02 15:04:05"))
+			for _, commit := range entry.Commits {
+				fmt.Printf("    %s  %-24s %s\n", commit.SHA[:8], commit.Branch, commit.Subject)
+			}
+		}
+		return nil
+	}
+
+	entry, found := apply.Entry{}, false
+	if strings.TrimSpace(*id) != "" {
+		for _, candidate := range history {
+			if candidate.ID == *id {
+				entry, found = candidate, true
+			}
+		}
+		if !found {
+			return fmt.Errorf("no applied plan %q in %s", *id, root)
+		}
+	} else if entry, found, err = apply.Last(ctx, root); err != nil {
+		return err
+	} else if !found {
+		return fmt.Errorf("nothing to undo in %s", root)
+	}
+
+	undone, err := apply.Undo(ctx, entry)
+	if err != nil {
+		return err
+	}
+	for _, branch := range undone.Branches {
+		if branch.Created() {
+			fmt.Printf("  deleted %s\n", branch.Name)
+			continue
+		}
+		fmt.Printf("  reset %s to %s\n", branch.Name, branch.Before[:8])
+	}
+	fmt.Printf("\nundid %d commits; working tree untouched\n", len(undone.Commits))
 	return nil
 }
 

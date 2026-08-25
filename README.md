@@ -74,9 +74,51 @@ patch. `tab` moves the keys into the diff to scroll it, `esc` goes back to the
 sessions with your marks intact, `[` and `]` switch repositories when the
 selection spanned several. `enter` leaves with the plan on stdout.
 
-**Nothing is applied.** No branch is created, no commit is written, the working
-tree is untouched - `feature/internal` above is a proposed name, not an
-existing branch. Applying is out of scope for this module; see below.
+`a` commits the plan. `u` on the result undoes it.
+
+## Applying
+
+`a` in the browser, or `hv merge -commit`, writes the plan as real branches and
+commits:
+
+```
+  978973a1  feature/internal   update internal/alpha.go
+  276fc77f  feature/internal   update internal/limiter
+
+2 commits on 1 branches (1 new, 0 extended); working tree untouched
+undo with: hv undo -C ~/git/fake/alpha
+```
+
+Nothing is ever checked out. Each revision's patch goes into a temporary index
+(`read-tree`, `apply --cached`, `write-tree`, `commit-tree`) and the branch ref
+moves last, which has three consequences worth relying on:
+
+- **the working tree keeps every change**, exactly as it was, so nothing is
+  lost if the commits turn out wrong;
+- a dirty tree is not an obstacle, and it always is one here - committing part
+  of a mixed working tree is the whole point;
+- **undo is only ref surgery**, because refs are the only thing that changed.
+
+Revisions routed to the same branch become successive commits on it, in plan
+order. An existing branch is extended from its own tip rather than rewritten:
+hv adds commits, it never discards anyone else's. Session provenance is written
+into the commit as `hv-session:` trailers, so it survives outside hv.
+
+### Undo
+
+```bash
+hv undo -C <repo>          # take back the last applied plan
+hv undo -C <repo> -list    # what has been applied here, and what is undone
+hv undo -C <repo> -id ...  # an earlier one
+```
+
+Branches hv created are deleted; branches it extended are reset to the commit
+they were at. The commits stay in the object database, unreferenced, where the
+reflog keeps them recoverable. **If a branch has moved since it was applied,
+undo refuses** rather than throwing away whatever moved it.
+
+Every apply is journalled in `.git/hv-journal.jsonl`, inside the git directory
+so it never appears as an untracked file in the tree hv is planning.
 
 The browser owns no session logic - it reads through the same packages the
 flags do. **Everything it does has a flag**, because a feature reachable only
@@ -95,6 +137,8 @@ hv watch                     # tail edits as they land
 hv merge                     # pick sessions in this repo, plan their changes
 hv merge -session a1b2,c3d4  # named sessions, each planned in its own repo
 hv merge -all -repair -json  # every candidate, repaired, as a plan packet
+hv merge -commit             # write the plan as real branches and commits
+hv undo -C <repo>            # take the last applied plan back
 hv open <session>            # reopen a session where it lives
 ```
 

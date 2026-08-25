@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/satoricorp/demux/capture"
+	"github.com/satoricorp/hv/apply"
 	"github.com/satoricorp/hv/desktop"
 	"github.com/satoricorp/hv/launch"
 	"github.com/satoricorp/hv/parse"
@@ -67,6 +68,7 @@ const (
 	screenSessions screen = iota
 	screenPlanning
 	screenPlan
+	screenApplied
 )
 
 type model struct {
@@ -83,6 +85,7 @@ type model struct {
 	events   []capture.SessionEvent
 	plans    []planGroup
 	plan     planCursor
+	applied  apply.Entry
 	filter   string
 	archived bool
 	repoOnly bool
@@ -177,6 +180,25 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyFilter()
 		return m, nil
 
+	case appliedMsg:
+		if msg.err != nil {
+			m.status = "could not commit: " + msg.err.Error()
+			return m, nil
+		}
+		m.applied = msg.entry
+		m.screen = screenApplied
+		m.status = ""
+		return m, nil
+
+	case undoneMsg:
+		if msg.err != nil {
+			m.status = "could not undo: " + msg.err.Error()
+			return m, nil
+		}
+		m.applied = msg.entry
+		m.status = ""
+		return m, nil
+
 	case plannedMsg:
 		if msg.err != nil {
 			m.screen = screenSessions
@@ -206,6 +228,8 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateFilter(msg)
 		case m.screen == screenPlan:
 			return m.updatePlan(msg)
+		case m.screen == screenApplied:
+			return m.updateApplied(msg)
 		case m.screen == screenPlanning:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
@@ -445,6 +469,8 @@ func (m model) View() string {
 		return m.planningView()
 	case screenPlan:
 		return m.planView()
+	case screenApplied:
+		return m.appliedView()
 	}
 	sections := []string{m.header(), m.list(), m.detail(), m.footer()}
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)

@@ -104,6 +104,12 @@ func (m model) updatePlan(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.switchGroup(-1)
 	case "]":
 		m.switchGroup(1)
+	case "a", "c":
+		// Write this repository's plan. The reader is looking at it, which is
+		// the only screen from which committing is an informed act.
+		m.status = "committing…"
+		return m, applyCmd(group)
+
 	case "enter":
 		// Leave with this plan on stdout, where it can be read at leisure,
 		// scrolled back to, or piped somewhere.
@@ -374,6 +380,7 @@ func (m model) planFooter() string {
 	keys := []string{
 		key("↑↓", "move"),
 		key("tab", pane),
+		key("a", "commit"),
 		key("esc", "back"),
 		key("enter", "print & exit"),
 	}
