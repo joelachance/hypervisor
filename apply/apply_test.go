@@ -235,3 +235,41 @@ func TestCommitMessageCarriesSessionTrailers(t *testing.T) {
 		t.Fatalf("commit message = %q, want a session trailer", body)
 	}
 }
+
+// Worktrees share one object database and one set of refs, so a merge run in
+// a worktree creates branches every checkout can see. The journal has to live
+// in the common git directory to match, or those branches are undoable only
+// from the worktree that made them - which is not where anyone would look.
+func TestJournalIsSharedAcrossWorktrees(t *testing.T) {
+	repo := repoWith(t, map[string]string{"version.go": "package main // 1\n"})
+	worktree := filepath.Join(t.TempDir(), "wt")
+	out, err := exec.Command("git", "-C", repo, "worktree", "add", "-q", worktree, "-b", "wt").CombinedOutput()
+	if err != nil {
+		t.Skipf("git worktree unavailable: %v: %s", err, out)
+	}
+
+	entry, err := Apply(context.Background(), worktree, packet(
+		[]demux.RevisionProposal{{ID: "u1", Intent: "bump", HunkIDs: []string{"h1"}, TargetStack: "feature/x"}},
+		[]demux.HunkRange{{ID: "h1", File: "version.go", Patch: bumpPatch}}), Options{})
+	if err != nil {
+		t.Fatalf("Apply() from a worktree = %v", err)
+	}
+	if gitOut(t, repo, "rev-parse", "--verify", "--quiet", "refs/heads/feature/x") == "" {
+		t.Fatal("the branch is not visible from the main checkout")
+	}
+
+	// The point of the test: the main checkout can undo what the worktree did.
+	last, ok, err := Last(context.Background(), repo)
+	if err != nil || !ok {
+		t.Fatalf("Last() from the main checkout = %v, %v; want the worktree's entry", ok, err)
+	}
+	if last.ID != entry.ID {
+		t.Fatalf("Last() = %s, want %s", last.ID, entry.ID)
+	}
+	if _, err := Undo(context.Background(), last); err != nil {
+		t.Fatalf("Undo() from the main checkout = %v", err)
+	}
+	if gitOut(t, repo, "rev-parse", "--verify", "--quiet", "refs/heads/feature/x") != "" {
+		t.Fatal("the branch survived an undo run from the main checkout")
+	}
+}

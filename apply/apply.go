@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -365,9 +366,30 @@ func asExit(err error, target **exec.ExitError) bool {
 	return ok
 }
 
-// journalPath is inside .git, so the journal travels with the repository and
-// never shows up as an untracked file in the tree hv is planning.
+// journalPath is inside the *common* git directory, so the journal travels
+// with the repository and never shows up as an untracked file in the tree hv
+// is planning.
+//
+// The common directory matters: worktrees share one object database and one
+// set of refs, so a merge run in a worktree creates branches every checkout
+// can see. A journal written to the worktree's own git directory would leave
+// those branches undoable from anywhere else, which is precisely where someone
+// would look for them.
 func journalPath(ctx context.Context, repoRoot string) (string, error) {
+	dir, err := git(ctx, repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		// Older git without --path-format; the per-worktree directory is the
+		// common one outside a worktree, which is the usual case.
+		if dir, err = git(ctx, repoRoot, "rev-parse", "--absolute-git-dir"); err != nil {
+			return "", err
+		}
+	}
+	return filepath.Join(dir, "hv-journal.jsonl"), nil
+}
+
+// legacyJournalPath is where journals written before the common-directory fix
+// live: inside the worktree's own git directory. It is read, never written.
+func legacyJournalPath(ctx context.Context, repoRoot string) (string, error) {
 	dir, err := git(ctx, repoRoot, "rev-parse", "--absolute-git-dir")
 	if err != nil {
 		return "", err
@@ -399,24 +421,33 @@ func History(ctx context.Context, repoRoot string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	body, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
+	paths := []string{path}
+	if legacy, err := legacyJournalPath(ctx, repoRoot); err == nil && legacy != path {
+		paths = append(paths, legacy)
 	}
 	entries := []Entry{}
-	for _, line := range strings.Split(string(body), "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
+	for _, candidate := range paths {
+		body, err := os.ReadFile(candidate)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
 		}
-		var entry Entry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue
+		for _, line := range strings.Split(string(body), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var entry Entry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				continue
+			}
+			entries = append(entries, entry)
 		}
-		entries = append(entries, entry)
 	}
+	sort.SliceStable(entries, func(left, right int) bool {
+		return entries[left].AppliedAt < entries[right].AppliedAt
+	})
 	// Later lines supersede earlier ones with the same id, which is how an
 	// undo is recorded without rewriting history in place.
 	latest := map[string]Entry{}

@@ -117,8 +117,26 @@ they were at. The commits stay in the object database, unreferenced, where the
 reflog keeps them recoverable. **If a branch has moved since it was applied,
 undo refuses** rather than throwing away whatever moved it.
 
-Every apply is journalled in `.git/hv-journal.jsonl`, inside the git directory
-so it never appears as an untracked file in the tree hv is planning.
+Every merge is journalled in `hv-journal.jsonl` inside the *common* git
+directory, so it never appears as an untracked file in the tree hv is planning.
+
+### Worktrees
+
+hv works from a worktree, and this is the case it is built for: agents run in
+worktrees, and worktrees of one repository share a single object database and a
+single set of refs. Only `HEAD`, the index, and the working tree are per
+worktree.
+
+So a merge run in a worktree creates branches every checkout of that repository
+can see, and the journal lives in the common git directory to match - undo
+works from any of them, not only the one that ran the merge.
+
+What a worktree does *not* share is uncommitted work: each has its own working
+tree, and a plan is a diff of one of them. Sessions in different worktrees are
+therefore planned separately, one plan per worktree, and their commits land on
+branches in the same shared repository. To stack them, route them at the same
+branch: hv extends an existing branch from its tip, so the second merge's
+commits sit on top of the first's.
 
 The browser owns no session logic - it reads through the same packages the
 flags do. **Everything it does has a flag**, because a feature reachable only
