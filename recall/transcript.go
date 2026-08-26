@@ -89,7 +89,11 @@ func itemFor(event capture.SessionEvent) (Item, bool) {
 		if text == "" {
 			return Item{}, false
 		}
-		return Item{Kind: KindUser, Text: text, TS: event.TS}, true
+		kind := KindUser
+		if parse.Role(event) == parse.RoleAssistant {
+			kind = KindAssistant
+		}
+		return Item{Kind: kind, Text: text, TS: event.TS}, true
 	case capture.KindEdit:
 		return Item{Kind: KindTool, Tool: "edit", File: event.FilePath, TS: event.TS}, true
 	case capture.KindRead:

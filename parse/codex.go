@@ -49,6 +49,9 @@ type codexPayload struct {
 	Model     string `json:"model"`
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
+	// Codex records the conversation as event_msg records with a plain
+	// message field, which is the whole transcript in two lines of parsing.
+	Message string `json:"message"`
 }
 
 type codexExecArguments struct {
@@ -83,6 +86,25 @@ func (c *Codex) ParseLine(path string, line []byte) ([]capture.SessionEvent, err
 	}
 
 	switch record.Type {
+	case "event_msg":
+		// user_message and agent_message are the conversation itself; the
+		// other event kinds are progress and token counts.
+		role := ""
+		switch payload.Type {
+		case "user_message":
+			role = RoleUser
+		case "agent_message":
+			role = RoleAssistant
+		default:
+			return nil, nil
+		}
+		if strings.TrimSpace(payload.Message) == "" {
+			return nil, nil
+		}
+		base.Kind = capture.KindMessage
+		base.PromptContext = payload.Message
+		base.Raw = withRole(base.Raw, role)
+		return []capture.SessionEvent{base}, nil
 	case "session_meta":
 		// Registers the session and pins its worktree, even before any call.
 		base.Kind = capture.KindMessage

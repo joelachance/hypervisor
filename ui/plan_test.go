@@ -44,7 +44,7 @@ func plannedModel(width, height int) model {
 func TestPlanViewShowsRevisionsRoutesAndDiff(t *testing.T) {
 	view := plannedModel(100, 26).planView()
 	for _, want := range []string{"u1", "u2", "feature/internal", "internal/alpha.go", "rate limiter",
-		"2 revisions", "2 hunks", "nothing applied"} {
+		"2 revisions", "2 hunks", "nothing applied yet"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("plan view is missing %q", want)
 		}
@@ -180,5 +180,40 @@ func TestDryRunKeysFromTheSessionList(t *testing.T) {
 		if key == "d" && !after.(model).dryRun {
 			t.Errorf("%q did not start a dry run", key)
 		}
+	}
+}
+
+// b names the branch the commits land on: the difference between commits
+// parked on a name demux invented and commits where they were wanted.
+func TestBranchKeyTakesATarget(t *testing.T) {
+	m := plannedModel(100, 26)
+	typing, _ := m.updatePlan(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	next := typing.(model)
+	if next.mode != modeBranch {
+		t.Fatal("b did not start asking for a branch")
+	}
+	for _, r := range "release" {
+		after, _ := next.updateBranch(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		next = after.(model)
+	}
+	if !strings.Contains(next.planFooter(), "release") {
+		t.Errorf("footer = %q, want the branch being typed", next.planFooter())
+	}
+	done, _ := next.updateBranch(tea.KeyMsg{Type: tea.KeyEnter})
+	if done.(model).target != "release" {
+		t.Fatalf("target = %q, want release", done.(model).target)
+	}
+	if !strings.Contains(done.(model).planView(), "→ release") {
+		t.Error("the plan header does not show where the commits will land")
+	}
+}
+
+func TestBranchEscapeClearsTheTarget(t *testing.T) {
+	m := plannedModel(100, 26)
+	m.target = "release"
+	m.mode = modeBranch
+	after, _ := m.updateBranch(tea.KeyMsg{Type: tea.KeyEscape})
+	if after.(model).target != "" {
+		t.Fatal("esc did not clear the target")
 	}
 }

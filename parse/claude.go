@@ -121,6 +121,15 @@ func (c *Claude) assistantEvents(base capture.SessionEvent, record claudeRecord)
 		return nil, nil
 	}
 	events := []capture.SessionEvent{}
+	// What the agent said is half the transcript, and until now hv kept only
+	// what it did.
+	if text := firstText(message.Content); strings.TrimSpace(text) != "" {
+		said := base
+		said.Kind = capture.KindMessage
+		said.PromptContext = text
+		said.Raw = withRole(said.Raw, RoleAssistant)
+		events = append(events, said)
+	}
 	for _, block := range blocks {
 		if block.Type != "tool_use" {
 			continue
@@ -145,6 +154,7 @@ func (c *Claude) userEvents(base capture.SessionEvent, record claudeRecord) ([]c
 	}
 	base.Kind = capture.KindMessage
 	base.PromptContext = text
+	base.Raw = withRole(base.Raw, RoleUser)
 	return []capture.SessionEvent{base}, nil
 }
 

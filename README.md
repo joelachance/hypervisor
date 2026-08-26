@@ -266,6 +266,11 @@ Two findings from the real stores worth knowing:
   unambiguous write forms and stripping heredoc bodies first. Those writes
   carry no text, so only the temporal match tier can claim them - a shell
   write can never produce a false exact match.
+Both Claude Code and Codex record the conversation itself, so `p` shows what a
+session was asked and what it answered. Codex keeps it in `event_msg` records
+(`user_message` / `agent_message`), which also gives its otherwise untitled
+sessions a name.
+
 - **Cursor transcripts are conversation only.** No timestamps, no tool calls,
   no file paths. A Cursor session registers and resolves its repo, but
   contributes no edit evidence; selecting one scopes nothing. Real Cursor

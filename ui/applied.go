@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/satoricorp/hv/apply"
+	"github.com/satoricorp/hv/recall"
 	"github.com/satoricorp/hv/resolve"
 	"github.com/satoricorp/hv/selection"
 )
@@ -26,15 +27,33 @@ type undoneMsg struct {
 // applyCmd writes one repository's plan. Only the repository on screen is
 // written: applying every repository at once from a screen showing one of them
 // would commit work the reader has not looked at.
-func applyCmd(group planGroup) tea.Cmd {
+func applyCmd(group planGroup, branch string) tea.Cmd {
 	return func() tea.Msg {
 		titles := map[string]string{}
+		why := map[string]string{}
+		outcomes := map[string]string{}
 		for _, current := range group.Sessions {
 			titles[current.ID] = current.Label()
+			// The transcript is read here rather than in the render loop, and
+			// it is what puts a Why paragraph in the commit message.
+			items, err := recall.Read(current, 0)
+			if err != nil {
+				continue
+			}
+			summary := recall.Summarize(current, items)
+			if summary.Intent != "" {
+				why[current.ID] = summary.Intent
+			}
+			if summary.Outcome != "" {
+				outcomes[current.ID] = summary.Outcome
+			}
 		}
 		options := apply.Options{
 			SessionIDs: selection.IDs(group.Sessions),
 			Trailers:   titles,
+			Why:        why,
+			Outcomes:   outcomes,
+			Branch:     branch,
 		}
 		// A patch that collides with what is already on the branch is settled
 		// by whichever harness is installed, so enter finishes the merge

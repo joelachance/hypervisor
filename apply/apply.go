@@ -62,7 +62,10 @@ type Entry struct {
 	Renamed    []Rename       `json:"renamed,omitempty"`
 	// Resolved names the files a Resolver had to settle on the way in.
 	Resolved []string `json:"resolved,omitempty"`
-	UndoneAt int64    `json:"undone_at,omitempty"`
+	// CheckedOut is set when the commits landed on the branch the worktree
+	// has checked out, which means the index was refreshed too.
+	CheckedOut string `json:"checked_out,omitempty"`
+	UndoneAt   int64  `json:"undone_at,omitempty"`
 }
 
 // Rename records a branch hv could not use under its routed name.
@@ -100,13 +103,26 @@ type Options struct {
 	Resolver Resolver
 	// Label names the side the revision came from, for the resolver's prompt.
 	Label string
+	// RevisionSessions maps revision id to the sessions whose edits are in it.
+	// It overrides the proposal's own provenance, which demux fills only from
+	// exact and fuzzy links and leaves empty more often than not - hv's
+	// matcher knows, and a commit with no Why paragraph because of a
+	// bookkeeping gap helps nobody.
+	RevisionSessions map[string][]string
+	// Branch, when set, is the branch every revision is committed to, in plan
+	// order, instead of the branches demux proposed. It is how someone says
+	// "put this work where I actually want it" rather than accepting a name
+	// invented from a file path.
+	Branch string
 	// SessionIDs are recorded on the entry and named in commit trailers.
 	SessionIDs []string
 	// Trailers maps session id to its title, for the commit trailers.
 	Trailers map[string]string
 	// Why maps session id to what that session was asked to do - the reason a
-	// diff can never supply.
-	Why map[string]string
+	// diff can never supply. Outcomes maps it to what the session reported
+	// doing, which is worth a line when it says more than the diff.
+	Why      map[string]string
+	Outcomes map[string]string
 }
 
 // Apply commits every revision in a plan and returns what it did.
@@ -143,7 +159,7 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 	renamed := map[string]string{}
 
 	for _, revision := range proposal.Revisions {
-		branch := branchOf(revision)
+		branch := branchOf(revision, options)
 		parent, ok := tips[branch]
 		if !ok {
 			parent = startingPoint(ctx, repoRoot, revision, tips, base)
@@ -161,8 +177,16 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 					// computed against this base and will not apply to that
 					// tip, so the work goes on a branch of its own rather than
 					// failing or landing on top of unrelated commits.
+					if options.Branch != "" {
+						// An explicit target is not a suggestion. If its tip
+						// is unrelated to this base, moving it would discard
+						// whatever is there.
+						return entry, fmt.Errorf(
+							"branch %s is not descended from %s; commit from a worktree on that branch, or pick another",
+							branch, short(base))
+					}
 					branch = freeBranch(ctx, repoRoot, branch, base)
-					renamed[branchOf(revision)] = branch
+					renamed[branchOf(revision, options)] = branch
 					if tip, ok := tips[branch]; ok {
 						parent = tip
 					}
@@ -191,6 +215,7 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 	for from, to := range renamed {
 		entry.Renamed = append(entry.Renamed, Rename{From: from, To: to})
 	}
+	current, _ := git(ctx, repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	for branch, tip := range tips {
 		if _, err := git(ctx, repoRoot, "update-ref", "refs/heads/"+branch, tip); err != nil {
 			return entry, fmt.Errorf("branch %s: %w", branch, err)
@@ -198,6 +223,16 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 		entry.Branches = append(entry.Branches, BranchChange{
 			Name: branch, Before: before[branch], After: tip,
 		})
+		// Committing to the branch you are standing on has to finish the job:
+		// the ref moved, so the index now disagrees with HEAD and git would
+		// report the work as changes that undo it. A mixed reset points the
+		// index at the new commit and leaves every file alone.
+		if branch == current {
+			if _, err := git(ctx, repoRoot, "reset", "--mixed", "--quiet", tip); err != nil {
+				return entry, fmt.Errorf("refreshing the index on %s: %w", branch, err)
+			}
+			entry.CheckedOut = branch
+		}
 	}
 	if err := record(ctx, repoRoot, entry); err != nil {
 		return entry, err
@@ -492,6 +527,14 @@ func Undo(ctx context.Context, entry Entry) (Entry, error) {
 		if _, err := git(ctx, entry.Repo, "update-ref", "refs/heads/"+branch.Name, branch.Before, branch.After); err != nil {
 			return entry, err
 		}
+		// If the commits landed on the checked-out branch, the index was
+		// pointed at them; putting the ref back has to put the index back too,
+		// or the work would look staged for deletion.
+		if entry.CheckedOut == branch.Name {
+			if _, err := git(ctx, entry.Repo, "reset", "--mixed", "--quiet", branch.Before); err != nil {
+				return entry, err
+			}
+		}
 	}
 	entry.UndoneAt = time.Now().UnixMilli()
 	if err := rewrite(ctx, entry.Repo, entry); err != nil {
@@ -520,7 +563,10 @@ func freeBranch(ctx context.Context, repoRoot, branch, base string) string {
 	}
 }
 
-func branchOf(revision demux.RevisionProposal) string {
+func branchOf(revision demux.RevisionProposal, options Options) string {
+	if branch := strings.TrimSpace(options.Branch); branch != "" {
+		return branch
+	}
 	if branch := strings.TrimSpace(revision.TargetStack); branch != "" {
 		return branch
 	}
@@ -540,35 +586,37 @@ func subjectFor(revision demux.RevisionProposal) string {
 
 // messageFor writes the commit message.
 //
-// A subject like "update internal/limiter.go" says nothing a diff does not,
-// so the body carries the two things a reader actually wants: what changed,
-// file by file with the symbols involved, and why - which hv knows, because it
-// is what the person asked the session for.
+// A subject like "update internal/limiter.go" says nothing a diff does not.
+// The body carries what a reader six months later actually needs: why the
+// change exists - which hv knows, because it is what the person asked the
+// session for - what the session concluded, and what moved, file by file with
+// the symbols involved.
+//
+// Nothing is padded. A session with no recorded prompt gets no Why paragraph
+// rather than a sentence restating the subject.
 func messageFor(revision demux.RevisionProposal, patch string, options Options) string {
 	var builder strings.Builder
 	builder.WriteString(subjectFor(revision))
 	builder.WriteString("\n")
 
+	if why := whyParagraph(revision, options); why != "" {
+		builder.WriteString("\n" + why + "\n")
+	}
+	if outcome := outcomeParagraph(revision, options); outcome != "" {
+		builder.WriteString("\n" + outcome + "\n")
+	}
 	if changes := changeSummary(revision, patch); len(changes) > 0 {
-		builder.WriteString("\n")
+		builder.WriteString("\nChanged:\n")
 		for _, change := range changes {
 			builder.WriteString(change + "\n")
 		}
 	}
 
-	reasons := reasonsFor(revision, options)
-	if len(reasons) > 0 {
-		builder.WriteString("\nWhy:\n")
-		for _, reason := range reasons {
-			builder.WriteString("  " + reason + "\n")
-		}
-	}
-
 	// The sessions that produced the change are recorded as trailers, so the
 	// provenance survives in the commit rather than only in hv's journal.
-	if len(revision.SessionIDs) > 0 {
+	if sessions := sessionsOf(revision, options); len(sessions) > 0 {
 		builder.WriteString("\n")
-		for _, id := range revision.SessionIDs {
+		for _, id := range sessions {
 			builder.WriteString("hv-session: " + id)
 			if title := options.Trailers[id]; title != "" {
 				builder.WriteString(" (" + title + ")")
@@ -577,6 +625,15 @@ func messageFor(revision demux.RevisionProposal, patch string, options Options) 
 		}
 	}
 	return builder.String()
+}
+
+// sessionsOf is who wrote this revision: hv's own attribution when it has any,
+// the proposal's otherwise.
+func sessionsOf(revision demux.RevisionProposal, options Options) []string {
+	if ids, ok := options.RevisionSessions[revision.ID]; ok && len(ids) > 0 {
+		return ids
+	}
+	return revision.SessionIDs
 }
 
 // changeSummary describes the patch per file: how many lines moved, whether
@@ -637,23 +694,69 @@ func changeSummary(revision demux.RevisionProposal, patch string) []string {
 	return out
 }
 
-// reasonsFor is what the sessions behind this revision were asked to do. It is
+// whyParagraph is what the sessions behind this revision were asked to do -
 // the only part of a commit message a diff can never supply.
-func reasonsFor(revision demux.RevisionProposal, options Options) []string {
-	out := []string{}
-	for _, id := range revision.SessionIDs {
+func whyParagraph(revision demux.RevisionProposal, options Options) string {
+	reasons := []string{}
+	for _, id := range sessionsOf(revision, options) {
 		why := strings.TrimSpace(options.Why[id])
 		if why == "" {
 			continue
 		}
-		title := strings.TrimSpace(options.Trailers[id])
-		if title != "" {
-			out = append(out, fmt.Sprintf("%s: %s", title, why))
+		if title := strings.TrimSpace(options.Trailers[id]); title != "" {
+			reasons = append(reasons, fmt.Sprintf("%s (%s)", why, title))
 			continue
 		}
-		out = append(out, why)
+		reasons = append(reasons, why)
 	}
-	return out
+	if len(reasons) == 0 {
+		return ""
+	}
+	if len(reasons) == 1 {
+		return wrap("Asked for: "+reasons[0], 72)
+	}
+	// Several sessions contributed - demux pairs a test with its source, and
+	// those are routinely different sessions - so each gets its own line.
+	var builder strings.Builder
+	builder.WriteString("Asked for, across " + fmt.Sprint(len(reasons)) + " sessions:\n")
+	for _, reason := range reasons {
+		builder.WriteString(wrap("  - "+reason, 72) + "\n")
+	}
+	return strings.TrimRight(builder.String(), "\n")
+}
+
+// outcomeParagraph is what the session said it did, when that adds something
+// the subject and the file list do not already say.
+func outcomeParagraph(revision demux.RevisionProposal, options Options) string {
+	for _, id := range sessionsOf(revision, options) {
+		outcome := strings.TrimSpace(options.Outcomes[id])
+		if outcome == "" {
+			continue
+		}
+		return wrap("The session reported: "+outcome, 72)
+	}
+	return ""
+}
+
+// wrap breaks a paragraph at a width commit messages are read at, without
+// splitting a word.
+func wrap(text string, width int) string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	line := words[0]
+	for _, word := range words[1:] {
+		if len(line)+1+len(word) > width {
+			builder.WriteString(line + "\n")
+			line = word
+			continue
+		}
+		line += " " + word
+	}
+	builder.WriteString(line)
+	return builder.String()
 }
 
 func containsString(values []string, want string) bool {

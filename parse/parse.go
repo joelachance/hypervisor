@@ -192,6 +192,20 @@ func home(parts ...string) string {
 	return filepath.Join(append([]string{dir}, parts...)...)
 }
 
+// RawRole is the key under which parsers record who said something: "user" or
+// "assistant". Without it every message looks like a prompt, and a transcript
+// reads as one side of a conversation.
+const RawRole = "role"
+
+// Roles a message can have.
+const (
+	RoleUser      = "user"
+	RoleAssistant = "assistant"
+)
+
+// Role returns who said this, when the parser recorded it.
+func Role(event capture.SessionEvent) string { return rawString(event, RawRole) }
+
 // RawLog is the key under which the watcher stamps the file an event was read
 // from, so a session's transcript can be re-read on demand without searching
 // every root for it again.
@@ -210,6 +224,19 @@ func rawString(event capture.SessionEvent, key string) string {
 		return ""
 	}
 	return value
+}
+
+// withRole adds a role to an event's raw bag, creating it if need be.
+func withRole(raw map[string]json.RawMessage, role string) map[string]json.RawMessage {
+	encoded, err := json.Marshal(role)
+	if err != nil {
+		return raw
+	}
+	if raw == nil {
+		raw = map[string]json.RawMessage{}
+	}
+	raw[RawRole] = encoded
+	return raw
 }
 
 // StampLog records the source file on a batch of events.

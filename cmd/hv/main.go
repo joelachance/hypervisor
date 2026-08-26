@@ -81,7 +81,7 @@ func usage() {
   hv -store DIR                                 read a different session store
   hv sessions [-tool t] [-since d] [-state s]   list coding sessions
   hv watch [-interval d]                        tail session edits as they land
-  hv merge [-session IDs] [-C dir]              commit the changes n sessions made,
+  hv merge [-branch NAME|HEAD] [-session IDs]   commit the changes n sessions made,
                                                 asking a harness to settle any
                                                 conflict (-no-resolve to refuse)
   hv merge -dry-run                             …show the plan without committing
@@ -169,7 +169,7 @@ func uiCmd(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return planPerRepo(ctx, outcome.Merge, events, false, nil)
+	return planPerRepo(ctx, outcome.Merge, events, false, nil, "")
 }
 
 // planPerRepo plans each repository the chosen sessions worked in.
@@ -201,7 +201,7 @@ func resolverName(resolver apply.Resolver) string {
 	return resolver.Name()
 }
 
-func planPerRepo(ctx context.Context, sessions []session.Session, events []capture.SessionEvent, commit bool, resolver apply.Resolver) error {
+func planPerRepo(ctx context.Context, sessions []session.Session, events []capture.SessionEvent, commit bool, resolver apply.Resolver, branch string) error {
 	order, groups, problems := hvplan.GroupByRepo(ctx, sessions)
 	for _, problem := range problems {
 		fmt.Fprintf(os.Stderr, "hv: %v\n", problem)
@@ -227,7 +227,7 @@ func planPerRepo(ctx context.Context, sessions []session.Session, events []captu
 		if !commit {
 			continue
 		}
-		if err := commitPlan(ctx, root, result, groups[root], resolver); err != nil {
+		if err := commitPlan(ctx, root, result, groups[root], resolver, branch); err != nil {
 			// One repository failing to commit must not stop the others; the
 			// ones that succeeded each printed their own undo command.
 			fmt.Fprintf(os.Stderr, "hv: %s: %v\n", root, err)
@@ -323,6 +323,7 @@ func mergeCmd(ctx context.Context, args []string) error {
 	intent := flags.String("intent", "", "intent prefix for proposed revisions")
 	repair := flags.Bool("repair", false, "apply demux's deterministic repair hints to the plan")
 	dryRun := flags.Bool("dry-run", false, "show the plan without committing anything")
+	branch := flags.String("branch", "", "commit everything to this branch instead of the ones demux proposes; HEAD means the branch you are on")
 	harnessName := flags.String("harness", "", "coding harness to settle conflicts: pi, fx, claude, codex, opencode, or a binary")
 	noResolve := flags.Bool("no-resolve", false, "fail on a conflict instead of asking a harness to settle it")
 	asJSON := flags.Bool("json", false, "print the full demux plan packet as JSON")
@@ -371,7 +372,7 @@ func mergeCmd(ctx context.Context, args []string) error {
 	commit := !*dryRun && !*asJSON
 	resolver := conflictResolver(*harnessName, *noResolve)
 	if len(named) > 0 {
-		return planPerRepo(ctx, sessions, events, commit, resolver)
+		return planPerRepo(ctx, sessions, events, commit, resolver, *branch)
 	}
 	result, err := hvplan.Run(ctx, hvplan.Request{
 		RepoRoot: root,
@@ -391,19 +392,37 @@ func mergeCmd(ctx context.Context, args []string) error {
 	}
 	printPlan(result, sessions)
 	if commit {
-		return commitPlan(ctx, root, result, sessions, resolver)
+		return commitPlan(ctx, root, result, sessions, resolver, *branch)
 	}
 	fmt.Fprintln(os.Stderr, "\ndry run: nothing was committed")
 	return nil
 }
 
 // commitPlan writes a plan to the repository and reports what it wrote.
-func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions []session.Session, resolver apply.Resolver) error {
+func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions []session.Session, resolver apply.Resolver, branch string) error {
+	// HEAD means "the branch I am on", which is the common case for someone
+	// who wants the work committed where they are standing rather than parked
+	// on a name they will have to go find.
+	if strings.EqualFold(strings.TrimSpace(branch), "HEAD") {
+		if current, err := hvplan.CurrentBranch(ctx, root); err == nil {
+			branch = current
+		}
+	}
+	why, outcomes := sessionReasons(sessions)
+	attribution := map[string][]string{}
+	for _, revision := range result.Packet.Proposal.Revisions {
+		if ids := revisionSessions(revision, result.Attributed.Links); len(ids) > 0 {
+			attribution[revision.ID] = ids
+		}
+	}
 	entry, err := apply.Apply(ctx, root, result.Packet, apply.Options{
-		SessionIDs: selection.IDs(sessions),
-		Trailers:   sessionTitles(sessions),
-		Why:        sessionReasons(sessions),
-		Resolver:   resolver,
+		RevisionSessions: attribution,
+		SessionIDs:       selection.IDs(sessions),
+		Trailers:         sessionTitles(sessions),
+		Why:              why,
+		Outcomes:         outcomes,
+		Branch:           branch,
+		Resolver:         resolver,
 	})
 	if err != nil {
 		return err
@@ -426,15 +445,19 @@ func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions
 	for _, rename := range entry.Renamed {
 		fmt.Printf("\n  %s was taken by unrelated history; used %s instead\n", rename.From, rename.To)
 	}
-	branch, _ := hvplan.CurrentBranch(ctx, root)
+	current, _ := hvplan.CurrentBranch(ctx, root)
 	fmt.Printf("\n%d commits on %d branch%s (%d new, %d extended)\n",
 		len(entry.Commits), len(entry.Branches), plural("es", len(entry.Branches)), created, extended)
 	// The confusing part, said plainly: the commits are copies. Nothing was
 	// checked out, the branch you are on has not moved, and the same edits are
 	// still sitting uncommitted where they were.
-	fmt.Printf("  you are still on %s, which did not move\n", firstNonEmptyString(branch, "your branch"))
-	fmt.Printf("  your uncommitted changes are still uncommitted - the commits are copies of them\n")
-	fmt.Printf("  see them with: git log %s\n", entry.Branches[0].Name)
+	if entry.CheckedOut != "" {
+		fmt.Printf("  %s moved, and your working tree now matches it - these are your commits\n", entry.CheckedOut)
+	} else {
+		fmt.Printf("  you are still on %s, which did not move\n", firstNonEmptyString(current, "your branch"))
+		fmt.Printf("  your uncommitted changes are still uncommitted - the commits are copies of them\n")
+		fmt.Printf("  see them with: git log %s\n", entry.Branches[0].Name)
+	}
 	fmt.Printf("undo with: hv undo -C %s\n", root)
 	return nil
 }
@@ -447,20 +470,25 @@ func sessionTitles(sessions []session.Session) map[string]string {
 	return titles
 }
 
-// sessionReasons is what each session was asked to do, read from its
-// transcript. It is the "why" line of every commit message hv writes.
-func sessionReasons(sessions []session.Session) map[string]string {
-	reasons := map[string]string{}
+// sessionReasons is what each session was asked to do and what it reported
+// doing, read from its transcript. Between them they are the paragraphs of
+// every commit message hv writes.
+func sessionReasons(sessions []session.Session) (why, outcomes map[string]string) {
+	why, outcomes = map[string]string{}, map[string]string{}
 	for _, current := range sessions {
 		items, err := recall.Read(current, 0)
 		if err != nil {
 			continue
 		}
-		if intent := recall.Summarize(current, items).Intent; intent != "" {
-			reasons[current.ID] = intent
+		summary := recall.Summarize(current, items)
+		if summary.Intent != "" {
+			why[current.ID] = summary.Intent
+		}
+		if summary.Outcome != "" {
+			outcomes[current.ID] = summary.Outcome
 		}
 	}
-	return reasons
+	return why, outcomes
 }
 
 func firstNonEmptyString(values ...string) string {

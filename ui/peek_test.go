@@ -76,3 +76,19 @@ func TestPeekIsHonestWhenThereIsNoTranscript(t *testing.T) {
 		t.Fatal("peek should say when it has nothing rather than showing an empty pane")
 	}
 }
+
+// Cursor records no conversation, and a session can be all tool calls. The
+// edits are a story of a kind; an empty pane is not.
+func TestPeekFallsBackToTheEditsWhenThereIsNoConversation(t *testing.T) {
+	m := peeked()
+	m.peek.items = nil
+	m.peek.session.Files = []string{"/repo/a.go", "/repo/b.go"}
+	m.peek.session.EditCount = 4
+	view := m.peekView()
+	if !strings.Contains(view, "no conversation recorded") {
+		t.Error("peek did not explain why the transcript is empty")
+	}
+	if !strings.Contains(view, "a.go") || !strings.Contains(view, "b.go") {
+		t.Error("peek did not fall back to the files the session edited")
+	}
+}

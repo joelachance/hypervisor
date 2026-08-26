@@ -57,6 +57,7 @@ type mode int
 const (
 	modeBrowse mode = iota
 	modeFilter
+	modeBranch
 )
 
 // screen is which view is on top. The browser picks sessions; the plan screen
@@ -87,6 +88,7 @@ type model struct {
 	plans    []planGroup
 	plan     planCursor
 	dryRun   bool
+	target   string
 	applied  apply.Entry
 	filter   string
 	archived bool
@@ -236,6 +238,8 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch {
+		case m.mode == modeBranch:
+			return m.updateBranch(msg)
 		case m.mode == modeFilter:
 			return m.updateFilter(msg)
 		case m.screen == screenPlan:
@@ -275,6 +279,32 @@ func (m model) updateFilter(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filter += " "
 		}
 		m.applyFilter()
+	}
+	return m, nil
+}
+
+// updateBranch reads the branch to commit to. Typing it here is the difference
+// between commits parked on a name demux invented and commits where the person
+// actually wants them.
+func (m model) updateBranch(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.Type {
+	case tea.KeyEnter:
+		m.mode = modeBrowse
+		if strings.TrimSpace(m.target) == "" {
+			m.status = "no target - each revision goes to the branch demux proposed"
+		} else {
+			m.status = "committing to " + m.target
+		}
+	case tea.KeyEscape:
+		m.mode = modeBrowse
+		m.target = ""
+		m.status = "target cleared"
+	case tea.KeyBackspace:
+		if m.target != "" {
+			m.target = m.target[:len(m.target)-1]
+		}
+	case tea.KeyRunes:
+		m.target += string(key.Runes)
 	}
 	return m, nil
 }

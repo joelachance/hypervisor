@@ -186,7 +186,9 @@ func (i *Index) Observe(event capture.SessionEvent) {
 	if log := strings.TrimSpace(parse.LogPath(event)); log != "" {
 		current.LogPath = log
 	}
-	if current.Summary == "" && event.Kind == capture.KindMessage {
+	// The first thing the person asked for, not the first thing said: an
+	// assistant's opening line describes nothing.
+	if current.Summary == "" && event.Kind == capture.KindMessage && parse.Role(event) != parse.RoleAssistant {
 		current.Summary = summarize(event.PromptContext)
 	}
 	current.EventCount++

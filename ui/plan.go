@@ -75,7 +75,7 @@ func (m model) updatePlan(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.outcome = Outcome{}
 		return m, tea.Quit
 
-	case "esc", "b", "left", "h":
+	case "esc", "left", "h":
 		// Back to the sessions with the marks intact, so another look at the
 		// same plan costs one keystroke. Leaving the plan screen also clears
 		// the outcome: quitting from the browser should print nothing.
@@ -113,7 +113,12 @@ func (m model) updatePlan(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// is the only screen from which committing is an informed act - and
 		// leaving without committing is q, one key away.
 		m.status = "committing…"
-		return m, applyCmd(group)
+		return m, applyCmd(group, m.target)
+
+	case "b":
+		// Name the branch these commits land on.
+		m.mode = modeBranch
+		return m, nil
 
 	case "p":
 		// Leave with this plan on stdout, where it can be read at leisure,
@@ -229,6 +234,9 @@ func (m model) planHeader() string {
 	}
 	if m.dryRun {
 		counts += styleCursor.Render("  ·  dry run")
+	}
+	if strings.TrimSpace(m.target) != "" {
+		counts += styleKey.Render("  ·  → " + m.target)
 	}
 	return styleTitleBar.Width(m.width).Render(left + where + counts)
 }
@@ -380,6 +388,9 @@ func diffLine(line string, width int) string {
 }
 
 func (m model) planFooter() string {
+	if m.mode == modeBranch {
+		return styleFilter.Width(m.width).Render("commit to branch: " + m.target + "█")
+	}
 	key := func(k, label string) string { return styleKey.Render(k) + styleDim.Render(" "+label) }
 	pane := "diff"
 	if m.plan.onDiff {
@@ -393,27 +404,26 @@ func (m model) planFooter() string {
 		key("↑↓", "move"),
 		key("tab", pane),
 		commit,
+		key("b", "branch"),
 		key("esc", "back"),
-		key("p", "print & exit"),
+		key("p", "print"),
 	}
 	if len(m.plans) > 1 {
 		keys = append(keys, key("[ ]", "repo"))
 	}
 	keys = append(keys, key("q", "quit"))
 
+	// Nothing on this screen has touched the repository, and a plan that looks
+	// like a result invites the assumption that it was applied. The note keeps
+	// its room first: a narrow terminal should lose a key, not the warning.
+	note := styleDim.Render("  nothing applied yet")
 	separator := styleDim.Render("  ·  ")
 	line := strings.Join(keys, separator)
-	for len(keys) > 1 && lipgloss.Width(line)+2 > m.width {
+	for len(keys) > 1 && lipgloss.Width(line+note)+2 > m.width {
 		keys = keys[:len(keys)-1]
 		line = strings.Join(keys, separator)
 	}
-	// Nothing on this screen has touched the repository, and a plan that looks
-	// like a result invites the assumption that it was applied.
-	note := styleDim.Render("  nothing applied")
-	if lipgloss.Width(line+note)+2 <= m.width {
-		line += note
-	}
-	return styleFooter.Width(m.width).Render(line)
+	return styleFooter.Width(m.width).Render(line + note)
 }
 
 // planListHeight gives the revision list what it needs up to a third of the

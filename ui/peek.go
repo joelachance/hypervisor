@@ -141,12 +141,34 @@ func (m model) peekBody() string {
 		lines = append(lines, m.peekLine(m.peek.items[index]))
 	}
 	if len(lines) == 0 {
-		lines = append(lines, styleDim.Render("  nothing to show"))
+		// No conversation was recorded - Cursor keeps none, and a session can
+		// be all tool calls. Say what is known rather than showing an empty
+		// pane: the edits are a story of a kind.
+		lines = append(lines, m.peekWithoutTranscript()...)
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
 	}
 	return styleDetail.Width(m.width).Height(height).Render(strings.Join(lines, "\n"))
+}
+
+// peekWithoutTranscript summarizes a session from what hv has when the
+// conversation is missing.
+func (m model) peekWithoutTranscript() []string {
+	current := m.peek.session
+	if len(current.Files) == 0 {
+		return []string{styleDim.Render("  no conversation and no edits recorded for this session")}
+	}
+	out := []string{styleDim.Render(fmt.Sprintf(
+		"  no conversation recorded; %d edits across %d files:", current.EditCount, len(current.Files)))}
+	for index, file := range current.Files {
+		if index >= m.peekHeight()-1 {
+			out = append(out, styleDim.Render(fmt.Sprintf("  … and %d more", len(current.Files)-index)))
+			break
+		}
+		out = append(out, styleActiveDot.Render("  edit   ")+styleDim.Render(shortPath(file)))
+	}
+	return out
 }
 
 func (m model) peekLine(item recall.Item) string {
