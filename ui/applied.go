@@ -48,12 +48,22 @@ func applyCmd(group planGroup, branch string) tea.Cmd {
 				outcomes[current.ID] = summary.Outcome
 			}
 		}
+		// Attribution has to come along, or a revision demux left unattributed
+		// commits with no Why paragraph - the browser's merges were briefer
+		// than the same merge from the command line.
+		attribution := map[string][]string{}
+		for _, revision := range group.Result.Packet.Proposal.Revisions {
+			if ids := revisionSessionIDs(revision, group.Result.Attributed.Links); len(ids) > 0 {
+				attribution[revision.ID] = ids
+			}
+		}
 		options := apply.Options{
-			SessionIDs: selection.IDs(group.Sessions),
-			Trailers:   titles,
-			Why:        why,
-			Outcomes:   outcomes,
-			Branch:     branch,
+			SessionIDs:       selection.IDs(group.Sessions),
+			Trailers:         titles,
+			Why:              why,
+			Outcomes:         outcomes,
+			RevisionSessions: attribution,
+			Branch:           branch,
 		}
 		// A patch that collides with what is already on the branch is settled
 		// by whichever harness is installed, so enter finishes the merge

@@ -10,6 +10,7 @@ import (
 
 	"github.com/satoricorp/demux"
 	"github.com/satoricorp/demux/capture"
+	"github.com/satoricorp/demux/matcher"
 	hvplan "github.com/satoricorp/hv/plan"
 	"github.com/satoricorp/hv/session"
 )
@@ -305,12 +306,13 @@ func (m model) planRow(group planGroup, revision demux.RevisionProposal, index i
 	return line
 }
 
-// creditLine names the sessions whose edits landed in a revision, from hv's
-// own hunk links rather than the provenance field - demux stamps that only
-// from exact and fuzzy links, and hv's matcher produces temporal ones.
-func creditLine(revision demux.RevisionProposal, group planGroup) string {
+// revisionSessionIDs is who wrote a revision, from hv's own hunk links rather
+// than the proposal's provenance field - demux fills that only from exact and
+// fuzzy links and leaves it empty more often than not, and a commit missing
+// its Why paragraph over a bookkeeping gap helps nobody.
+func revisionSessionIDs(revision demux.RevisionProposal, links []matcher.HunkLink) []string {
 	bySession := map[string]string{}
-	for _, link := range group.Result.Attributed.Links {
+	for _, link := range links {
 		bySession[link.HunkID] = link.SessionID
 	}
 	ids := revision.HunkIDs
@@ -320,7 +322,7 @@ func creditLine(revision demux.RevisionProposal, group planGroup) string {
 		}
 	}
 	seen := map[string]struct{}{}
-	names := []string{}
+	out := []string{}
 	for _, id := range ids {
 		sessionID := bySession[id]
 		if sessionID == "" {
@@ -330,7 +332,16 @@ func creditLine(revision demux.RevisionProposal, group planGroup) string {
 			continue
 		}
 		seen[sessionID] = struct{}{}
-		names = append(names, sessionTitle(sessionID, group.Sessions))
+		out = append(out, sessionID)
+	}
+	return out
+}
+
+// creditLine names those sessions for the plan row.
+func creditLine(revision demux.RevisionProposal, group planGroup) string {
+	names := []string{}
+	for _, id := range revisionSessionIDs(revision, group.Result.Attributed.Links) {
+		names = append(names, sessionTitle(id, group.Sessions))
 	}
 	return strings.Join(names, ", ")
 }
