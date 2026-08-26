@@ -218,17 +218,90 @@ func (m model) peekBody() string {
 	return styleDetail.Width(m.width).Height(height).Render(strings.Join(visible, "\n"))
 }
 
+// maxSpeechLines caps one side of an exchange. A single answer can be a page
+// of markdown, and a pane filled by one message shows fewer exchanges than a
+// pane showing none.
+const maxSpeechLines = 6
+
 // speech renders one side of an exchange: a labelled first line, then the rest
 // indented under it so the label reads as a speaker rather than a bullet.
 func (m model) speech(label string, style lipgloss.Style, text string) []string {
 	width := maxInt(m.width-6, 24)
-	body := wrapLines(text, width, "", "")
+	paragraphs := readable(text)
+	body := []string{}
+	for _, paragraph := range paragraphs {
+		if strings.HasPrefix(paragraph, "\x00code:") {
+			body = append(body, styleDim.Render(strings.TrimPrefix(paragraph, "\x00code:")))
+			continue
+		}
+		body = append(body, wrapLines(paragraph, width, "", "")...)
+	}
+	if len(body) > maxSpeechLines {
+		hidden := len(body) - maxSpeechLines
+		body = body[:maxSpeechLines]
+		suffix := "lines"
+		if hidden == 1 {
+			suffix = "line"
+		}
+		body = append(body, styleDim.Render(fmt.Sprintf("… %d more %s", hidden, suffix)))
+	}
+
 	out := make([]string, 0, len(body)+1)
 	out = append(out, style.Render(" "+label))
 	for _, line := range body {
-		out = append(out, styleRow.Render("   "+line))
+		out = append(out, "   "+line)
 	}
 	return out
+}
+
+// readable turns a message into lines worth showing in a narrow pane: fenced
+// code becomes a one-line note, headings and emphasis lose their markup, and
+// runs of blank lines collapse. The point is to read a conversation, not to
+// render markdown.
+func readable(text string) []string {
+	out := []string{}
+	inFence := false
+	fenceLines := 0
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			if inFence {
+				out = append(out, fmt.Sprintf("\x00code:[code, %d lines]", fenceLines))
+				inFence, fenceLines = false, 0
+				continue
+			}
+			inFence = true
+			continue
+		}
+		if inFence {
+			fenceLines++
+			continue
+		}
+		if trimmed == "" {
+			// One blank line between paragraphs, never a run of them.
+			if len(out) > 0 && out[len(out)-1] != "" {
+				out = append(out, "")
+			}
+			continue
+		}
+		out = append(out, plain(trimmed))
+	}
+	if inFence {
+		out = append(out, fmt.Sprintf("\x00code:[code, %d lines]", fenceLines))
+	}
+	// A trailing blank line wastes a row the next speaker could use.
+	for len(out) > 0 && out[len(out)-1] == "" {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+// plain strips the markup that only makes sense rendered.
+func plain(line string) string {
+	line = strings.TrimLeft(line, "#")
+	line = strings.ReplaceAll(line, "**", "")
+	line = strings.ReplaceAll(line, "`", "")
+	return strings.TrimSpace(line)
 }
 
 // wrapLines breaks text to a width without splitting words, prefixing the

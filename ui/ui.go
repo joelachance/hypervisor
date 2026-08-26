@@ -516,8 +516,8 @@ func (m model) selected() []session.Session {
 func (m model) listHeight() int {
 	height := m.height - chromeHeight
 	if m.mode == modeRepo {
-		// The picker takes its rows from the list, plus its own border.
-		height -= len(m.repoChoices()) + 1
+		// The picker takes its rows from the list, plus its note and border.
+		height -= len(m.repoChoices()) + 2
 	}
 	if height < 1 {
 		return 1
@@ -796,24 +796,57 @@ func (m model) scopeKey() string {
 	return styleKey.Render("r") + styleDim.Render(" repo")
 }
 
-// repoChoices is what the picker offers: every repository, then each one that
-// has sessions. The empty string is "every repo".
+// repoChoices is what the picker offers: every repository, then each one with
+// a session someone is still working in. The empty string is "every repo".
+//
+// A repository whose sessions have all gone quiet is finished work, and
+// listing it makes the picker longer without making it more useful. When
+// nothing at all is active the full list is offered instead, because an empty
+// picker answers nothing.
 func (m model) repoChoices() []string {
+	now := time.Now().UnixMilli()
 	seen := map[string]struct{}{}
-	repos := []string{}
+	active, all := []string{}, []string{}
 	for _, row := range m.all {
 		root := strings.TrimSpace(row.RepoRoot)
 		if root == "" {
 			continue
 		}
-		if _, ok := seen[root]; ok {
-			continue
+		if _, ok := seen[root]; !ok {
+			seen[root] = struct{}{}
+			all = append(all, root)
 		}
-		seen[root] = struct{}{}
-		repos = append(repos, root)
+		if row.State(now) == session.StateActive && !containsString(active, root) {
+			active = append(active, root)
+		}
+	}
+	repos := active
+	if len(repos) == 0 {
+		repos = all
 	}
 	sort.Strings(repos)
 	return append([]string{""}, repos...)
+}
+
+// repoPickerNote says which list is on screen, so a missing repository is
+// explained rather than surprising.
+func (m model) repoPickerNote() string {
+	now := time.Now().UnixMilli()
+	for _, row := range m.all {
+		if row.State(now) == session.StateActive {
+			return "repos with active sessions"
+		}
+	}
+	return "no active sessions - showing every repo"
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // repoIndex is where the current pick sits in the choices.
@@ -863,7 +896,8 @@ func (m *model) selectRepo() {
 // repoPanel is the picker itself, above the sessions it is filtering.
 func (m model) repoPanel() string {
 	choices := m.repoChoices()
-	rows := make([]string, 0, len(choices))
+	rows := make([]string, 0, len(choices)+1)
+	rows = append(rows, styleDim.Render("  "+m.repoPickerNote()))
 	for index, repo := range choices {
 		label := "every repo"
 		style := styleDim
@@ -871,14 +905,18 @@ func (m model) repoPanel() string {
 			label = repoName(sessionAt(repo))
 			style = repoStyle(label)
 		}
-		count := m.countIn(repo)
+		total, live := m.countIn(repo)
 		cursor := "  "
 		if index == m.repoCursor {
 			cursor = styleCursor.Render("❯ ")
 		}
+		counts := fmt.Sprintf("%d session%s", total, plural("s", total))
+		if live > 0 {
+			counts += fmt.Sprintf(", %d active", live)
+		}
 		line := fmt.Sprintf("%s%s %s", cursor,
 			style.Render(fmt.Sprintf("%-16s", truncate(label, 16))),
-			styleDim.Render(fmt.Sprintf("%d session%s", count, plural("s", count))))
+			styleDim.Render(counts))
 		if index == m.repoCursor {
 			line = styleHighlight.Width(m.width).Render(line)
 		}
@@ -894,9 +932,15 @@ func (m model) repoPanel() string {
 // countIn is how many sessions the picker would show for a choice, under the
 // filters already in force - an archived-only repository should not advertise
 // sessions the list will not show.
-func (m model) countIn(repo string) int {
-	filter := selection.Filter{IncludeArchived: m.archived, TouchedUnder: repo}
-	return len(selection.Apply(m.all, filter))
+func (m model) countIn(repo string) (total, active int) {
+	now := time.Now().UnixMilli()
+	rows := selection.Apply(m.all, selection.Filter{IncludeArchived: m.archived, TouchedUnder: repo})
+	for _, row := range rows {
+		if row.State(now) == session.StateActive {
+			active++
+		}
+	}
+	return len(rows), active
 }
 
 // plural is the suffix for a count.

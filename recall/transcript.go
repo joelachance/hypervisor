@@ -20,6 +20,7 @@
 package recall
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/satoricorp/demux/capture"
@@ -82,10 +83,52 @@ func Read(current session.Session, limit int) ([]Item, error) {
 	return items, nil
 }
 
+// noisePrefixes are the wrappers a harness puts in the transcript that are not
+// part of the conversation: slash-command plumbing, hook output, injected
+// reminders. They are recorded as user messages, so without this the first
+// thing a session appears to have been asked is "Caveat: the messages below
+// were generated while running local commands".
+var noisePrefixes = []string{
+	"<command-name>", "<command-message>", "<command-args>",
+	"<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+	"<user-prompt-submit-hook>", "<system-reminder>", "<bash-input>", "<bash-stdout>",
+	"caveat: the messages below",
+}
+
+// reminderBlock is an injected note appended to a real message; the message is
+// worth keeping, the note is not.
+var reminderBlock = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
+
+// isNoise reports whether a message is transcript plumbing rather than
+// something a person or an agent said.
+func isNoise(text string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(text))
+	if trimmed == "" {
+		return true
+	}
+	for _, prefix := range noisePrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// clean strips injected blocks from a message that is otherwise real.
+func clean(text string) string {
+	return strings.TrimSpace(reminderBlock.ReplaceAllString(text, ""))
+}
+
 func itemFor(event capture.SessionEvent) (Item, bool) {
 	switch event.Kind {
 	case capture.KindMessage:
-		text := clip(redact.Redact(event.PromptContext), clipItem)
+		body := clean(event.PromptContext)
+		if isNoise(body) {
+			return Item{}, false
+		}
+		// Kept with its line breaks: a message is paragraphs and lists, and
+		// flattening it to one line is what made transcripts unreadable.
+		text := clipLines(redact.Redact(body), clipItem)
 		if text == "" {
 			return Item{}, false
 		}
@@ -178,6 +221,17 @@ func line(summary Summary) string {
 		parts = append(parts, "· files: "+clip(strings.Join(summary.Files, ", "), 120))
 	}
 	return strings.Join(parts, " ")
+}
+
+// clipLines caps length while keeping newlines, for text that will be
+// displayed as written rather than summarized into a line.
+func clipLines(text string, max int) string {
+	text = strings.TrimSpace(text)
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	return string(runes[:max-1]) + "…"
 }
 
 // clip collapses whitespace and caps length, counting runes so a multi-byte

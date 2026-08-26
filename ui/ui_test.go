@@ -227,3 +227,48 @@ func TestViewRendersBeforeTheSizeArrives(t *testing.T) {
 		t.Fatalf("view before WindowSizeMsg showed no sessions:\n%s", view)
 	}
 }
+
+// A repository whose sessions have all gone quiet is finished work; listing it
+// makes the picker longer without making it more useful.
+func TestRepoPickerHidesRepositoriesWithNothingActive(t *testing.T) {
+	now := time.Now().UnixMilli()
+	rows := []session.Session{
+		{ID: "live", RepoRoot: "/busy", LastActiveAt: now, Files: []string{"/busy/a.go"}},
+		{ID: "old", RepoRoot: "/quiet", LastActiveAt: now - 48*60*60*1000, Files: []string{"/quiet/b.go"}},
+	}
+	m := NewForTest(rows)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	opened := press(m, "r").(model)
+
+	// The picker hides it; the session list below still shows every session,
+	// which is the point of the two being separate.
+	panel := opened.repoPanel()
+	if !strings.Contains(panel, "busy") {
+		t.Error("the repository with an active session is missing")
+	}
+	if strings.Contains(panel, "quiet") {
+		t.Error("a repository with nothing active was listed")
+	}
+	if !strings.Contains(panel, "repos with active sessions") {
+		t.Error("the picker does not say which list it is showing")
+	}
+}
+
+// An empty picker answers nothing, so with nothing active it offers them all
+// and says so.
+func TestRepoPickerFallsBackWhenNothingIsActive(t *testing.T) {
+	old := time.Now().UnixMilli() - 48*60*60*1000
+	rows := []session.Session{
+		{ID: "a", RepoRoot: "/one", LastActiveAt: old, Files: []string{"/one/a.go"}},
+		{ID: "b", RepoRoot: "/two", LastActiveAt: old, Files: []string{"/two/b.go"}},
+	}
+	m := NewForTest(rows)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	panel := press(m, "r").(model).repoPanel()
+	if !strings.Contains(panel, "one") || !strings.Contains(panel, "two") {
+		t.Error("with nothing active the picker should offer every repository")
+	}
+	if !strings.Contains(panel, "no active sessions") {
+		t.Error("the picker does not explain why it is showing everything")
+	}
+}
