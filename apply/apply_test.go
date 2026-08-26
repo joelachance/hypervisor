@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/satoricorp/demux"
+	"github.com/satoricorp/hv/journal"
 )
 
 func repoWith(t *testing.T, files map[string]string) string {
@@ -134,7 +135,7 @@ func TestUndoDeletesBranchesItCreated(t *testing.T) {
 	if gitOut(t, repo, "rev-parse", "--verify", "--quiet", "refs/heads/feature/x") == "" {
 		t.Fatal("branch was not created")
 	}
-	undone, err := Undo(context.Background(), entry)
+	undone, err := journal.Undo(context.Background(), entry)
 	if err != nil {
 		t.Fatalf("Undo() error = %v", err)
 	}
@@ -144,7 +145,7 @@ func TestUndoDeletesBranchesItCreated(t *testing.T) {
 	if gitOut(t, repo, "rev-parse", "--verify", "--quiet", "refs/heads/feature/x") != "" {
 		t.Fatal("branch survived the undo")
 	}
-	if _, err := Undo(context.Background(), undone); err == nil {
+	if _, err := journal.Undo(context.Background(), undone); err == nil {
 		t.Error("undoing twice must fail rather than delete something else")
 	}
 }
@@ -168,7 +169,7 @@ func TestUndoResetsBranchesItExtended(t *testing.T) {
 	if entry.Branches[0].Created() {
 		t.Fatal("an existing branch was recorded as created")
 	}
-	if _, err := Undo(context.Background(), entry); err != nil {
+	if _, err := journal.Undo(context.Background(), entry); err != nil {
 		t.Fatalf("Undo() error = %v", err)
 	}
 	if now := gitOut(t, repo, "rev-parse", "feature/x"); now != original {
@@ -190,7 +191,7 @@ func TestUndoRefusesAMovedBranch(t *testing.T) {
 	if out, err := exec.Command("git", "-C", repo, "update-ref", "refs/heads/feature/x", main).CombinedOutput(); err != nil {
 		t.Fatalf("update-ref: %v: %s", err, out)
 	}
-	if _, err := Undo(context.Background(), entry); err == nil {
+	if _, err := journal.Undo(context.Background(), entry); err == nil {
 		t.Fatal("undo moved a branch that had changed since it was applied")
 	}
 }
@@ -203,17 +204,17 @@ func TestHistoryRecordsAppliedAndUndoneState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	last, ok, err := Last(context.Background(), repo)
+	last, ok, err := journal.Last(context.Background(), repo)
 	if err != nil || !ok || last.ID != entry.ID {
 		t.Fatalf("Last() = %v, %v, %v; want the entry just applied", last.ID, ok, err)
 	}
-	if _, err := Undo(context.Background(), entry); err != nil {
+	if _, err := journal.Undo(context.Background(), entry); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := Last(context.Background(), repo); ok {
+	if _, ok, _ := journal.Last(context.Background(), repo); ok {
 		t.Error("an undone entry is still offered as the thing to undo")
 	}
-	history, err := History(context.Background(), repo)
+	history, err := journal.History(context.Background(), repo)
 	if err != nil || len(history) != 1 || !history[0].Undone() {
 		t.Fatalf("history = %+v, %v; want one entry marked undone", history, err)
 	}
@@ -226,7 +227,7 @@ func TestCommitMessageCarriesSessionTrailers(t *testing.T) {
 		[]demux.RevisionProposal{{ID: "u1", Intent: "bump", HunkIDs: []string{"h1"},
 			TargetStack: "feature/x", SessionIDs: []string{"s1"}}},
 		[]demux.HunkRange{{ID: "h1", File: "version.go", Patch: bumpPatch}}),
-		Options{Trailers: map[string]string{"s1": "rate limiter"}})
+		Options{Sessions: []SessionInfo{{ID: "s1", Title: "rate limiter"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,14 +260,14 @@ func TestJournalIsSharedAcrossWorktrees(t *testing.T) {
 	}
 
 	// The point of the test: the main checkout can undo what the worktree did.
-	last, ok, err := Last(context.Background(), repo)
+	last, ok, err := journal.Last(context.Background(), repo)
 	if err != nil || !ok {
 		t.Fatalf("Last() from the main checkout = %v, %v; want the worktree's entry", ok, err)
 	}
 	if last.ID != entry.ID {
 		t.Fatalf("Last() = %s, want %s", last.ID, entry.ID)
 	}
-	if _, err := Undo(context.Background(), last); err != nil {
+	if _, err := journal.Undo(context.Background(), last); err != nil {
 		t.Fatalf("Undo() from the main checkout = %v", err)
 	}
 	if gitOut(t, repo, "rev-parse", "--verify", "--quiet", "refs/heads/feature/x") != "" {

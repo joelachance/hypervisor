@@ -3,13 +3,12 @@ package resolve
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/satoricorp/hv/apply"
 	"github.com/satoricorp/hv/conflict"
+	"github.com/satoricorp/hv/internal/gitx"
+	"github.com/satoricorp/hv/journal"
 )
 
 // Fixed is one file the agent resolved.
@@ -67,14 +66,14 @@ func Merge(ctx context.Context, repo string, report conflict.Report, runner Runn
 			replacements = append(replacements, resolution.Resolved)
 			fixed.Resolutions = append(fixed.Resolutions, resolution)
 		}
-		merged, err := replaceRegions(fileConflict.Merged, replacements)
+		merged, err := gitx.ReplaceRegions(fileConflict.Merged, replacements)
 		if err != nil {
 			return outcome, fmt.Errorf("%s: %w", fileConflict.Path, err)
 		}
 		if strings.Contains(merged, "<<<<<<<") {
 			return outcome, fmt.Errorf("%s still has conflict markers after resolution", fileConflict.Path)
 		}
-		blob, err := hashObject(ctx, repo, merged)
+		blob, err := gitx.HashObject(ctx, repo, merged)
 		if err != nil {
 			return outcome, err
 		}
@@ -92,38 +91,38 @@ func Merge(ctx context.Context, repo string, report conflict.Report, runner Runn
 	}
 	outcome.Tree = tree
 
-	ours, err := git(ctx, repo, "rev-parse", report.Ours.Ref)
+	ours, err := gitx.Run(ctx, repo, "rev-parse", report.Ours.Ref)
 	if err != nil {
 		return outcome, err
 	}
-	theirs, err := git(ctx, repo, "rev-parse", report.Theirs.Ref)
+	theirs, err := gitx.Run(ctx, repo, "rev-parse", report.Theirs.Ref)
 	if err != nil {
 		return outcome, err
 	}
 	outcome.Parents = []string{ours, theirs}
 
-	commit, err := commitTree(ctx, repo, tree, []string{ours, theirs}, message(report, outcome))
+	commit, err := gitx.CommitTree(ctx, repo, tree, []string{ours, theirs}, message(report, outcome), nil)
 	if err != nil {
 		return outcome, err
 	}
 	outcome.Commit = commit
 
-	before, _ := git(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-	if _, err := git(ctx, repo, "update-ref", "refs/heads/"+branch, commit); err != nil {
+	before, _ := gitx.Run(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	if _, err := gitx.Run(ctx, repo, "update-ref", "refs/heads/"+branch, commit); err != nil {
 		return outcome, err
 	}
-	entry := apply.Entry{
-		ID:        apply.NewID(),
+	entry := journal.Entry{
+		ID:        journal.NewID(),
 		AppliedAt: time.Now().UnixMilli(),
 		Repo:      repo,
 		Base:      report.Base,
-		Commits: []apply.Commit{{
+		Commits: []journal.Commit{{
 			Revision: "merge", Branch: branch, SHA: commit,
 			Subject: firstLine(message(report, outcome)), Files: len(outcome.Fixed),
 		}},
-		Branches: []apply.BranchChange{{Name: branch, Before: before, After: commit}},
+		Branches: []journal.BranchChange{{Name: branch, Before: before, After: commit}},
 	}
-	if err := apply.Journal(ctx, repo, entry); err != nil {
+	if err := journal.Record(ctx, repo, entry); err != nil {
 		return outcome, err
 	}
 	outcome.EntryID = entry.ID
@@ -146,63 +145,28 @@ func requestForRegion(report conflict.Report, path string, region conflict.Regio
 	return request
 }
 
-// replaceRegions swaps every conflict block for its resolution in one pass,
-// leaving everything around them byte for byte as git produced it.
-func replaceRegions(merged string, replacements [][]string) (string, error) {
-	lines := strings.Split(merged, "\n")
-	out := make([]string, 0, len(lines))
-	seen, inBlock := 0, false
-	for _, line := range lines {
-		switch {
-		case strings.HasPrefix(line, "<<<<<<<"):
-			if seen >= len(replacements) {
-				return "", fmt.Errorf("more conflict blocks than resolutions")
-			}
-			out = append(out, replacements[seen]...)
-			seen++
-			inBlock = true
-		case inBlock && strings.HasPrefix(line, ">>>>>>>"):
-			inBlock = false
-		case inBlock:
-			// dropped: the resolution replaces the whole block
-		default:
-			out = append(out, line)
-		}
-	}
-	if seen != len(replacements) {
-		return "", fmt.Errorf("resolved %d regions but the file has %d", len(replacements), seen)
-	}
-	return strings.Join(out, "\n"), nil
-}
-
 // treeWith writes a tree that is the merge's tree with the resolved files
 // swapped in. A scratch index again, so nothing touches the real one.
-func treeWith(ctx context.Context, repo, baseTree string, blobs map[string]string) (string, error) {
-	indexFile, err := os.CreateTemp("", "hv-merge-index-*")
-	if err != nil {
-		return "", err
-	}
-	indexPath := indexFile.Name()
-	indexFile.Close()
-	os.Remove(indexPath)
-	defer os.Remove(indexPath)
-
-	env := append(os.Environ(), "GIT_INDEX_FILE="+indexPath)
-	if _, err := gitEnv(ctx, repo, env, "read-tree", baseTree); err != nil {
-		return "", err
-	}
-	for path, blob := range blobs {
-		mode := fileMode(ctx, repo, baseTree, path)
-		if _, err := gitEnv(ctx, repo, env, "update-index", "--add", "--cacheinfo",
-			fmt.Sprintf("%s,%s,%s", mode, blob, path)); err != nil {
-			return "", err
+func treeWith(ctx context.Context, repo, baseTree string, blobs map[string]string) (tree string, err error) {
+	err = gitx.ScratchIndex(func(env []string) error {
+		if _, err := gitx.RunIn(ctx, repo, env, "read-tree", baseTree); err != nil {
+			return err
 		}
-	}
-	return gitEnv(ctx, repo, env, "write-tree")
+		for path, blob := range blobs {
+			mode := fileMode(ctx, repo, baseTree, path)
+			if _, err := gitx.RunIn(ctx, repo, env, "update-index", "--add", "--cacheinfo",
+				fmt.Sprintf("%s,%s,%s", mode, blob, path)); err != nil {
+				return err
+			}
+		}
+		tree, err = gitx.RunIn(ctx, repo, env, "write-tree")
+		return err
+	})
+	return tree, err
 }
 
 func fileMode(ctx context.Context, repo, tree, path string) string {
-	out, err := git(ctx, repo, "ls-tree", tree, "--", path)
+	out, err := gitx.Run(ctx, repo, "ls-tree", tree, "--", path)
 	if err != nil || out == "" {
 		return "100644"
 	}
@@ -251,51 +215,4 @@ func label(title, ref string) string {
 		return title
 	}
 	return ref
-}
-
-func hashObject(ctx context.Context, repo, body string) (string, error) {
-	command := exec.CommandContext(ctx, "git", "hash-object", "-w", "--stdin")
-	command.Dir = repo
-	command.Stdin = strings.NewReader(body)
-	out, err := command.Output()
-	if err != nil {
-		return "", fmt.Errorf("git hash-object: %w", err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func commitTree(ctx context.Context, repo, tree string, parents []string, body string) (string, error) {
-	args := []string{"commit-tree", tree}
-	for _, parent := range parents {
-		args = append(args, "-p", parent)
-	}
-	args = append(args, "-F", "-")
-	command := exec.CommandContext(ctx, "git", args...)
-	command.Dir = repo
-	command.Stdin = strings.NewReader(body)
-	out, err := command.Output()
-	if err != nil {
-		return "", fmt.Errorf("git commit-tree: %w", err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func git(ctx context.Context, dir string, args ...string) (string, error) {
-	return gitEnv(ctx, dir, nil, args...)
-}
-
-func gitEnv(ctx context.Context, dir string, env []string, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, "git", args...)
-	command.Dir = dir
-	command.Env = env
-	out, err := command.Output()
-	if err != nil {
-		detail := ""
-		var exitErr *exec.ExitError
-		if ok := asExit(err, &exitErr); ok {
-			detail = strings.TrimSpace(string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, detail)
-	}
-	return strings.TrimSpace(string(out)), nil
 }

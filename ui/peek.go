@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/satoricorp/hv/internal/text"
 	"github.com/satoricorp/hv/recall"
 	"github.com/satoricorp/hv/session"
 )
@@ -156,11 +157,11 @@ func (m model) peekView() string {
 	current := m.peek.session
 	// The header stays one line: a wrapped title costs a line of conversation
 	// and reads as a rendering fault.
-	title := lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render(truncate(current.Label(), 40))
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render(text.Truncate(current.Label(), 40))
 	facts := fmt.Sprintf("  ·  %s  ·  %s  ·  %d edits in %d files",
 		current.Tool, repoName(current), current.EditCount, len(current.Files))
 	header := styleTitleBar.Width(m.width).Render(
-		title + styleCount.Render(truncate(facts, maxInt(m.width-lipgloss.Width(title)-4, 10))))
+		title + styleCount.Render(text.Truncate(facts, maxInt(m.width-lipgloss.Width(title)-4, 10))))
 
 	summary := lipgloss.NewStyle().Padding(1, 1).Render(strings.Join(m.peekSummary(), "\n"))
 	body := m.peekBody()

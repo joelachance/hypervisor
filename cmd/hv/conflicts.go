@@ -11,6 +11,7 @@ import (
 
 	"github.com/satoricorp/hv/conflict"
 	"github.com/satoricorp/hv/desktop"
+	"github.com/satoricorp/hv/internal/text"
 	hvplan "github.com/satoricorp/hv/plan"
 	"github.com/satoricorp/hv/recall"
 	"github.com/satoricorp/hv/selection"
@@ -105,11 +106,11 @@ func printConflicts(report conflict.Report) {
 		fmt.Printf("clean: %s and %s merge with no overlap (%d files, %d + %d changed lines)\n",
 			sideLabel(report.Ours), sideLabel(report.Theirs), len(report.AutoMerged),
 			report.Accounting.OursChangedLines, report.Accounting.TheirsChangedLines)
-		fmt.Printf("merged tree %s is ready to commit\n", short(report.MergedTree))
+		fmt.Printf("merged tree %s is ready to commit\n", text.Short(report.MergedTree))
 		return
 	}
 	fmt.Printf("%d file(s) conflict between %s and %s, from base %s\n\n",
-		len(report.Conflicts), sideLabel(report.Ours), sideLabel(report.Theirs), short(report.Base))
+		len(report.Conflicts), sideLabel(report.Ours), sideLabel(report.Theirs), text.Short(report.Base))
 	for _, step := range report.Steps {
 		if step.Action == conflict.ActionAuto && step.Path == "" {
 			fmt.Printf("%d. %s\n\n", step.N, step.Reason)
@@ -155,11 +156,4 @@ func sideLabel(side conflict.Side) string {
 		return title
 	}
 	return side.Ref
-}
-
-func short(sha string) string {
-	if len(sha) > 8 {
-		return sha[:8]
-	}
-	return sha
 }

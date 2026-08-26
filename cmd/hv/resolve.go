@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/satoricorp/hv/conflict"
+	"github.com/satoricorp/hv/internal/text"
 	hvplan "github.com/satoricorp/hv/plan"
 	"github.com/satoricorp/hv/resolve"
 )
@@ -102,7 +103,7 @@ func printOutcome(outcome resolve.Outcome) {
 	report := outcome.Report
 	fmt.Printf("resolved %s ← %s\n\n", sideLabel(report.Ours), sideLabel(report.Theirs))
 	for _, fixed := range outcome.Fixed {
-		fmt.Printf("%s  (%d region%s)\n", fixed.Path, fixed.Regions, plural("", fixed.Regions))
+		fmt.Printf("%s  (%d region%s)\n", fixed.Path, fixed.Regions, text.Plural("s", fixed.Regions))
 		for index, resolution := range fixed.Resolutions {
 			fmt.Printf("  region %d: %s\n", index+1, resolution.Reasoning)
 			for _, line := range resolution.Resolved {
@@ -118,9 +119,9 @@ func printOutcome(outcome resolve.Outcome) {
 		fmt.Printf("%d file(s) merged with no conflict: %s\n\n",
 			len(report.AutoMerged), strings.Join(report.AutoMerged, ", "))
 	}
-	fmt.Printf("  %s  %s\n", short(outcome.Commit), outcome.Branch)
+	fmt.Printf("  %s  %s\n", text.Short(outcome.Commit), outcome.Branch)
 	fmt.Printf("  merge of %s and %s, resolved by %s\n",
-		short(outcome.Parents[0]), short(outcome.Parents[1]), outcome.Runner)
+		text.Short(outcome.Parents[0]), text.Short(outcome.Parents[1]), outcome.Runner)
 	fmt.Printf("\nevery conflicted line is accounted for; working tree untouched\n")
 	fmt.Printf("undo with: hv undo -C %s\n", outcome.Repo)
 }

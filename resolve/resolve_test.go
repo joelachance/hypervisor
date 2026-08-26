@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/satoricorp/hv/conflict"
+	"github.com/satoricorp/hv/internal/gitx"
 )
 
 // fakeRunner stands in for fx so the pipeline is testable without a model or
@@ -99,7 +100,7 @@ func TestPromptCarriesBothIntentsAndBothVersions(t *testing.T) {
 
 func TestReplaceRegionsLeavesTheRestByteForByte(t *testing.T) {
 	merged := "top\n<<<<<<< ours\nA\n||||||| base\nO\n=======\nB\n>>>>>>> theirs\nbottom\n"
-	got, err := replaceRegions(merged, [][]string{{"AB"}})
+	got, err := gitx.ReplaceRegions(merged, [][]string{{"AB"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +119,7 @@ func TestReplaceRegionsHandlesSeveralBlocks(t *testing.T) {
 		"<<<<<<< ours", "A2", "||||||| base", "O2", "=======", "B2", ">>>>>>> theirs",
 		"bottom", "",
 	}, "\n")
-	got, err := replaceRegions(merged, [][]string{{"first"}, {"second"}})
+	got, err := gitx.ReplaceRegions(merged, [][]string{{"first"}, {"second"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +131,7 @@ func TestReplaceRegionsHandlesSeveralBlocks(t *testing.T) {
 
 func TestReplaceRegionsRejectsAMiscount(t *testing.T) {
 	merged := "a\n<<<<<<< ours\nA\n=======\nB\n>>>>>>> theirs\nb\n"
-	if _, err := replaceRegions(merged, [][]string{{"one"}, {"two"}}); err == nil {
+	if _, err := gitx.ReplaceRegions(merged, [][]string{{"one"}, {"two"}}); err == nil {
 		t.Fatal("a resolution count that does not match the file was accepted")
 	}
 }

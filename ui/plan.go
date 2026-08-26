@@ -10,7 +10,8 @@ import (
 
 	"github.com/satoricorp/demux"
 	"github.com/satoricorp/demux/capture"
-	"github.com/satoricorp/demux/matcher"
+	"github.com/satoricorp/hv/internal/text"
+	"github.com/satoricorp/hv/merge"
 	hvplan "github.com/satoricorp/hv/plan"
 	"github.com/satoricorp/hv/session"
 )
@@ -36,10 +37,10 @@ type planCursor struct {
 func planCmd(sessions []session.Session, events []capture.SessionEvent) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
-		order, groups, problems := hvplan.GroupByRepo(ctx, sessions)
+		order, groups, problems := merge.ByRepo(ctx, sessions)
 		out := []planGroup{}
 		for _, root := range order {
-			result, err := hvplan.Run(ctx, hvplan.Request{
+			result, err := merge.Plan(ctx, merge.Request{
 				RepoRoot: root,
 				Sessions: groups[root],
 				Events:   events,
@@ -297,50 +298,19 @@ func (m model) planRow(group planGroup, revision demux.RevisionProposal, index i
 	line := fmt.Sprintf("%s%s %s %s %s",
 		cursor,
 		name.Bold(selected).Render(fmt.Sprintf("%-3s", revision.ID)),
-		styleValue.Render(truncate(files, width)+strings.Repeat(" ", maxInt(width-len([]rune(truncate(files, width))), 0))),
-		styleBadgeCLI.Render(fmt.Sprintf("%-24s", truncate("→ "+route, 24))),
-		styleDim.Render(truncate(credit, 22)))
+		styleValue.Render(text.Truncate(files, width)+strings.Repeat(" ", maxInt(width-len([]rune(text.Truncate(files, width))), 0))),
+		styleBadgeCLI.Render(fmt.Sprintf("%-24s", text.Truncate("→ "+route, 24))),
+		styleDim.Render(text.Truncate(credit, 22)))
 	if selected {
 		return styleHighlight.Width(m.width).Render(line)
 	}
 	return line
 }
 
-// revisionSessionIDs is who wrote a revision, from hv's own hunk links rather
-// than the proposal's provenance field - demux fills that only from exact and
-// fuzzy links and leaves it empty more often than not, and a commit missing
-// its Why paragraph over a bookkeeping gap helps nobody.
-func revisionSessionIDs(revision demux.RevisionProposal, links []matcher.HunkLink) []string {
-	bySession := map[string]string{}
-	for _, link := range links {
-		bySession[link.HunkID] = link.SessionID
-	}
-	ids := revision.HunkIDs
-	if len(ids) == 0 {
-		for _, hunk := range revision.Hunks {
-			ids = append(ids, hunk.ID)
-		}
-	}
-	seen := map[string]struct{}{}
-	out := []string{}
-	for _, id := range ids {
-		sessionID := bySession[id]
-		if sessionID == "" {
-			continue
-		}
-		if _, ok := seen[sessionID]; ok {
-			continue
-		}
-		seen[sessionID] = struct{}{}
-		out = append(out, sessionID)
-	}
-	return out
-}
-
 // creditLine names those sessions for the plan row.
 func creditLine(revision demux.RevisionProposal, group planGroup) string {
 	names := []string{}
-	for _, id := range revisionSessionIDs(revision, group.Result.Attributed.Links) {
+	for _, id := range merge.RevisionSessions(revision, group.Result.Attributed.Links) {
 		names = append(names, sessionTitle(id, group.Sessions))
 	}
 	return strings.Join(names, ", ")
@@ -381,7 +351,7 @@ func (m model) diffPane() string {
 // diffLine colors a patch line by what it does, which is the fastest way to
 // read one.
 func diffLine(line string, width int) string {
-	trimmed := truncate(line, maxInt(width, 8))
+	trimmed := text.Truncate(line, maxInt(width, 8))
 	switch {
 	case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
 		return styleDim.Render(trimmed)

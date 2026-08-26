@@ -8,77 +8,48 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/satoricorp/hv/apply"
-	"github.com/satoricorp/hv/recall"
+	"github.com/satoricorp/hv/internal/text"
+	"github.com/satoricorp/hv/journal"
+	"github.com/satoricorp/hv/merge"
 	"github.com/satoricorp/hv/resolve"
-	"github.com/satoricorp/hv/selection"
 )
 
 type appliedMsg struct {
-	entry apply.Entry
+	entry journal.Entry
 	err   error
 }
 
 type undoneMsg struct {
-	entry apply.Entry
+	entry journal.Entry
 	err   error
 }
 
 // applyCmd writes one repository's plan. Only the repository on screen is
 // written: applying every repository at once from a screen showing one of them
 // would commit work the reader has not looked at.
+// applyCmd commits one repository's plan through the shared merge path, so
+// the browser and the command line cannot drift apart again.
 func applyCmd(group planGroup, branch string) tea.Cmd {
 	return func() tea.Msg {
-		titles := map[string]string{}
-		why := map[string]string{}
-		outcomes := map[string]string{}
-		for _, current := range group.Sessions {
-			titles[current.ID] = current.Label()
-			// The transcript is read here rather than in the render loop, and
-			// it is what puts a Why paragraph in the commit message.
-			items, err := recall.Read(current, 0)
-			if err != nil {
-				continue
-			}
-			summary := recall.Summarize(current, items)
-			if summary.Intent != "" {
-				why[current.ID] = summary.Intent
-			}
-			if summary.Outcome != "" {
-				outcomes[current.ID] = summary.Outcome
-			}
-		}
-		// Attribution has to come along, or a revision demux left unattributed
-		// commits with no Why paragraph - the browser's merges were briefer
-		// than the same merge from the command line.
-		attribution := map[string][]string{}
-		for _, revision := range group.Result.Packet.Proposal.Revisions {
-			if ids := revisionSessionIDs(revision, group.Result.Attributed.Links); len(ids) > 0 {
-				attribution[revision.ID] = ids
-			}
-		}
-		options := apply.Options{
-			SessionIDs:       selection.IDs(group.Sessions),
-			Trailers:         titles,
-			Why:              why,
-			Outcomes:         outcomes,
-			RevisionSessions: attribution,
-			Branch:           branch,
+		request := merge.Request{
+			RepoRoot: group.Root,
+			Sessions: group.Sessions,
+			Branch:   branch,
 		}
 		// A patch that collides with what is already on the branch is settled
 		// by whichever harness is installed, so enter finishes the merge
 		// rather than stopping at "does not apply".
 		if harness, ok := resolve.Detect(); ok {
-			options.Resolver = resolve.Adapter{Harness: harness}
+			request.Resolver = resolve.Adapter{Harness: harness}
 		}
-		entry, err := apply.Apply(context.Background(), group.Root, group.Result.Packet, options)
-		return appliedMsg{entry: entry, err: err}
+		result, err := merge.CommitPlanned(context.Background(), request, group.Result)
+		return appliedMsg{entry: result.Entry, err: err}
 	}
 }
 
-func undoCmd(entry apply.Entry) tea.Cmd {
+func undoCmd(entry journal.Entry) tea.Cmd {
 	return func() tea.Msg {
-		undone, err := apply.Undo(context.Background(), entry)
+		undone, err := journal.Undo(context.Background(), entry)
 		return undoneMsg{entry: undone, err: err}
 	}
 }
@@ -120,8 +91,8 @@ func (m model) appliedView() string {
 	lines := []string{}
 	for _, commit := range entry.Commits {
 		lines = append(lines, fmt.Sprintf("  %s  %s  %s",
-			styleDim.Render(short(commit.SHA)),
-			styleBadgeCLI.Render(fmt.Sprintf("%-24s", truncate(commit.Branch, 24))),
+			styleDim.Render(text.Short(commit.SHA)),
+			styleBadgeCLI.Render(fmt.Sprintf("%-24s", text.Truncate(commit.Branch, 24))),
 			styleRow.Render(commit.Subject)))
 	}
 	lines = append(lines, "")
@@ -158,11 +129,4 @@ func (m model) appliedView() string {
 	}
 	footer := styleFooter.Width(m.width).Render(strings.Join(keys, styleDim.Render("  ·  ")))
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
-}
-
-func short(sha string) string {
-	if len(sha) > 8 {
-		return sha[:8]
-	}
-	return sha
 }

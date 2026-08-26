@@ -17,12 +17,10 @@ package conflict
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/satoricorp/hv/internal/gitx"
 	"github.com/satoricorp/hv/recall"
 )
 
@@ -37,14 +35,7 @@ type Side struct {
 // Region is one stretch of a file the two sides disagree about, with every
 // line of all three versions kept - the whole point is that nothing is
 // summarized away.
-type Region struct {
-	Index     int      `json:"index"`
-	StartLine int      `json:"start_line"`
-	Base      []string `json:"base"`
-	Ours      []string `json:"ours"`
-	Theirs    []string `json:"theirs"`
-	Identical bool     `json:"identical,omitempty"`
-}
+type Region = gitx.Region
 
 // FileConflict is one path the merge could not settle.
 type FileConflict struct {
@@ -112,7 +103,7 @@ type Report struct {
 func Analyze(ctx context.Context, repo string, ours, theirs Side) (Report, error) {
 	report := Report{Repo: repo, Ours: ours, Theirs: theirs}
 
-	base, err := git(ctx, repo, "merge-base", ours.Ref, theirs.Ref)
+	base, err := gitx.Run(ctx, repo, "merge-base", ours.Ref, theirs.Ref)
 	if err != nil {
 		return report, fmt.Errorf("no common base for %s and %s: %w", ours.Ref, theirs.Ref, err)
 	}
@@ -170,25 +161,15 @@ func Analyze(ctx context.Context, repo string, ours, theirs Side) (Report, error
 // mergeTree runs the oracle. Exit status 1 means conflicts, which is a result
 // and not a failure; anything else is a real error.
 func mergeTree(ctx context.Context, repo, ours, theirs string) (string, map[string][3]string, []string, error) {
-	command := exec.CommandContext(ctx, "git", "merge-tree", "--write-tree", "--messages", "-z", ours, theirs)
-	command.Dir = repo
-	out, err := command.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if !asExit(err, &exitErr) || exitErr.ExitCode() != 1 {
-			detail := ""
-			if exitErr != nil {
-				detail = strings.TrimSpace(string(exitErr.Stderr))
-			}
-			return "", nil, nil, fmt.Errorf("git merge-tree: %v: %s", err, detail)
-		}
+	// merge-tree exits 1 when it finds conflicts, which is a result and not a
+	// failure, so the output is read whatever the status.
+	out := gitx.Output(ctx, repo, "merge-tree", "--write-tree", "--messages", "-z", ours, theirs)
+	if strings.TrimSpace(out) == "" {
+		return "", nil, nil, fmt.Errorf("git merge-tree said nothing about %s and %s", ours, theirs)
 	}
 	// With -z the sections are NUL separated: tree, then one entry per
 	// conflicted stage, then the messages.
-	fields := strings.Split(string(out), "\x00")
-	if len(fields) == 0 {
-		return "", nil, nil, fmt.Errorf("git merge-tree returned nothing")
-	}
+	fields := strings.Split(out, "\x00")
 	tree := strings.TrimSpace(fields[0])
 	stages := map[string][3]string{}
 	messages := []string{}
@@ -197,24 +178,13 @@ func mergeTree(ctx context.Context, repo, ours, theirs string) (string, map[stri
 		if field == "" {
 			continue
 		}
-		// "<mode> <oid> <stage>\t<path>"
-		parts := strings.SplitN(field, "\t", 2)
-		if len(parts) != 2 {
+		path, stage, blob, ok := parseStageLine(field)
+		if !ok {
 			messages = append(messages, field)
 			continue
 		}
-		meta := strings.Fields(parts[0])
-		if len(meta) != 3 {
-			messages = append(messages, field)
-			continue
-		}
-		stage, err := strconv.Atoi(meta[2])
-		if err != nil || stage < 1 || stage > 3 {
-			continue
-		}
-		path := parts[1]
 		entry := stages[path]
-		entry[stage-1] = meta[1]
+		entry[stage-1] = blob
 		stages[path] = entry
 	}
 	return tree, stages, messages, nil
@@ -226,67 +196,14 @@ func analyzeFile(ctx context.Context, repo, path string, stage [3]string) (FileC
 	fileConflict := FileConflict{
 		Path: path, BaseBlob: stage[0], OursBlob: stage[1], TheirsBlob: stage[2],
 	}
-	dir, err := os.MkdirTemp("", "hv-conflict-*")
+	merged, err := gitx.MergeFile(ctx, repo, stage[0], stage[1], stage[2],
+		[3]string{"base", "ours", "theirs"})
 	if err != nil {
 		return fileConflict, err
 	}
-	defer os.RemoveAll(dir)
-
-	names := [3]string{"base", "ours", "theirs"}
-	paths := [3]string{}
-	for index, blob := range stage {
-		target := filepath.Join(dir, names[index])
-		paths[index] = target
-		body := ""
-		if blob != "" {
-			if body, err = git(ctx, repo, "cat-file", "blob", blob); err != nil {
-				return fileConflict, err
-			}
-			body += "\n"
-		}
-		if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
-			return fileConflict, err
-		}
-	}
-	// merge-file writes conflict markers with the base kept (--diff3), which
-	// is what makes each region show all three versions.
-	merged := runIgnoringStatus(ctx, repo, "merge-file", "-p", "--diff3",
-		"-L", "ours", "-L", "base", "-L", "theirs", paths[1], paths[0], paths[2])
 	fileConflict.Merged = merged
-	fileConflict.Regions = ParseRegions(merged)
+	fileConflict.Regions = gitx.ParseRegions(merged)
 	return fileConflict, nil
-}
-
-// ParseRegions reads git's conflict markers back into structured regions.
-func ParseRegions(merged string) []Region {
-	regions := []Region{}
-	var current *Region
-	section := 0 // 1 ours, 2 base, 3 theirs
-	for number, line := range strings.Split(merged, "\n") {
-		switch {
-		case strings.HasPrefix(line, "<<<<<<<"):
-			current = &Region{Index: len(regions) + 1, StartLine: number + 1}
-			section = 1
-		case strings.HasPrefix(line, "|||||||") && current != nil:
-			section = 2
-		case strings.HasPrefix(line, "=======") && current != nil:
-			section = 3
-		case strings.HasPrefix(line, ">>>>>>>") && current != nil:
-			current.Identical = equalLines(current.Ours, current.Theirs)
-			regions = append(regions, *current)
-			current, section = nil, 0
-		case current != nil:
-			switch section {
-			case 1:
-				current.Ours = append(current.Ours, line)
-			case 2:
-				current.Base = append(current.Base, line)
-			case 3:
-				current.Theirs = append(current.Theirs, line)
-			}
-		}
-	}
-	return regions
 }
 
 // steps turns the findings into an ordered, exhaustive list of decisions, and
@@ -350,7 +267,7 @@ func sideName(side Side) string {
 
 // changedLines counts added and removed lines between two refs.
 func changedLines(ctx context.Context, repo, from, to string) int {
-	out := runIgnoringStatus(ctx, repo, "diff", "--numstat", from, to)
+	out := gitx.Output(ctx, repo, "diff", "--numstat", from, to)
 	total := 0
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
@@ -370,7 +287,7 @@ func changedFiles(ctx context.Context, repo, base string, refs ...string) []stri
 	seen := map[string]struct{}{}
 	out := []string{}
 	for _, ref := range refs {
-		listing := runIgnoringStatus(ctx, repo, "diff", "--name-only", base, ref)
+		listing := gitx.Output(ctx, repo, "diff", "--name-only", base, ref)
 		for _, file := range strings.Split(listing, "\n") {
 			file = strings.TrimSpace(file)
 			if file == "" {
@@ -413,34 +330,20 @@ func maxInt(left, right int) int {
 	return right
 }
 
-func git(ctx context.Context, dir string, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, "git", args...)
-	command.Dir = dir
-	out, err := command.Output()
-	if err != nil {
-		detail := ""
-		var exitErr *exec.ExitError
-		if asExit(err, &exitErr) {
-			detail = strings.TrimSpace(string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, detail)
+// parseStageLine reads one "<mode> <oid> <stage>\t<path>" entry, which is how
+// merge-tree and ls-files -u both describe a conflicted path.
+func parseStageLine(field string) (path string, stage int, blob string, ok bool) {
+	parts := strings.SplitN(field, "\t", 2)
+	if len(parts) != 2 {
+		return "", 0, "", false
 	}
-	return strings.TrimRight(string(out), "\n"), nil
-}
-
-// runIgnoringStatus returns stdout whatever the exit status: several git
-// commands report findings through the exit code rather than failure.
-func runIgnoringStatus(ctx context.Context, dir string, args ...string) string {
-	command := exec.CommandContext(ctx, "git", args...)
-	command.Dir = dir
-	out, _ := command.Output()
-	return string(out)
-}
-
-func asExit(err error, target **exec.ExitError) bool {
-	exitErr, ok := err.(*exec.ExitError)
-	if ok {
-		*target = exitErr
+	meta := strings.Fields(parts[0])
+	if len(meta) != 3 {
+		return "", 0, "", false
 	}
-	return ok
+	stage, err := strconv.Atoi(meta[2])
+	if err != nil || stage < 1 || stage > 3 {
+		return "", 0, "", false
+	}
+	return parts[1], stage, meta[1], true
 }

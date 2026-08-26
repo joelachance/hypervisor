@@ -15,13 +15,14 @@ import (
 
 	"github.com/satoricorp/demux"
 	"github.com/satoricorp/demux/capture"
-	"github.com/satoricorp/demux/matcher"
 	"github.com/satoricorp/hv/apply"
 	"github.com/satoricorp/hv/desktop"
+	"github.com/satoricorp/hv/internal/text"
+	"github.com/satoricorp/hv/journal"
 	"github.com/satoricorp/hv/launch"
+	"github.com/satoricorp/hv/merge"
 	"github.com/satoricorp/hv/parse"
 	hvplan "github.com/satoricorp/hv/plan"
-	"github.com/satoricorp/hv/recall"
 	"github.com/satoricorp/hv/resolve"
 	"github.com/satoricorp/hv/selection"
 	"github.com/satoricorp/hv/session"
@@ -283,7 +284,7 @@ func sessionsCmd(args []string) error {
 	for _, current := range sessions {
 		fmt.Printf("%-6s %-14s %-32s %-13s %3d edits  %-9s %s\n",
 			current.State(now.UnixMilli()),
-			truncate(repoName(current), 14), truncate(current.Label(), 32),
+			text.Truncate(repoName(current), 14), text.Truncate(current.Label(), 32),
 			short[current.ID], current.EditCount,
 			humanAge(now.UnixMilli()-current.LastActiveAt), landedLabel(current))
 	}
@@ -308,7 +309,7 @@ func watchCmd(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("%s %-7s %-13s %s\n",
 			time.UnixMilli(event.TS).Format("15:04:05"), event.Tool,
-			shortID(event.SessionID), event.FilePath)
+			text.Short(event.SessionID), event.FilePath)
 	})
 }
 
@@ -398,35 +399,25 @@ func mergeCmd(ctx context.Context, args []string) error {
 	return nil
 }
 
-// commitPlan writes a plan to the repository and reports what it wrote.
+// commitPlan writes a plan through the shared merge path and reports what it
+// wrote. The orchestration lives in merge; this only decides what to say.
 func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions []session.Session, resolver apply.Resolver, branch string) error {
-	// HEAD means "the branch I am on", which is the common case for someone
-	// who wants the work committed where they are standing rather than parked
-	// on a name they will have to go find.
-	if strings.EqualFold(strings.TrimSpace(branch), "HEAD") {
-		if current, err := hvplan.CurrentBranch(ctx, root); err == nil {
-			branch = current
-		}
-	}
-	why, outcomes := sessionReasons(sessions)
-	attribution := map[string][]string{}
-	for _, revision := range result.Packet.Proposal.Revisions {
-		if ids := revisionSessions(revision, result.Attributed.Links); len(ids) > 0 {
-			attribution[revision.ID] = ids
-		}
-	}
-	entry, err := apply.Apply(ctx, root, result.Packet, apply.Options{
-		RevisionSessions: attribution,
-		SessionIDs:       selection.IDs(sessions),
-		Trailers:         sessionTitles(sessions),
-		Why:              why,
-		Outcomes:         outcomes,
-		Branch:           branch,
-		Resolver:         resolver,
-	})
+	outcome, err := merge.CommitPlanned(ctx, merge.Request{
+		RepoRoot: root,
+		Sessions: sessions,
+		Branch:   branch,
+		Resolver: resolver,
+	}, result)
 	if err != nil {
 		return err
 	}
+	printCommitted(ctx, root, outcome.Entry, resolver)
+	return nil
+}
+
+// printCommitted says what landed, and - the part people ask about - what did
+// not move.
+func printCommitted(ctx context.Context, root string, entry journal.Entry, resolver apply.Resolver) {
 	fmt.Println()
 	for _, commit := range entry.Commits {
 		fmt.Printf("  %s  %-24s %s\n", commit.SHA[:8], commit.Branch, commit.Subject)
@@ -449,19 +440,15 @@ func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions
 	// to "your branch" below.
 	current, _ := hvplan.CurrentBranch(ctx, root)
 	fmt.Printf("\n%d commits on %d branch%s (%d new, %d extended)\n",
-		len(entry.Commits), len(entry.Branches), plural("es", len(entry.Branches)), created, extended)
-	// The confusing part, said plainly: the commits are copies. Nothing was
-	// checked out, the branch you are on has not moved, and the same edits are
-	// still sitting uncommitted where they were.
+		len(entry.Commits), len(entry.Branches), text.Plural("es", len(entry.Branches)), created, extended)
 	if entry.CheckedOut != "" {
 		fmt.Printf("  %s moved, and your working tree now matches it - these are your commits\n", entry.CheckedOut)
 	} else {
-		fmt.Printf("  you are still on %s, which did not move\n", firstNonEmptyString(current, "your branch"))
+		fmt.Printf("  you are still on %s, which did not move\n", text.FirstNonEmpty(current, "your branch"))
 		fmt.Printf("  your uncommitted changes are still uncommitted - the commits are copies of them\n")
 		fmt.Printf("  see them with: git log %s\n", entry.Branches[0].Name)
 	}
 	fmt.Printf("undo with: hv undo -C %s\n", root)
-	return nil
 }
 
 func sessionTitles(sessions []session.Session) map[string]string {
@@ -470,36 +457,6 @@ func sessionTitles(sessions []session.Session) map[string]string {
 		titles[current.ID] = current.Label()
 	}
 	return titles
-}
-
-// sessionReasons is what each session was asked to do and what it reported
-// doing, read from its transcript. Between them they are the paragraphs of
-// every commit message hv writes.
-func sessionReasons(sessions []session.Session) (why, outcomes map[string]string) {
-	why, outcomes = map[string]string{}, map[string]string{}
-	for _, current := range sessions {
-		items, err := recall.Read(current, 0)
-		if err != nil {
-			continue
-		}
-		summary := recall.Summarize(current, items)
-		if summary.Intent != "" {
-			why[current.ID] = summary.Intent
-		}
-		if summary.Outcome != "" {
-			outcomes[current.ID] = summary.Outcome
-		}
-	}
-	return why, outcomes
-}
-
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func undoCmd(ctx context.Context, args []string) error {
@@ -514,7 +471,7 @@ func undoCmd(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	history, err := apply.History(ctx, root)
+	history, err := journal.History(ctx, root)
 	if err != nil {
 		return err
 	}
@@ -537,7 +494,7 @@ func undoCmd(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	entry, found := apply.Entry{}, false
+	entry, found := journal.Entry{}, false
 	if strings.TrimSpace(*id) != "" {
 		for _, candidate := range history {
 			if candidate.ID == *id {
@@ -547,13 +504,13 @@ func undoCmd(ctx context.Context, args []string) error {
 		if !found {
 			return fmt.Errorf("no applied plan %q in %s", *id, root)
 		}
-	} else if entry, found, err = apply.Last(ctx, root); err != nil {
+	} else if entry, found, err = journal.Last(ctx, root); err != nil {
 		return err
 	} else if !found {
 		return fmt.Errorf("nothing to undo in %s", root)
 	}
 
-	undone, err := apply.Undo(ctx, entry)
+	undone, err := journal.Undo(ctx, entry)
 	if err != nil {
 		return err
 	}
@@ -626,7 +583,7 @@ func printPlan(result hvplan.Result, sessions []session.Session) {
 		// usually empty even when every hunk is accounted for. A revision can
 		// also draw on several sessions - demux pairs a test with its source,
 		// and those are routinely different sessions.
-		if contributors := revisionSessions(revision, result.Attributed.Links); len(contributors) > 0 {
+		if contributors := merge.RevisionSessions(revision, result.Attributed.Links); len(contributors) > 0 {
 			names := make([]string, 0, len(contributors))
 			for _, id := range contributors {
 				names = append(names, sessionName(id, short, sessions))
@@ -649,44 +606,12 @@ func withState(sessions []session.Session, want session.State, now int64) []sess
 	return out
 }
 
-// revisionSessions returns the sessions whose edits landed in a revision, in
-// the order their hunks appear.
-func revisionSessions(revision demux.RevisionProposal, links []matcher.HunkLink) []string {
-	if len(links) == 0 {
-		return nil
-	}
-	bySession := map[string]string{}
-	for _, link := range links {
-		bySession[link.HunkID] = link.SessionID
-	}
-	ids := revision.HunkIDs
-	if len(ids) == 0 {
-		for _, hunk := range revision.Hunks {
-			ids = append(ids, hunk.ID)
-		}
-	}
-	seen := map[string]struct{}{}
-	out := []string{}
-	for _, id := range ids {
-		sessionID := bySession[id]
-		if sessionID == "" {
-			continue
-		}
-		if _, ok := seen[sessionID]; ok {
-			continue
-		}
-		seen[sessionID] = struct{}{}
-		out = append(out, sessionID)
-	}
-	return out
-}
-
 // sessionName labels a session id with the title it goes by, so a plan reads
 // in the same terms as the picker that produced it.
 func sessionName(id string, short map[string]string, sessions []session.Session) string {
 	abbreviated, ok := short[id]
 	if !ok {
-		abbreviated = shortID(id)
+		abbreviated = text.Short(id)
 	}
 	for _, current := range sessions {
 		if current.ID == id && strings.TrimSpace(current.Title) != "" {
@@ -694,13 +619,6 @@ func sessionName(id string, short map[string]string, sessions []session.Session)
 		}
 	}
 	return abbreviated
-}
-
-func plural(word string, count int) string {
-	if count == 1 {
-		return word
-	}
-	return word + "s"
 }
 
 func routeOf(revision demux.RevisionProposal) string {
@@ -718,13 +636,6 @@ func splitIDs(value string) []string {
 		}
 	}
 	return out
-}
-
-func shortID(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	return id
 }
 
 // repoName is the last path element of a session's directory - hv lists every
@@ -815,11 +726,4 @@ func humanAge(millis int64) string {
 	default:
 		return fmt.Sprintf("%dd ago", int(age.Hours()/24))
 	}
-}
-
-func truncate(text string, limit int) string {
-	if len(text) <= limit {
-		return text
-	}
-	return text[:limit-1] + "\u2026"
 }

@@ -2,13 +2,12 @@ package plan
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/satoricorp/demux"
+	"github.com/satoricorp/hv/internal/gitx"
 )
 
 // Probe implements demux.ContentProbe over git, which is what lets demux drop
@@ -41,7 +40,7 @@ func WorkingDiff(ctx context.Context, repoRoot string, staged bool, files []stri
 	}
 	args = append(args, "--")
 	args = append(args, files...)
-	tracked, err := runRaw(ctx, repoRoot, args...)
+	tracked, err := gitx.RunRaw(ctx, repoRoot, args...)
 	if err != nil {
 		return "", err
 	}
@@ -64,7 +63,7 @@ func WorkingDiff(ctx context.Context, repoRoot string, staged bool, files []stri
 // that mutates the repository is a planning command people stop trusting.
 func untrackedDiff(ctx context.Context, repoRoot string, files []string) (string, error) {
 	args := append([]string{"ls-files", "--others", "--exclude-standard", "--"}, files...)
-	listing, err := runRaw(ctx, repoRoot, args...)
+	listing, err := gitx.RunRaw(ctx, repoRoot, args...)
 	if err != nil {
 		return "", err
 	}
@@ -76,7 +75,7 @@ func untrackedDiff(ctx context.Context, repoRoot string, files []string) (string
 		}
 		// --no-index exits 1 whenever the files differ, which is always here,
 		// so its status says nothing and the output has to be read anyway.
-		diff := runIgnoringStatus(ctx, repoRoot,
+		diff := gitx.Output(ctx, repoRoot,
 			"diff", "--no-color", "--no-ext-diff", "--no-index", "--", os.DevNull, path)
 		if strings.TrimSpace(diff) == "" {
 			continue
@@ -104,31 +103,5 @@ func RepoRoot(ctx context.Context, dir string) (string, error) {
 }
 
 func run(ctx context.Context, dir string, args ...string) (string, error) {
-	out, err := runRaw(ctx, dir, args...)
-	return strings.TrimSpace(out), err
-}
-
-// runIgnoringStatus returns git's stdout whatever its exit status. Some git
-// commands report findings through the exit code rather than failure, and for
-// those the output is the answer.
-func runIgnoringStatus(ctx context.Context, dir string, args ...string) string {
-	command := exec.CommandContext(ctx, "git", args...)
-	command.Dir = dir
-	out, _ := command.Output()
-	return string(out)
-}
-
-func runRaw(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	out, err := cmd.Output()
-	if err != nil {
-		detail := ""
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			detail = strings.TrimSpace(string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, detail)
-	}
-	return string(out), nil
+	return gitx.Run(ctx, dir, args...)
 }

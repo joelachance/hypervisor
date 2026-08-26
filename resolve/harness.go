@@ -22,6 +22,7 @@ package resolve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -219,7 +220,7 @@ func (h Harness) Ask(ctx context.Context, prompt string) (string, error) {
 	if err != nil {
 		detail := ""
 		var exitErr *exec.ExitError
-		if ok := asExit(err, &exitErr); ok {
+		if errors.As(err, &exitErr) {
 			detail = strings.TrimSpace(string(exitErr.Stderr))
 		}
 		return "", fmt.Errorf("%s: %v: %s", h.Name(), err, clipError(detail))
@@ -388,14 +389,6 @@ func RequestFor(report conflict.Report, step conflict.Step) Request {
 		request.TheirsIntent = report.Theirs.Context.Intent
 	}
 	return request
-}
-
-func asExit(err error, target **exec.ExitError) bool {
-	exitErr, ok := err.(*exec.ExitError)
-	if ok {
-		*target = exitErr
-	}
-	return ok
 }
 
 // Adapter lets a Harness settle conflicts that arise while committing, which

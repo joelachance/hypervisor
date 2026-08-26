@@ -45,6 +45,9 @@ dropped with a reason - before it reaches a commit.
 ## Layout
 
 ```
+internal/gitx/   every git invocation hv makes, and conflict-region handling
+internal/text/   the small string helpers output is built from
+
 parse/      per-tool session log decoding
 watch/      polling sweep over the log roots
 session/    the indexed Session and its state
@@ -53,12 +56,24 @@ selection/  filters
 recall/     transcripts and cross-repo memory
 match/      hunk to session attribution
 plan/       the demux handoff
-apply/      commits, branches, journal, undo
+apply/      building commits and moving refs
+journal/    what was committed, and undo
+merge/      the one path from chosen sessions to commits
 conflict/   merge-tree analysis
 resolve/    harness-driven conflict resolution
-ui/         the browser
+ui/         the browser, one file per screen
 cmd/hv/     the CLI
 ```
+
+**Both frontends go through `merge`.** The browser and the command line each
+used to orchestrate plan-and-commit themselves, and the browser silently lost
+its commit messages' Why paragraph because a fix landed in one copy. Add
+behaviour to `merge`; the frontends only decide what to say about the outcome.
+
+**Shell out to git only through `internal/gitx`.** Four packages had grown
+their own copy, which is four ideas about when a non-zero exit is a failure.
+It usually is not: several git commands report a finding through the exit code,
+and `gitx.Output` exists for those.
 
 demux itself lives in a sibling checkout (`../demux`) and is wired in with a
 `replace` directive; the two repositories have to stay siblings.
