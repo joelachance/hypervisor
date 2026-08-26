@@ -54,6 +54,25 @@ func TestVerifyCatchesASilentlyDroppedLine(t *testing.T) {
 	}
 }
 
+// Combining two lines into one is an honest resolution, and without a way to
+// say so it would look like two lines going missing.
+func TestVerifyAcceptsARewrittenLine(t *testing.T) {
+	request := Request{
+		Ours:   []string{"// caps requests, with a burst"},
+		Theirs: []string{"// caps requests, backing off"},
+	}
+	resolution := Resolution{
+		Resolved: []string{"// caps requests, with a burst, backing off"},
+		Rewritten: []Rewrite{
+			{From: "// caps requests, with a burst", To: "// caps requests, with a burst, backing off", Why: "combined"},
+			{From: "// caps requests, backing off", To: "// caps requests, with a burst, backing off", Why: "combined"},
+		},
+	}
+	if problems := Verify(request, resolution); len(problems) != 0 {
+		t.Fatalf("problems = %v, want none", problems)
+	}
+}
+
 func TestVerifyAcceptsADroppedLineWithAReason(t *testing.T) {
 	request := Request{Ours: []string{"old call"}, Theirs: []string{"new call"}}
 	resolution := Resolution{
@@ -78,14 +97,41 @@ func TestPromptCarriesBothIntentsAndBothVersions(t *testing.T) {
 	}
 }
 
-func TestReplaceRegionLeavesTheRestByteForByte(t *testing.T) {
+func TestReplaceRegionsLeavesTheRestByteForByte(t *testing.T) {
 	merged := "top\n<<<<<<< ours\nA\n||||||| base\nO\n=======\nB\n>>>>>>> theirs\nbottom\n"
-	got, err := replaceRegion(merged, 1, []string{"AB"})
+	got, err := replaceRegions(merged, [][]string{{"AB"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != "top\nAB\nbottom\n" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// Replacing blocks one at a time renumbers the ones that follow, so a file
+// with two conflicts would look for region 2 in a file that no longer has one.
+func TestReplaceRegionsHandlesSeveralBlocks(t *testing.T) {
+	merged := strings.Join([]string{
+		"top",
+		"<<<<<<< ours", "A1", "||||||| base", "O1", "=======", "B1", ">>>>>>> theirs",
+		"middle",
+		"<<<<<<< ours", "A2", "||||||| base", "O2", "=======", "B2", ">>>>>>> theirs",
+		"bottom", "",
+	}, "\n")
+	got, err := replaceRegions(merged, [][]string{{"first"}, {"second"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "top\nfirst\nmiddle\nsecond\nbottom\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestReplaceRegionsRejectsAMiscount(t *testing.T) {
+	merged := "a\n<<<<<<< ours\nA\n=======\nB\n>>>>>>> theirs\nb\n"
+	if _, err := replaceRegions(merged, [][]string{{"one"}, {"two"}}); err == nil {
+		t.Fatal("a resolution count that does not match the file was accepted")
 	}
 }
 

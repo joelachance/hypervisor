@@ -85,6 +85,7 @@ type model struct {
 	events   []capture.SessionEvent
 	plans    []planGroup
 	plan     planCursor
+	dryRun   bool
 	applied  apply.Entry
 	filter   string
 	archived bool
@@ -290,12 +291,15 @@ func (m model) updateBrowse(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.moveCursor(1)
 		}
 
-	case "enter":
+	case "enter", "shift+enter", "d":
 		chosen := m.selected()
 		if len(chosen) == 0 {
 			m.status = "nothing selected - space marks a session, enter merges"
 			return m, nil
 		}
+		// Shift+Enter plans without the option to commit. Not every terminal
+		// can send it, so d does the same thing.
+		m.dryRun = key.String() != "enter"
 		m.outcome = Outcome{Merge: chosen}
 		m.screen = screenPlanning
 		return m, planCmd(chosen, m.events)
@@ -682,6 +686,7 @@ func (m model) footer() string {
 		key("↑↓", "move"),
 		key("space", "mark"),
 		key("enter", "merge"),
+		key("⇧enter/d", "dry run"),
 		key("o", "open"),
 		key("/", "filter"),
 		m.scopeKey(),

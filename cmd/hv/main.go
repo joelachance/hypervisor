@@ -84,7 +84,9 @@ func usage() {
   hv open <session>                             reopen a session where it lives
   hv undo [-C dir] [-list]                      undo the last merge
   hv conflicts -ours REF -theirs REF [-json]    what two sessions disagree about
-  hv resolve -ours REF -theirs REF              have fx fix it, commit the merge
+  hv resolve -ours REF -theirs REF              have a coding agent fix it and
+                                                commit the merge (-harness pi|fx|
+                                                claude|codex|opencode|<binary>)
 
 With no -session, merge lists the sessions that touched this repo and asks
 which to merge. Their edits are attributed to hunks, grouped into revisions,
@@ -385,6 +387,9 @@ func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions
 		} else {
 			extended++
 		}
+	}
+	for _, rename := range entry.Renamed {
+		fmt.Printf("\n  %s was taken by unrelated history; used %s instead\n", rename.From, rename.To)
 	}
 	fmt.Printf("\n%d commits on %d branches (%d new, %d extended); working tree untouched\n",
 		len(entry.Commits), len(entry.Branches), created, extended)

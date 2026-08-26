@@ -51,7 +51,10 @@ func Merge(ctx context.Context, repo string, report conflict.Report, runner Runn
 	blobs := map[string]string{}
 	for _, fileConflict := range report.Conflicts {
 		fixed := Fixed{Path: fileConflict.Path, Regions: len(fileConflict.Regions)}
-		merged := fileConflict.Merged
+		// Every region is resolved first and the file rewritten in one pass.
+		// Replacing them one at a time would renumber the blocks that follow,
+		// so region 2 would be looked for in a file that no longer has one.
+		replacements := make([][]string, 0, len(fileConflict.Regions))
 		for _, region := range fileConflict.Regions {
 			request := requestForRegion(report, fileConflict.Path, region)
 			resolution, err := runner.Resolve(ctx, request)
@@ -61,12 +64,12 @@ func Merge(ctx context.Context, repo string, report conflict.Report, runner Runn
 			if problems := Verify(request, resolution); len(problems) > 0 {
 				fixed.Problems = append(fixed.Problems, problems...)
 			}
-			replaced, err := replaceRegion(merged, region.Index, resolution.Resolved)
-			if err != nil {
-				return outcome, fmt.Errorf("%s region %d: %w", fileConflict.Path, region.Index, err)
-			}
-			merged = replaced
+			replacements = append(replacements, resolution.Resolved)
 			fixed.Resolutions = append(fixed.Resolutions, resolution)
+		}
+		merged, err := replaceRegions(fileConflict.Merged, replacements)
+		if err != nil {
+			return outcome, fmt.Errorf("%s: %w", fileConflict.Path, err)
 		}
 		if strings.Contains(merged, "<<<<<<<") {
 			return outcome, fmt.Errorf("%s still has conflict markers after resolution", fileConflict.Path)
@@ -143,23 +146,21 @@ func requestForRegion(report conflict.Report, path string, region conflict.Regio
 	return request
 }
 
-// replaceRegion swaps the nth conflict block for the resolved lines, leaving
-// everything around it byte for byte as git produced it.
-func replaceRegion(merged string, index int, resolved []string) (string, error) {
+// replaceRegions swaps every conflict block for its resolution in one pass,
+// leaving everything around them byte for byte as git produced it.
+func replaceRegions(merged string, replacements [][]string) (string, error) {
 	lines := strings.Split(merged, "\n")
 	out := make([]string, 0, len(lines))
-	seen, inBlock, replaced := 0, false, false
+	seen, inBlock := 0, false
 	for _, line := range lines {
 		switch {
 		case strings.HasPrefix(line, "<<<<<<<"):
-			seen++
-			inBlock = seen == index
-			if !inBlock {
-				out = append(out, line)
-				continue
+			if seen >= len(replacements) {
+				return "", fmt.Errorf("more conflict blocks than resolutions")
 			}
-			out = append(out, resolved...)
-			replaced = true
+			out = append(out, replacements[seen]...)
+			seen++
+			inBlock = true
 		case inBlock && strings.HasPrefix(line, ">>>>>>>"):
 			inBlock = false
 		case inBlock:
@@ -168,8 +169,8 @@ func replaceRegion(merged string, index int, resolved []string) (string, error) 
 			out = append(out, line)
 		}
 	}
-	if !replaced {
-		return "", fmt.Errorf("region %d not found", index)
+	if seen != len(replacements) {
+		return "", fmt.Errorf("resolved %d regions but the file has %d", len(replacements), seen)
 	}
 	return strings.Join(out, "\n"), nil
 }

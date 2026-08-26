@@ -105,6 +105,10 @@ func (m model) updatePlan(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "]":
 		m.switchGroup(1)
 	case "enter", "a", "c":
+		if m.dryRun {
+			m.status = "dry run - press esc, then enter on the sessions to commit"
+			return m, nil
+		}
 		// Commit this repository's plan. The reader is looking at it, which
 		// is the only screen from which committing is an informed act - and
 		// leaving without committing is q, one key away.
@@ -222,6 +226,9 @@ func (m model) planHeader() string {
 		len(proposal.Revisions), len(proposal.Hunks), group.Result.Packet.State))
 	if len(m.plans) > 1 {
 		counts += styleKey.Render(fmt.Sprintf("  ·  repo %d/%d", m.plan.group+1, len(m.plans)))
+	}
+	if m.dryRun {
+		counts += styleCursor.Render("  ·  dry run")
 	}
 	return styleTitleBar.Width(m.width).Render(left + where + counts)
 }
@@ -378,10 +385,14 @@ func (m model) planFooter() string {
 	if m.plan.onDiff {
 		pane = "revisions"
 	}
+	commit := key("enter", "commit")
+	if m.dryRun {
+		commit = styleDim.Render("dry run — nothing will be committed")
+	}
 	keys := []string{
 		key("↑↓", "move"),
 		key("tab", pane),
-		key("enter", "commit"),
+		commit,
 		key("esc", "back"),
 		key("p", "print & exit"),
 	}

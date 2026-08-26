@@ -25,8 +25,9 @@ func resolveCmd(ctx context.Context, args []string) error {
 	oursSession := flags.String("ours-session", "", "session behind -ours, for context")
 	theirsSession := flags.String("theirs-session", "", "session behind -theirs, for context")
 	branch := flags.String("branch", "", "branch for the merge (default hv/merge-<ours>-<theirs>)")
-	model := flags.String("model", "", "model for fx to use")
-	binary := flags.String("fx", "fx", "the fx binary")
+	model := flags.String("model", "", "model for the harness to use")
+	harnessName := flags.String("harness", "", "coding harness: pi, fx, claude, codex, opencode, or a binary path")
+	harnessArgs := flags.String("harness-args", "", "argument template for a custom harness; {prompt} is the question")
 	dryRun := flags.Bool("dry-run", false, "report the conflicts without asking fx or committing")
 	asJSON := flags.Bool("json", false, "print the outcome as JSON")
 	if err := flags.Parse(args); err != nil {
@@ -71,7 +72,10 @@ func resolveCmd(ctx context.Context, args []string) error {
 	if target == "" {
 		target = "hv/merge-" + slug(*ours) + "-" + slug(*theirs)
 	}
-	runner := resolve.Fx{Binary: *binary, Dir: root, Model: *model}
+	runner, err := harnessFor(*harnessName, *harnessArgs, *model)
+	if err != nil {
+		return err
+	}
 
 	fmt.Fprintf(os.Stderr, "%d file(s) conflict; asking %s to resolve %d region(s)…\n",
 		len(report.Conflicts), runner.Name(), regionCount(report))
@@ -119,6 +123,49 @@ func printOutcome(outcome resolve.Outcome) {
 		short(outcome.Parents[0]), short(outcome.Parents[1]), outcome.Runner)
 	fmt.Printf("\nevery conflicted line is accounted for; working tree untouched\n")
 	fmt.Printf("undo with: hv undo -C %s\n", outcome.Repo)
+}
+
+// harnessFor resolves which coding agent to ask. Named harnesses come with a
+// recipe; anything else is treated as a binary plus an argument template, so
+// hv can drive a harness it has never heard of.
+func harnessFor(name, args, model string) (resolve.Harness, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = strings.TrimSpace(os.Getenv("HV_HARNESS"))
+	}
+	if strings.TrimSpace(args) == "" {
+		args = strings.TrimSpace(os.Getenv("HV_HARNESS_ARGS"))
+	}
+	if name == "" {
+		harness, ok := resolve.Detect()
+		if !ok {
+			return resolve.Harness{}, fmt.Errorf(
+				"no coding harness found on PATH; install one of %s or pass -harness <binary> -harness-args '<template with {prompt}>'",
+				strings.Join(harnessNames(), ", "))
+		}
+		harness.Model = model
+		return harness, nil
+	}
+	if harness, ok := resolve.Builtin(name); ok {
+		harness.Model = model
+		return harness, nil
+	}
+	if strings.TrimSpace(args) == "" {
+		return resolve.Harness{}, fmt.Errorf(
+			"unknown harness %q; known: %s. For anything else pass -harness-args with {prompt} in it",
+			name, strings.Join(harnessNames(), ", "))
+	}
+	harness := resolve.Custom(name, strings.Fields(args))
+	harness.Model = model
+	return harness, nil
+}
+
+func harnessNames() []string {
+	names := []string{}
+	for _, harness := range resolve.Builtins() {
+		names = append(names, harness.Label)
+	}
+	return names
 }
 
 func regionCount(report conflict.Report) int {

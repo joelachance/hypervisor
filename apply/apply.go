@@ -57,7 +57,14 @@ type Entry struct {
 	Commits    []Commit       `json:"commits"`
 	Branches   []BranchChange `json:"branches"`
 	SessionIDs []string       `json:"session_ids,omitempty"`
+	Renamed    []Rename       `json:"renamed,omitempty"`
 	UndoneAt   int64          `json:"undone_at,omitempty"`
+}
+
+// Rename records a branch hv could not use under its routed name.
+type Rename struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 // Undone reports whether this entry has already been undone.
@@ -100,6 +107,9 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 	// a patch that fails to apply leaves no half-built branch behind.
 	tips := map[string]string{}
 	before := map[string]string{}
+	// Branches that had to be renamed because the name was taken by unrelated
+	// history; reported so nobody goes looking for commits under the old one.
+	renamed := map[string]string{}
 
 	for _, revision := range proposal.Revisions {
 		branch := branchOf(revision)
@@ -107,11 +117,25 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 		if !ok {
 			parent = startingPoint(ctx, repoRoot, revision, tips, base)
 			if existing, err := git(ctx, repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
-				before[branch] = existing
-				// An existing branch is extended from its own tip rather than
-				// rewritten from HEAD: hv adds commits, it does not discard
-				// anyone else's.
-				parent = existing
+				if descendsFrom(ctx, repoRoot, base, existing) {
+					// An existing branch is extended from its own tip rather
+					// than rewritten from HEAD: hv adds commits, it does not
+					// discard anyone else's.
+					before[branch] = existing
+					parent = existing
+				} else {
+					// The branch exists but grew from somewhere else - most
+					// often another worktree of this repository that routed to
+					// the same name from a different base. Its patches were
+					// computed against this base and will not apply to that
+					// tip, so the work goes on a branch of its own rather than
+					// failing or landing on top of unrelated commits.
+					branch = freeBranch(ctx, repoRoot, branch, base)
+					renamed[branchOf(revision)] = branch
+					if tip, ok := tips[branch]; ok {
+						parent = tip
+					}
+				}
 			}
 		}
 		patch := patchFor(revision, patches)
@@ -132,6 +156,9 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 		})
 	}
 
+	for from, to := range renamed {
+		entry.Renamed = append(entry.Renamed, Rename{From: from, To: to})
+	}
 	for branch, tip := range tips {
 		if _, err := git(ctx, repoRoot, "update-ref", "refs/heads/"+branch, tip); err != nil {
 			return entry, fmt.Errorf("branch %s: %w", branch, err)
@@ -243,6 +270,26 @@ func Undo(ctx context.Context, entry Entry) (Entry, error) {
 		return entry, err
 	}
 	return entry, nil
+}
+
+// descendsFrom reports whether tip has base in its history, which is what
+// makes it safe to apply patches computed against base on top of tip.
+func descendsFrom(ctx context.Context, repoRoot, base, tip string) bool {
+	command := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", base, tip)
+	command.Dir = repoRoot
+	return command.Run() == nil
+}
+
+// freeBranch finds an unused name near the routed one, preferring a suffix
+// that says where the work came from.
+func freeBranch(ctx context.Context, repoRoot, branch, base string) string {
+	candidate := branch + "-" + short(base)
+	for suffix := 2; ; suffix++ {
+		if _, err := git(ctx, repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+candidate); err != nil {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%s-%d", branch, short(base), suffix)
+	}
 }
 
 func branchOf(revision demux.RevisionProposal) string {

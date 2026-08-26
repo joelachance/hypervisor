@@ -134,27 +134,43 @@ Naming the sessions is the part git cannot do. `-json` adds an `accounting`
 block that proves nothing was lost: every conflicted line belongs to a step,
 and `complete` is false if any does not.
 
-## Resolving with fx
+## Resolving with a coding agent
 
 ```bash
 hv resolve -ours sess-a -theirs sess-b \
   -ours-session a1b2c3d4 -theirs-session b3c4d5e6
 ```
 
-fx is asked one region at a time, and is given the region, both versions in
-full, and what each session was asked to do - **never the repository**. It
+Any harness will do. hv ships recipes for **pi, fx, claude, codex, and
+opencode**, picks the first one on your PATH, and takes `-harness <binary>
+-harness-args '<template with {prompt}>'` for anything else. The contract is
+one question in, one answer out on stdout - the smallest thing every harness
+already does, and the reason this stays open to whatever exists next year.
+
+The harness is asked one region at a time, and is given the region, both
+versions in full, and what each session was asked to do - **never the
+repository**, and it runs in a scratch directory so its edit tools have
+nothing to reach. It
 answers with the resolved lines plus an account of what it kept from each side.
 hv checks that account before anything is written: a line that existed on
 either side must survive, be claimed as kept, or be listed as dropped with a
 reason. A resolution that quietly loses a line is refused and no branch is
 created.
 
+Every line of both sides must be accounted for exactly once - kept verbatim,
+rewritten into something else, or dropped with a reason - and that accounting
+is checked before anything is written. A resolution that leaves a line out of
+it is refused and no branch is created.
+
 The result is a real merge commit - two parents, `ours` and `theirs` - on its
 own branch, with each region's reasoning in the message and `hv-session:`
 trailers for both sides. `hv undo` takes it back like any other merge.
 
-`-dry-run` reports the conflicts without asking fx or writing anything. fx
-needs `fx login` (or `AI_GATEWAY_API_KEY`) first.
+`-dry-run` reports the conflicts without asking a harness or writing anything.
+
+The accounting proves nothing was **lost**. It cannot prove the resolution is
+**right**: an agent asked to reconcile `n * 2` and `n / 2` may well answer
+`(n * 2) / 2`, which keeps both edits and means neither. Read the diff.
 
 ## Undo
 

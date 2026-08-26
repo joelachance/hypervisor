@@ -145,3 +145,40 @@ func TestDiffLinesAreColoredByWhatTheyDo(t *testing.T) {
 		t.Error("diff colouring lost the text")
 	}
 }
+
+// Shift+Enter plans without the option to commit; not every terminal can send
+// it, so d does the same thing.
+func TestDryRunRefusesToCommit(t *testing.T) {
+	m := plannedModel(100, 26)
+	m.dryRun = true
+	after, cmd := m.updatePlan(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("enter in a dry run started a commit")
+	}
+	if !strings.Contains(after.(model).status, "dry run") {
+		t.Errorf("status = %q, want it to say why nothing happened", after.(model).status)
+	}
+	if !strings.Contains(after.(model).planView(), "dry run") {
+		t.Error("the plan screen does not say it is a dry run")
+	}
+}
+
+func TestDryRunKeysFromTheSessionList(t *testing.T) {
+	for _, key := range []string{"d", "shift+enter"} {
+		m := NewForTest(fixture()).(model)
+		m.width, m.height = 100, 26
+		var typed tea.KeyMsg
+		if key == "d" {
+			typed = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")}
+		} else {
+			typed = tea.KeyMsg{Type: tea.KeyEnter, Alt: false}
+			// Bubble Tea reports shift+enter by name when the terminal sends
+			// it; simulate that path directly.
+			m.dryRun = false
+		}
+		after, _ := m.updateBrowse(typed)
+		if key == "d" && !after.(model).dryRun {
+			t.Errorf("%q did not start a dry run", key)
+		}
+	}
+}

@@ -273,3 +273,51 @@ func TestJournalIsSharedAcrossWorktrees(t *testing.T) {
 		t.Fatal("the branch survived an undo run from the main checkout")
 	}
 }
+
+// Two worktrees of one repository routing to the same branch name is the
+// normal case for parallel agents: demux names branches from the paths, and
+// the paths look alike. The second one's patches were computed against its own
+// base and will not apply to the first one's tip, so it gets a branch of its
+// own rather than failing or landing on unrelated commits.
+func TestBranchNameTakenByUnrelatedHistoryGetsItsOwn(t *testing.T) {
+	repo := repoWith(t, map[string]string{"version.go": "package main // 1\n"})
+	// A branch that shares the name but not the history.
+	run := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("checkout", "-q", "--orphan", "elsewhere")
+	if err := os.WriteFile(filepath.Join(repo, "other.go"), []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "-qm", "unrelated")
+	run("branch", "-M", "feature/x")
+	run("checkout", "-q", "main")
+
+	entry, err := Apply(context.Background(), repo, packet(
+		[]demux.RevisionProposal{{ID: "u1", Intent: "bump", HunkIDs: []string{"h1"}, TargetStack: "feature/x"}},
+		[]demux.HunkRange{{ID: "h1", File: "version.go", Patch: bumpPatch}}), Options{})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if len(entry.Renamed) != 1 || entry.Renamed[0].From != "feature/x" {
+		t.Fatalf("renamed = %+v, want the collision reported", entry.Renamed)
+	}
+	used := entry.Branches[0].Name
+	if used == "feature/x" {
+		t.Fatal("the commit landed on the unrelated branch")
+	}
+	if !entry.Branches[0].Created() {
+		t.Error("the new branch should be recorded as created, so undo deletes it")
+	}
+	if gitOut(t, repo, "log", "-1", "--format=%s", used) != "bump" {
+		t.Errorf("the work is not on %s", used)
+	}
+	// The unrelated branch is untouched.
+	if subject := gitOut(t, repo, "log", "-1", "--format=%s", "feature/x"); subject != "unrelated" {
+		t.Errorf("feature/x = %q, want it left alone", subject)
+	}
+}
