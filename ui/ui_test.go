@@ -117,25 +117,70 @@ func TestMergeAllTakesEveryVisibleSession(t *testing.T) {
 	}
 }
 
-// r cycles through the repositories that have sessions, so narrowing is one
-// key rather than a filter to type.
-func TestRepoKeyCyclesThroughRepositories(t *testing.T) {
+// r opens a picker listing the repositories, so you can see what you are
+// choosing between rather than cycling blind.
+func TestRepoPickerListsRepositoriesAndFiltersAsYouMove(t *testing.T) {
 	rows := fixture()
 	rows[1].RepoRoot = "/other"
 	m := NewForTest(rows)
-	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	first := press(m, "r").(model)
+	opened := press(m, "r").(model)
+	if opened.mode != modeRepo {
+		t.Fatal("r did not open the picker")
+	}
+	view := opened.View()
+	for _, want := range []string{"every repo", "repo", "other", "sessions"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("picker is missing %q", want)
+		}
+	}
+
+	// Moving applies straight away: the sessions below are the answer to
+	// "what would this show me".
+	moved, _ := opened.updateRepoPicker(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	first := moved.(model)
 	if first.repoPick == "" {
-		t.Fatal("r did not narrow to a repository")
+		t.Fatal("moving the cursor did not narrow to a repository")
 	}
-	second := press(first, "r").(model)
-	if second.repoPick == first.repoPick {
-		t.Fatal("r did not move to the next repository")
+	if len(first.rows) != 1 {
+		t.Fatalf("rows = %d, want only the sessions in %q", len(first.rows), first.repoPick)
 	}
-	third := press(second, "r").(model)
-	if third.repoPick != "" {
-		t.Fatalf("repoPick = %q, want the cycle back to every repo", third.repoPick)
+
+	// Arrows and j/k do the same as r.
+	down, _ := first.updateRepoPicker(tea.KeyMsg{Type: tea.KeyDown})
+	if down.(model).repoPick == first.repoPick {
+		t.Error("down did not move the picker")
+	}
+	up, _ := down.(model).updateRepoPicker(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if up.(model).repoPick != first.repoPick {
+		t.Error("k did not move back")
+	}
+}
+
+// esc puts back whatever was showing before the picker opened.
+func TestRepoPickerEscapeRestoresTheScope(t *testing.T) {
+	rows := fixture()
+	rows[1].RepoRoot = "/other"
+	m := NewForTest(rows)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	opened := press(m, "r").(model)
+	moved, _ := opened.updateRepoPicker(tea.KeyMsg{Type: tea.KeyDown})
+	cancelled, _ := moved.(model).updateRepoPicker(tea.KeyMsg{Type: tea.KeyEscape})
+	after := cancelled.(model)
+	if after.mode != modeBrowse || after.repoPick != "" {
+		t.Fatalf("after esc: mode=%v pick=%q, want the browser back at every repo", after.mode, after.repoPick)
+	}
+}
+
+func TestRepoPickerFitsTheTerminal(t *testing.T) {
+	rows := fixture()
+	rows[1].RepoRoot = "/other"
+	m := NewForTest(rows)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	opened := press(m, "r").(model)
+	if lines := strings.Split(opened.View(), "\n"); len(lines) != 30 {
+		t.Fatalf("with the picker open the frame is %d lines, want 30", len(lines))
 	}
 }
 

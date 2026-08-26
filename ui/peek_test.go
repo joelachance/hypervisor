@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -28,11 +29,63 @@ func peeked() model {
 
 // A row says a session touched files in a repo. Peeking says what it was asked
 // to do, which is what deciding whether to merge it actually needs.
-func TestPeekShowsIntentOutcomeAndTranscript(t *testing.T) {
+func TestPeekLeadsWithASummary(t *testing.T) {
 	view := peeked().peekView()
-	for _, want := range []string{"benchmarks", "add a rate limiter", "added a token bucket", "a.go", "asked", "said"} {
+	for _, want := range []string{"benchmarks", "Asked: “add a rate limiter”", "Reported:", "Edited"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("peek is missing %q", want)
+		}
+	}
+}
+
+// Three sentences at most: a summary someone has to read carefully is not one.
+func TestPeekSummaryIsAtMostThreeSentences(t *testing.T) {
+	m := peeked()
+	m.peek.session.Files = []string{"/repo/a.go", "/repo/b.go", "/repo/c.go", "/repo/d.go", "/repo/e.go"}
+	sentences := m.peekSentences()
+	if len(sentences) > 3 {
+		t.Fatalf("summary has %d sentences: %q", len(sentences), sentences)
+	}
+	text := strings.Join(sentences, " ")
+	if !strings.Contains(text, "and 2 more") {
+		t.Errorf("summary = %q, want the file list capped rather than spilling", text)
+	}
+}
+
+// The conversation, and only the conversation: a list of file reads is what
+// the session row already shows.
+func TestPeekShowsExchangesWithoutToolCalls(t *testing.T) {
+	view := peeked().peekView()
+	if !strings.Contains(view, "you") || !strings.Contains(view, "add a rate limiter") {
+		t.Error("the exchange is missing what was asked")
+	}
+	if !strings.Contains(view, "added a token bucket") {
+		t.Error("the exchange is missing what came back")
+	}
+	if strings.Contains(view, "edit   ") {
+		t.Error("tool calls leaked into the conversation pane")
+	}
+}
+
+// Only the last four rounds: enough to see where a session ended up, short
+// enough to read at a glance.
+func TestPeekShowsTheLastFourExchanges(t *testing.T) {
+	m := peeked()
+	m.height = 60
+	m.peek.items = nil
+	for round := 1; round <= 6; round++ {
+		m.peek.items = append(m.peek.items,
+			recall.Item{Kind: recall.KindUser, Text: fmt.Sprintf("question %d", round)},
+			recall.Item{Kind: recall.KindTool, Tool: "edit", File: "/repo/a.go"},
+			recall.Item{Kind: recall.KindAssistant, Text: fmt.Sprintf("answer %d", round)})
+	}
+	view := m.peekView()
+	if strings.Contains(view, "question 2") {
+		t.Error("an exchange older than the last four is shown")
+	}
+	for round := 3; round <= 6; round++ {
+		if !strings.Contains(view, fmt.Sprintf("question %d", round)) {
+			t.Errorf("round %d is missing", round)
 		}
 	}
 }
@@ -72,8 +125,8 @@ func TestPeekIsHonestWhenThereIsNoTranscript(t *testing.T) {
 	m.peek.items = nil
 	m.peek.session.Files = nil
 	m.peek.session.Branch = ""
-	if !strings.Contains(m.peekView(), "no transcript recorded") {
-		t.Fatal("peek should say when it has nothing rather than showing an empty pane")
+	if !strings.Contains(m.peekView(), "No transcript and no edits") {
+		t.Fatalf("peek should say when it has nothing:\n%s", m.peekView())
 	}
 }
 

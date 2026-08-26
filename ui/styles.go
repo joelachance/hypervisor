@@ -18,6 +18,35 @@ var (
 	colorDanger = lipgloss.AdaptiveColor{Light: "#B3261E", Dark: "#FF7A7A"}
 )
 
+// repoPalette gives each repository a colour of its own, assigned by name so
+// it is the same colour every run. Reading a list of forty sessions is mostly
+// grouping them by repo, and colour does that faster than a word does.
+var repoPalette = []lipgloss.AdaptiveColor{
+	{Light: "#1F6FB2", Dark: "#7FC3F5"},
+	{Light: "#7A3EA1", Dark: "#C48FE8"},
+	{Light: "#0F7B4F", Dark: "#3DD68C"},
+	{Light: "#B7410E", Dark: "#FF9E64"},
+	{Light: "#A8891F", Dark: "#E0C060"},
+	{Light: "#B3261E", Dark: "#FF7A7A"},
+	{Light: "#00707A", Dark: "#5FD3DC"},
+}
+
+// repoStyle picks a repository's colour from its name, so the same repo always
+// reads the same and two repos rarely collide.
+func repoStyle(name string) lipgloss.Style {
+	if name == "" {
+		return lipgloss.NewStyle().Foreground(colorDim)
+	}
+	sum := 0
+	for _, char := range name {
+		sum = sum*31 + int(char)
+	}
+	if sum < 0 {
+		sum = -sum
+	}
+	return lipgloss.NewStyle().Foreground(repoPalette[sum%len(repoPalette)])
+}
+
 var (
 	styleTitleBar = lipgloss.NewStyle().Bold(true).Foreground(colorText).
 			Border(lipgloss.NormalBorder(), false, false, true, false).

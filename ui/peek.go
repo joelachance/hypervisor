@@ -80,44 +80,89 @@ func (m model) updatePeek(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 // peekFacts is the summary block above the transcript. It is a method so the
 // body can be sized against its real height rather than a guess, which is the
 // difference between a frame that fits the terminal and one that scrolls it.
-func (m model) peekFacts() []string {
-	current := m.peek.session
-	facts := []string{}
-	add := func(label, value string) {
-		if strings.TrimSpace(value) != "" {
-			facts = append(facts, styleLabel.Render(label+" ")+styleValue.Render(value))
-		}
-	}
-	add("asked", m.peek.summary.Intent)
-	add("said", m.peek.summary.Outcome)
-	add("branch", current.Branch)
-	if len(current.Files) > 0 {
-		add("files", truncate(strings.Join(shortPaths(current.Files), ", "), maxInt(m.width-10, 20)))
-	}
-	if m.peek.err != nil {
-		facts = append(facts, styleError.Render("could not read the transcript: "+m.peek.err.Error()))
-	}
-	if len(facts) == 0 {
-		facts = append(facts, styleDim.Render("no transcript recorded for this session"))
-	}
-	return facts
+// exchange is one round of the conversation: what was asked and what came
+// back. Tool calls are left out - a list of file reads is what the session
+// row already shows, and it buries the two things worth reading.
+type exchange struct {
+	asked    string
+	answered string
 }
 
-// peekHeight is what the transcript pane gets: the terminal, less the header
-// and its border, the summary block and its padding, the pane's own border,
-// and the footer.
+// exchanges pairs the transcript into rounds, most recent last.
+func exchanges(items []recall.Item) []exchange {
+	out := []exchange{}
+	for _, item := range items {
+		switch item.Kind {
+		case recall.KindUser:
+			out = append(out, exchange{asked: item.Text})
+		case recall.KindAssistant:
+			// An answer with nothing before it still happened; a second answer
+			// in a row replaces the first, which is the one that summarized.
+			if len(out) == 0 {
+				out = append(out, exchange{})
+			}
+			out[len(out)-1].answered = item.Text
+		}
+	}
+	return out
+}
+
+// peekSummary is at most three sentences: what the session was asked, what it
+// reported, and what it touched. Three is the limit because a summary someone
+// has to read carefully is not a summary.
+func (m model) peekSummary() []string {
+	lines := []string{}
+	for _, sentence := range m.peekSentences() {
+		lines = append(lines, wrapLines(sentence, m.width-4, "  ", "  ")...)
+	}
+	return lines
+}
+
+// peekSentences is the summary itself, one string per sentence.
+func (m model) peekSentences() []string {
+	current := m.peek.session
+	sentences := []string{}
+	if intent := strings.TrimSpace(m.peek.summary.Intent); intent != "" {
+		// Quoted rather than folded into a sentence: prompts are not always
+		// imperatives, and "Asked to testing this out" reads as a typo.
+		sentences = append(sentences, "Asked: “"+trimPeriod(intent)+"”.")
+	}
+	if outcome := strings.TrimSpace(m.peek.summary.Outcome); outcome != "" {
+		sentences = append(sentences, "Reported: "+trimPeriod(outcome)+".")
+	}
+	if len(current.Files) > 0 {
+		names := shortPaths(current.Files)
+		listed := names
+		suffix := ""
+		if len(names) > 3 {
+			listed = names[:3]
+			suffix = fmt.Sprintf(" and %d more", len(names)-3)
+		}
+		sentences = append(sentences, fmt.Sprintf("Edited %s%s.", strings.Join(listed, ", "), suffix))
+	}
+	if len(sentences) == 0 {
+		sentences = append(sentences, "No transcript and no edits were recorded for this session.")
+	}
+	return sentences
+}
+
+// peekHeight is what the conversation gets: the terminal, less the header and
+// its border, the summary block, the pane's own border, and the footer.
 func (m model) peekHeight() int {
-	return maxInt(m.height-2-(len(m.peekFacts())+2)-1-1, 1)
+	return maxInt(m.height-2-(len(m.peekSummary())+2)-1-1, 1)
 }
 
 func (m model) peekView() string {
 	current := m.peek.session
+	// The header stays one line: a wrapped title costs a line of conversation
+	// and reads as a rendering fault.
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render(truncate(current.Label(), 40))
+	facts := fmt.Sprintf("  ·  %s  ·  %s  ·  %d edits in %d files",
+		current.Tool, repoName(current), current.EditCount, len(current.Files))
 	header := styleTitleBar.Width(m.width).Render(
-		lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render(truncate(current.Label(), 40)) +
-			styleCount.Render(fmt.Sprintf("  ·  %s  ·  %s  ·  %d edits in %d files",
-				current.Tool, shortPath(current.RepoRoot), current.EditCount, len(current.Files))))
+		title + styleCount.Render(truncate(facts, maxInt(m.width-lipgloss.Width(title)-4, 10))))
 
-	summary := lipgloss.NewStyle().Padding(1, 1).Render(strings.Join(m.peekFacts(), "\n"))
+	summary := lipgloss.NewStyle().Padding(1, 1).Render(strings.Join(m.peekSummary(), "\n"))
 	body := m.peekBody()
 
 	key := func(k, label string) string { return styleKey.Render(k) + styleDim.Render(" "+label) }
@@ -132,24 +177,85 @@ func (m model) peekView() string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, summary, body, footer)
 }
 
-// peekBody is the transcript itself: what was asked, what was answered, and
-// every file the session touched, in order.
+// lastExchanges is how many rounds the conversation pane shows. Four is enough
+// to see where a session ended up and short enough to read at a glance.
+const lastExchanges = 4
+
+// peekBody is the tail of the conversation, wrapped and spaced so the two
+// voices are told apart without reading closely.
 func (m model) peekBody() string {
+	rounds := exchanges(m.peek.items)
+	if len(rounds) > lastExchanges {
+		rounds = rounds[len(rounds)-lastExchanges:]
+	}
+	rendered := []string{}
+	for index, round := range rounds {
+		if index > 0 {
+			rendered = append(rendered, "")
+		}
+		if round.asked != "" {
+			rendered = append(rendered, m.speech("▌ you", styleKey, round.asked)...)
+		}
+		if round.answered != "" {
+			rendered = append(rendered, m.speech("▌ "+m.peek.session.Tool, styleBadgeCLI, round.answered)...)
+		}
+	}
+	if len(rendered) == 0 {
+		rendered = m.peekWithoutTranscript()
+	}
+
 	height := m.peekHeight()
-	lines := make([]string, 0, height)
-	for index := m.peek.offset; index < len(m.peek.items) && len(lines) < height; index++ {
-		lines = append(lines, m.peekLine(m.peek.items[index]))
+	if m.peek.offset > maxInt(len(rendered)-height, 0) {
+		m.peek.offset = maxInt(len(rendered)-height, 0)
 	}
-	if len(lines) == 0 {
-		// No conversation was recorded - Cursor keeps none, and a session can
-		// be all tool calls. Say what is known rather than showing an empty
-		// pane: the edits are a story of a kind.
-		lines = append(lines, m.peekWithoutTranscript()...)
+	visible := []string{}
+	for index := m.peek.offset; index < len(rendered) && len(visible) < height; index++ {
+		visible = append(visible, rendered[index])
 	}
-	for len(lines) < height {
-		lines = append(lines, "")
+	for len(visible) < height {
+		visible = append(visible, "")
 	}
-	return styleDetail.Width(m.width).Height(height).Render(strings.Join(lines, "\n"))
+	return styleDetail.Width(m.width).Height(height).Render(strings.Join(visible, "\n"))
+}
+
+// speech renders one side of an exchange: a labelled first line, then the rest
+// indented under it so the label reads as a speaker rather than a bullet.
+func (m model) speech(label string, style lipgloss.Style, text string) []string {
+	width := maxInt(m.width-6, 24)
+	body := wrapLines(text, width, "", "")
+	out := make([]string, 0, len(body)+1)
+	out = append(out, style.Render(" "+label))
+	for _, line := range body {
+		out = append(out, styleRow.Render("   "+line))
+	}
+	return out
+}
+
+// wrapLines breaks text to a width without splitting words, prefixing the
+// first line and the rest independently.
+func wrapLines(text string, width int, first, rest string) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	if width < 20 {
+		width = 20
+	}
+	out := []string{}
+	line := first + words[0]
+	for _, word := range words[1:] {
+		if len([]rune(line))+1+len([]rune(word)) > width {
+			out = append(out, line)
+			line = rest + word
+			continue
+		}
+		line += " " + word
+	}
+	return append(out, line)
+}
+
+func trimPeriod(text string) string {
+	return strings.TrimRight(strings.TrimSpace(text), ".")
 }
 
 // peekWithoutTranscript summarizes a session from what hv has when the
@@ -171,27 +277,6 @@ func (m model) peekWithoutTranscript() []string {
 	return out
 }
 
-func (m model) peekLine(item recall.Item) string {
-	width := maxInt(m.width-12, 20)
-	switch item.Kind {
-	case recall.KindUser:
-		return styleKey.Render(" asked  ") + styleRow.Render(truncate(item.Text, width))
-	case recall.KindAssistant:
-		return styleBadgeCLI.Render(" said   ") + styleRow.Render(truncate(item.Text, width))
-	default:
-		verb := item.Tool
-		if verb == "" {
-			verb = "tool"
-		}
-		style := styleDim
-		if verb == "edit" {
-			style = styleActiveDot
-		}
-		return style.Render(fmt.Sprintf(" %-6s ", verb)) +
-			styleDim.Render(truncate(shortPath(item.File), width))
-	}
-}
-
 func shortPaths(files []string) []string {
 	out := make([]string, 0, len(files))
 	for _, file := range files {
@@ -205,4 +290,14 @@ func minInt(left, right int) int {
 		return left
 	}
 	return right
+}
+
+// PeekFrameForTest renders one session's peek screen without a terminal.
+func PeekFrameForTest(current session.Session, width, height int) string {
+	built := model{chosen: map[string]bool{}, width: width, height: height, screen: screenPeek}
+	built.peek = peekState{session: current}
+	if message, ok := peekCmd(current)().(peekedMsg); ok {
+		built.peek.items, built.peek.summary, built.peek.err = message.items, message.summary, message.err
+	}
+	return built.peekView()
 }

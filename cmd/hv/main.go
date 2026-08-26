@@ -281,9 +281,9 @@ func sessionsCmd(args []string) error {
 	}
 	short := session.Abbreviate(sessions, 8)
 	for _, current := range sessions {
-		fmt.Printf("%-6s %-3s %-12s %-30s %-13s %3d edits  %-9s %s\n",
-			current.State(now.UnixMilli()), originLabel(current),
-			truncate(repoName(current), 12), truncate(current.Label(), 30),
+		fmt.Printf("%-6s %-14s %-32s %-13s %3d edits  %-9s %s\n",
+			current.State(now.UnixMilli()),
+			truncate(repoName(current), 14), truncate(current.Label(), 32),
 			short[current.ID], current.EditCount,
 			humanAge(now.UnixMilli()-current.LastActiveAt), landedLabel(current))
 	}
@@ -723,23 +723,6 @@ func shortID(id string) string {
 		return id[:12]
 	}
 	return id
-}
-
-// originLabel is where the session runs, short enough for a column.
-func originLabel(current session.Session) string {
-	switch current.Origin {
-	case session.OriginApp:
-		return "app"
-	case session.OriginCLI:
-		return "cli"
-	default:
-		// Codex and Cursor record no entrypoint; name the tool instead, cut to
-		// the same width so the column stays a column.
-		if len(current.Tool) > 3 {
-			return current.Tool[:3]
-		}
-		return current.Tool
-	}
 }
 
 // repoName is the last path element of a session's directory - hv lists every

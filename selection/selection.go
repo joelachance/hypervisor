@@ -90,7 +90,11 @@ func touchedUnder(candidate session.Session, dir string) bool {
 			return true
 		}
 	}
-	return false
+	// A session that ran in the directory belongs to it even if it edited
+	// nothing there - it is still one of that repository's sessions, and
+	// hiding it would make the repository look emptier than it is.
+	root := strings.TrimSuffix(strings.TrimSpace(candidate.RepoRoot), "/")
+	return root != "" && (root == dir || strings.HasPrefix(root, dir+"/"))
 }
 
 // Apply filters and orders sessions, most recently active first.

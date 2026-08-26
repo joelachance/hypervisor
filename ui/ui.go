@@ -58,6 +58,7 @@ const (
 	modeBrowse mode = iota
 	modeFilter
 	modeBranch
+	modeRepo
 )
 
 // screen is which view is on top. The browser picks sessions; the plan screen
@@ -74,33 +75,35 @@ const (
 )
 
 type model struct {
-	watcher  *watch.Watcher
-	all      []session.Session
-	rows     []session.Session
-	chosen   map[string]bool
-	cursor   int
-	offset   int
-	width    int
-	height   int
-	mode     mode
-	screen   screen
-	events   []capture.SessionEvent
-	plans    []planGroup
-	plan     planCursor
-	dryRun   bool
-	target   string
-	applied  apply.Entry
-	filter   string
-	archived bool
-	repoOnly bool
-	repoRoot string
-	repoPick string
-	peek     peekState
-	short    map[string]string
-	status   string
-	err      error
-	outcome  Outcome
-	now      int64
+	watcher    *watch.Watcher
+	all        []session.Session
+	rows       []session.Session
+	chosen     map[string]bool
+	cursor     int
+	offset     int
+	width      int
+	height     int
+	mode       mode
+	screen     screen
+	events     []capture.SessionEvent
+	plans      []planGroup
+	plan       planCursor
+	dryRun     bool
+	target     string
+	applied    apply.Entry
+	filter     string
+	archived   bool
+	repoOnly   bool
+	repoRoot   string
+	repoPick   string
+	repoCursor int
+	repoBefore string
+	peek       peekState
+	short      map[string]string
+	status     string
+	err        error
+	outcome    Outcome
+	now        int64
 }
 
 type refreshedMsg struct {
@@ -238,6 +241,8 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch {
+		case m.mode == modeRepo:
+			return m.updateRepoPicker(msg)
 		case m.mode == modeBranch:
 			return m.updateBranch(msg)
 		case m.mode == modeFilter:
@@ -354,12 +359,17 @@ func (m model) updateBrowse(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "a":
 		m.archived = !m.archived
 		m.applyFilter()
-	case "r":
-		// Cycle through the repositories that actually have sessions, so
-		// narrowing is one key rather than a filter someone has to type.
-		m.cycleRepo(1)
-	case "R":
-		m.cycleRepo(-1)
+	case "r", "R":
+		// Open the repository picker rather than cycling blind: with a list on
+		// screen you can see what you are choosing between.
+		repos := m.repoChoices()
+		if len(repos) <= 1 {
+			m.status = "no session recorded a repository"
+			break
+		}
+		m.mode = modeRepo
+		m.repoBefore = m.repoPick
+		m.repoCursor = m.repoIndex()
 	case "M":
 		// Merge everything on screen, whatever the marks say.
 		m.chosen = map[string]bool{}
@@ -505,6 +515,10 @@ func (m model) selected() []session.Session {
 // nothing useful.
 func (m model) listHeight() int {
 	height := m.height - chromeHeight
+	if m.mode == modeRepo {
+		// The picker takes its rows from the list, plus its own border.
+		height -= len(m.repoChoices()) + 1
+	}
 	if height < 1 {
 		return 1
 	}
@@ -544,7 +558,11 @@ func (m model) View() string {
 	case screenPeek:
 		return m.peekView()
 	}
-	sections := []string{m.header(), m.list(), m.detail(), m.footer()}
+	sections := []string{m.header()}
+	if m.mode == modeRepo {
+		sections = append(sections, m.repoPanel())
+	}
+	sections = append(sections, m.list(), m.detail(), m.footer())
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
@@ -629,16 +647,6 @@ func (m model) row(current session.Session, highlighted bool) string {
 		dot = styleActiveDot.Render("●")
 	}
 
-	// Where it runs when that is known, otherwise which tool it is - Codex and
-	// Cursor record no entrypoint, and a blank column looks like missing data.
-	origin := styleDim.Render(fmt.Sprintf("%-3s", toolBadge(current.Tool)))
-	switch current.Origin {
-	case session.OriginApp:
-		origin = styleBadgeApp.Render("app")
-	case session.OriginCLI:
-		origin = styleBadgeCLI.Render("cli")
-	}
-
 	titleStyle := styleRow
 	if current.State(m.now) != session.StateActive {
 		titleStyle = styleRowDim
@@ -649,19 +657,20 @@ func (m model) row(current session.Session, highlighted bool) string {
 
 	// The title gets whatever the terminal has left after the fixed columns,
 	// so a narrow window loses the title's tail rather than wrapping the row.
-	// cursor, mark, dot, origin, repo, id, age, and the PR badge each take a
-	// fixed column; the title takes what is left.
-	fixed := 2 + 2 + 2 + 4 + 14 + 14 + 9 + 16
+	// cursor, mark, dot, repo, id, age, and the PR badge each take a fixed
+	// column; the title takes what is left.
+	fixed := 2 + 2 + 2 + 15 + 14 + 9 + 16
 	titleWidth := m.width - fixed
 	if titleWidth < 12 {
 		titleWidth = 12
 	}
 
-	line := fmt.Sprintf("%s%s%s %s %s %s %s %s %s",
-		cursor, mark, dot, origin,
-		// The repo is a column now that the browser spans all of them: a
-		// title alone does not say where the work is.
-		styleDim.Render(fmt.Sprintf("%-13s", truncate(repoName(current), 13))),
+	line := fmt.Sprintf("%s%s%s %s %s %s %s %s",
+		cursor, mark, dot,
+		// The repo is a column now that the browser spans all of them - a
+		// title alone does not say where the work is - and it carries a colour
+		// of its own so a repo can be picked out without reading the word.
+		repoStyle(repoName(current)).Render(fmt.Sprintf("%-14s", truncate(repoName(current), 14))),
 		titleStyle.Width(titleWidth).Render(truncate(current.Label(), titleWidth)),
 		styleDim.Render(fmt.Sprintf("%13s", m.label(current))),
 		styleDim.Render(fmt.Sprintf("%8s", humanAge(m.now-current.LastActiveAt))),
@@ -746,6 +755,12 @@ func prLinks(current session.Session) string {
 }
 
 func (m model) footer() string {
+	if m.mode == modeRepo {
+		key := func(k, label string) string { return styleKey.Render(k) + styleDim.Render(" "+label) }
+		return styleFooter.Width(m.width).Render(strings.Join([]string{
+			key("r/↑↓", "choose"), key("enter", "keep"), key("esc", "cancel"),
+		}, styleDim.Render("  ·  ")))
+	}
 	if m.mode == modeFilter {
 		return styleFilter.Width(m.width).Render("/" + m.filter + "█")
 	}
@@ -781,10 +796,11 @@ func (m model) scopeKey() string {
 	return styleKey.Render("r") + styleDim.Render(" repo")
 }
 
-// repos are the repositories with sessions, in the order they appear.
-func (m model) repos() []string {
+// repoChoices is what the picker offers: every repository, then each one that
+// has sessions. The empty string is "every repo".
+func (m model) repoChoices() []string {
 	seen := map[string]struct{}{}
-	out := []string{}
+	repos := []string{}
 	for _, row := range m.all {
 		root := strings.TrimSpace(row.RepoRoot)
 		if root == "" {
@@ -794,37 +810,106 @@ func (m model) repos() []string {
 			continue
 		}
 		seen[root] = struct{}{}
-		out = append(out, root)
+		repos = append(repos, root)
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(repos)
+	return append([]string{""}, repos...)
 }
 
-// cycleRepo steps through "every repo" and each repository that has sessions.
-func (m *model) cycleRepo(step int) {
-	repos := m.repos()
-	if len(repos) == 0 {
-		m.status = "no session recorded a repository"
-		return
-	}
-	// Index 0 is "every repo"; the rest are the repositories themselves.
-	at := 0
-	for index, repo := range repos {
+// repoIndex is where the current pick sits in the choices.
+func (m model) repoIndex() int {
+	for index, repo := range m.repoChoices() {
 		if repo == m.repoPick {
-			at = index + 1
-			break
+			return index
 		}
 	}
-	at = (at + step + len(repos) + 1) % (len(repos) + 1)
-	m.repoOnly = false
-	if at == 0 {
-		m.repoPick = ""
-	} else {
-		m.repoPick = repos[at-1]
+	return 0
+}
+
+// updateRepoPicker drives the list of repositories. The choice applies as the
+// cursor moves, so the sessions below are the answer to "what would this show
+// me" rather than something to find out after committing to it.
+func (m model) updateRepoPicker(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	choices := m.repoChoices()
+	switch key.String() {
+	case "r", "down", "j", "tab":
+		m.repoCursor = (m.repoCursor + 1) % len(choices)
+	case "R", "up", "k", "shift+tab":
+		m.repoCursor = (m.repoCursor - 1 + len(choices)) % len(choices)
+	case "enter":
+		m.mode = modeBrowse
+		return m, nil
+	case "esc":
+		m.mode = modeBrowse
+		m.repoPick = m.repoBefore
+		m.selectRepo()
+		return m, nil
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	default:
+		return m, nil
 	}
+	m.repoPick = choices[m.repoCursor]
+	m.selectRepo()
+	return m, nil
+}
+
+func (m *model) selectRepo() {
+	m.repoOnly = false
 	m.cursor, m.offset = 0, 0
 	m.applyFilter()
 }
+
+// repoPanel is the picker itself, above the sessions it is filtering.
+func (m model) repoPanel() string {
+	choices := m.repoChoices()
+	rows := make([]string, 0, len(choices))
+	for index, repo := range choices {
+		label := "every repo"
+		style := styleDim
+		if repo != "" {
+			label = repoName(sessionAt(repo))
+			style = repoStyle(label)
+		}
+		count := m.countIn(repo)
+		cursor := "  "
+		if index == m.repoCursor {
+			cursor = styleCursor.Render("❯ ")
+		}
+		line := fmt.Sprintf("%s%s %s", cursor,
+			style.Render(fmt.Sprintf("%-16s", truncate(label, 16))),
+			styleDim.Render(fmt.Sprintf("%d session%s", count, plural("s", count))))
+		if index == m.repoCursor {
+			line = styleHighlight.Width(m.width).Render(line)
+		}
+		rows = append(rows, line)
+	}
+	// Bottom border only: the header already drew a line above this.
+	return lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder(), false, false, true, false).
+		BorderForeground(colorDim).Width(m.width).
+		Render(strings.Join(rows, "\n"))
+}
+
+// countIn is how many sessions the picker would show for a choice, under the
+// filters already in force - an archived-only repository should not advertise
+// sessions the list will not show.
+func (m model) countIn(repo string) int {
+	filter := selection.Filter{IncludeArchived: m.archived, TouchedUnder: repo}
+	return len(selection.Apply(m.all, filter))
+}
+
+// plural is the suffix for a count.
+func plural(suffix string, count int) string {
+	if count == 1 {
+		return ""
+	}
+	return suffix
+}
+
+// sessionAt is a stand-in session carrying a repository path, so the panel can
+// name and colour a repo with the same code the rows use.
+func sessionAt(root string) session.Session { return session.Session{RepoRoot: root} }
 
 func humanAge(millis int64) string {
 	age := time.Duration(millis) * time.Millisecond
@@ -838,15 +923,6 @@ func humanAge(millis int64) string {
 	default:
 		return fmt.Sprintf("%dd", int(age.Hours()/24))
 	}
-}
-
-// toolBadge is a three-letter tool name, cut rather than elided: an ellipsis
-// in a three-character column costs a third of the word to say nothing.
-func toolBadge(tool string) string {
-	if len(tool) <= 3 {
-		return tool
-	}
-	return tool[:3]
 }
 
 // repoName is the last path element of a session's directory, which is what
