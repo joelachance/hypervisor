@@ -231,29 +231,37 @@ func overlap(left, right map[string]struct{}) float64 {
 }
 
 // matchTemporal attributes a hunk to the most recent session that edited the
-// same file within the window. It is the weakest tier and the one that fires
-// when a file was rewritten past recognition.
+// same file, and only among edits close enough in time to that one to be
+// plausible authors of what survived. It is the weakest tier and the one that
+// fires when a file was rewritten past recognition.
+//
+// A hunk carries no timestamp of its own, so the window is measured from the
+// newest edit to that file rather than from the hunk: an edit an hour before
+// the last one is a plausible author of surviving lines, an edit three days
+// before is a different piece of work that has since been overwritten.
 func (m Matcher) matchTemporal(hunk demux.HunkRange, edits []capture.SessionEvent, window time.Duration) (capture.SessionEvent, bool) {
 	file := strings.TrimSpace(hunk.File)
 	if file == "" {
 		return capture.SessionEvent{}, false
 	}
-	// TODO(hv): the hunk has no timestamp of its own, so the window is
-	// currently open-ended backwards from the newest matching edit. Once the
-	// caller can supply the working-tree mtime, bound it on both sides.
-	_ = window
-	var best capture.SessionEvent
-	found := false
+	// Tracked with a flag rather than a zero sentinel: a timestamp can legally
+	// be zero, and using zero as "none" would drop every untimed edit.
+	newest, seen := int64(0), false
 	for _, event := range edits {
 		if !sameFile(event.FilePath, file) {
 			continue
 		}
-		if !found || event.TS > best.TS {
-			best = event
-			found = true
+		if !seen || event.TS > newest {
+			newest, seen = event.TS, true
 		}
 	}
-	return best, found
+	if !seen {
+		return capture.SessionEvent{}, false
+	}
+	cutoff := newest - window.Milliseconds()
+	return bestMatch(hunk, edits, func(event capture.SessionEvent) bool {
+		return event.TS >= cutoff
+	})
 }
 
 // AddedLines returns the lines a hunk adds, without their leading marker.

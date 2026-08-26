@@ -445,6 +445,8 @@ func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions
 	for _, rename := range entry.Renamed {
 		fmt.Printf("\n  %s was taken by unrelated history; used %s instead\n", rename.From, rename.To)
 	}
+	// Only used to name the branch in a sentence; an unnamed HEAD falls back
+	// to "your branch" below.
 	current, _ := hvplan.CurrentBranch(ctx, root)
 	fmt.Printf("\n%d commits on %d branch%s (%d new, %d extended)\n",
 		len(entry.Commits), len(entry.Branches), plural("es", len(entry.Branches)), created, extended)

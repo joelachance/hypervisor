@@ -2,6 +2,7 @@ package match
 
 import (
 	"testing"
+	"time"
 
 	"github.com/satoricorp/demux"
 	"github.com/satoricorp/demux/capture"
@@ -197,5 +198,49 @@ func TestLinkingIsDeterministic(t *testing.T) {
 	second := (Matcher{}).Link(hunks, backward).Links[0].SessionID
 	if first != second {
 		t.Fatalf("the same events in a different order produced %q and %q", first, second)
+	}
+}
+
+// The temporal window has to mean something: an edit made days before the last
+// one is a different piece of work that has since been overwritten, not a
+// plausible author of what survived.
+func TestTemporalWindowExcludesStaleEdits(t *testing.T) {
+	hunks := []demux.HunkRange{{ID: "h1", File: "limiter.go"}}
+	newest := int64(10_000_000)
+	events := []capture.SessionEvent{
+		{SessionID: "long-ago", Kind: capture.KindEdit, FilePath: "limiter.go",
+			TS: newest - int64(72*time.Hour/time.Millisecond)},
+		{SessionID: "just-before", Kind: capture.KindEdit, FilePath: "limiter.go",
+			TS: newest - int64(5*time.Minute/time.Millisecond)},
+		{SessionID: "newest", Kind: capture.KindEdit, FilePath: "limiter.go", TS: newest},
+	}
+	// The newest still wins; the point is that the stale one is not a
+	// candidate at all.
+	got := (Matcher{}).Link(hunks, events).Links
+	if len(got) != 1 || got[0].SessionID != "newest" {
+		t.Fatalf("links = %+v, want the newest edit", got)
+	}
+
+	// With the newest two removed, a short window leaves nothing plausible.
+	stale := []capture.SessionEvent{events[0], {
+		SessionID: "also-long-ago", Kind: capture.KindEdit, FilePath: "limiter.go",
+		TS: events[0].TS - int64(48*time.Hour/time.Millisecond),
+	}}
+	linked := Matcher{TemporalWindow: time.Hour}.Link(hunks, stale).Links
+	if len(linked) != 1 || linked[0].SessionID != "long-ago" {
+		t.Fatalf("links = %+v, want only the edit inside the window", linked)
+	}
+}
+
+// A window wide enough keeps everything, which is the old behaviour and the
+// right default when sessions overlap.
+func TestTemporalWindowKeepsRecentEdits(t *testing.T) {
+	hunks := []demux.HunkRange{{ID: "h1", File: "limiter.go"}}
+	events := []capture.SessionEvent{
+		{SessionID: "older", Kind: capture.KindEdit, FilePath: "limiter.go", TS: 1_000},
+		{SessionID: "newer", Kind: capture.KindEdit, FilePath: "limiter.go", TS: 2_000},
+	}
+	if got := (Matcher{}).Link(hunks, events).Links; len(got) != 1 || got[0].SessionID != "newer" {
+		t.Fatalf("links = %+v, want the newer edit", got)
 	}
 }

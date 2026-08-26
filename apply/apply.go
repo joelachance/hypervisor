@@ -215,6 +215,8 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 	for from, to := range renamed {
 		entry.Renamed = append(entry.Renamed, Rename{From: from, To: to})
 	}
+	// A detached HEAD or an unborn branch has no name, and the error is the
+	// answer: no branch matches, so no index is refreshed.
 	current, _ := git(ctx, repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	for branch, tip := range tips {
 		if _, err := git(ctx, repoRoot, "update-ref", "refs/heads/"+branch, tip); err != nil {
