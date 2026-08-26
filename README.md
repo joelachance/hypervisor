@@ -104,7 +104,59 @@ order. An existing branch is extended from its own tip rather than rewritten:
 hv adds commits, it never discards anyone else's. Session provenance is written
 into the commit as `hv-session:` trailers, so it survives outside hv.
 
-### Undo
+### Conflicts
+
+Two sessions that touched the same lines are found with `git merge-tree
+--write-tree`, which merges two commits in memory - no index, no checkout, no
+working tree - and reports conflicted paths as base/ours/theirs blobs. Its exit
+status is the verdict, so the analysis is deterministic and side-effect free.
+
+```bash
+hv conflicts -ours sess-a -theirs sess-b \
+  -ours-session a1b2c3d4 -theirs-session b3c4d5e6
+```
+
+```
+1 file(s) conflict between rate limiter and beta retry bug, from base 65180800
+
+1. 3 files merged with no overlap: README.md, internal/limiter.go, …
+2. CHOOSE  internal/alpha.go region 1
+   rate limiter:    func Version() string { return "0.2-limiter" }
+   beta retry bug:  func Version() string { return "0.2-retry" }
+
+rate limiter was asked: add a rate limiter to alpha
+beta retry bug was asked: fix the retry bug in beta
+
+2 conflicted lines, all covered by the steps above: true
+```
+
+Naming the sessions is the part git cannot do. `-json` adds an `accounting`
+block that proves nothing was lost: every conflicted line belongs to a step,
+and `complete` is false if any does not.
+
+## Resolving with fx
+
+```bash
+hv resolve -ours sess-a -theirs sess-b \
+  -ours-session a1b2c3d4 -theirs-session b3c4d5e6
+```
+
+fx is asked one region at a time, and is given the region, both versions in
+full, and what each session was asked to do - **never the repository**. It
+answers with the resolved lines plus an account of what it kept from each side.
+hv checks that account before anything is written: a line that existed on
+either side must survive, be claimed as kept, or be listed as dropped with a
+reason. A resolution that quietly loses a line is refused and no branch is
+created.
+
+The result is a real merge commit - two parents, `ours` and `theirs` - on its
+own branch, with each region's reasoning in the message and `hv-session:`
+trailers for both sides. `hv undo` takes it back like any other merge.
+
+`-dry-run` reports the conflicts without asking fx or writing anything. fx
+needs `fx login` (or `AI_GATEWAY_API_KEY`) first.
+
+## Undo
 
 ```bash
 hv undo -C <repo>          # take back the last applied plan

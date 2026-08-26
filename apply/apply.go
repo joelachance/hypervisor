@@ -415,6 +415,15 @@ func record(ctx context.Context, repoRoot string, entry Entry) error {
 	return err
 }
 
+// Journal records an entry written by something other than Apply - a resolved
+// merge, for instance - so hv undo can take it back the same way.
+func Journal(ctx context.Context, repoRoot string, entry Entry) error {
+	return record(ctx, repoRoot, entry)
+}
+
+// NewID returns an entry id for callers building their own entries.
+func NewID() string { return newID() }
+
 // History returns the repository's applied plans, newest first.
 func History(ctx context.Context, repoRoot string) ([]Entry, error) {
 	path, err := journalPath(ctx, repoRoot)

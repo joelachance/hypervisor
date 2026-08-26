@@ -57,6 +57,8 @@ func main() {
 		err = undoCmd(ctx, os.Args[2:])
 	case "conflicts":
 		err = conflictsCmd(ctx, os.Args[2:])
+	case "resolve":
+		err = resolveCmd(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -82,6 +84,7 @@ func usage() {
   hv open <session>                             reopen a session where it lives
   hv undo [-C dir] [-list]                      undo the last merge
   hv conflicts -ours REF -theirs REF [-json]    what two sessions disagree about
+  hv resolve -ours REF -theirs REF              have fx fix it, commit the merge
 
 With no -session, merge lists the sessions that touched this repo and asks
 which to merge. Their edits are attributed to hunks, grouped into revisions,
