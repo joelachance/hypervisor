@@ -92,6 +92,12 @@ func HeadCommit(ctx context.Context, repoRoot string) (string, error) {
 	return run(ctx, repoRoot, "rev-parse", "HEAD")
 }
 
+// CurrentBranch is the branch checked out in a worktree, which hv never moves
+// and therefore has to be able to name.
+func CurrentBranch(ctx context.Context, repoRoot string) (string, error) {
+	return run(ctx, repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+}
+
 // RepoRoot resolves the worktree root containing dir.
 func RepoRoot(ctx context.Context, dir string) (string, error) {
 	return run(ctx, dir, "rev-parse", "--show-toplevel")

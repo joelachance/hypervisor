@@ -69,6 +69,7 @@ const (
 	screenPlanning
 	screenPlan
 	screenApplied
+	screenPeek
 )
 
 type model struct {
@@ -91,6 +92,8 @@ type model struct {
 	archived bool
 	repoOnly bool
 	repoRoot string
+	repoPick string
+	peek     peekState
 	short    map[string]string
 	status   string
 	err      error
@@ -200,6 +203,14 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = ""
 		return m, nil
 
+	case peekedMsg:
+		if msg.sessionID != m.peek.session.ID {
+			return m, nil
+		}
+		m.peek.items, m.peek.summary, m.peek.err = msg.items, msg.summary, msg.err
+		m.peek.offset = 0
+		return m, nil
+
 	case plannedMsg:
 		if msg.err != nil {
 			m.screen = screenSessions
@@ -231,6 +242,8 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updatePlan(msg)
 		case m.screen == screenApplied:
 			return m.updateApplied(msg)
+		case m.screen == screenPeek:
+			return m.updatePeek(msg)
 		case m.screen == screenPlanning:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
@@ -286,9 +299,10 @@ func (m model) updateBrowse(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clampCursor()
 
 	case " ":
+		// Mark in place. Advancing steals the cursor from under someone
+		// marking two rows they are comparing.
 		if current, ok := m.current(); ok {
 			m.chosen[current.ID] = !m.chosen[current.ID]
-			m.moveCursor(1)
 		}
 
 	case "enter", "shift+enter", "d":
@@ -311,12 +325,31 @@ func (m model) updateBrowse(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.archived = !m.archived
 		m.applyFilter()
 	case "r":
-		if m.repoRoot == "" {
-			m.status = "not inside a repository, so there is nothing to narrow to"
-			break
+		// Cycle through the repositories that actually have sessions, so
+		// narrowing is one key rather than a filter someone has to type.
+		m.cycleRepo(1)
+	case "R":
+		m.cycleRepo(-1)
+	case "M":
+		// Merge everything on screen, whatever the marks say.
+		m.chosen = map[string]bool{}
+		for _, row := range m.rows {
+			m.chosen[row.ID] = true
 		}
-		m.repoOnly = !m.repoOnly
-		m.applyFilter()
+		if len(m.rows) == 0 {
+			m.status = "nothing to merge"
+			return m, nil
+		}
+		m.dryRun = false
+		m.outcome = Outcome{Merge: m.selected()}
+		m.screen = screenPlanning
+		return m, planCmd(m.outcome.Merge, m.events)
+	case "p", "v":
+		if current, ok := m.current(); ok {
+			m.screen = screenPeek
+			m.peek = peekState{session: current}
+			return m, peekCmd(current)
+		}
 	case "/":
 		m.mode = modeFilter
 	case "ctrl+r":
@@ -361,7 +394,10 @@ func (m model) openCurrent() (tea.Model, tea.Cmd) {
 
 func (m *model) applyFilter() {
 	filter := selection.Filter{IncludeArchived: m.archived}
-	if m.repoOnly && m.repoRoot != "" {
+	switch {
+	case m.repoPick != "":
+		filter.TouchedUnder = m.repoPick
+	case m.repoOnly && m.repoRoot != "":
 		filter.TouchedUnder = m.repoRoot
 	}
 	rows := selection.Apply(m.all, filter)
@@ -475,6 +511,8 @@ func (m model) View() string {
 		return m.planView()
 	case screenApplied:
 		return m.appliedView()
+	case screenPeek:
+		return m.peekView()
 	}
 	sections := []string{m.header(), m.list(), m.detail(), m.footer()}
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
@@ -488,7 +526,10 @@ func (m model) header() string {
 		}
 	}
 	scope := "every repo"
-	if m.repoOnly && m.repoRoot != "" {
+	switch {
+	case m.repoPick != "":
+		scope = shortPath(m.repoPick) + " only"
+	case m.repoOnly && m.repoRoot != "":
 		scope = shortPath(m.repoRoot) + " only"
 	}
 	left := lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render("hv")
@@ -687,6 +728,8 @@ func (m model) footer() string {
 		key("space", "mark"),
 		key("enter", "merge"),
 		key("⇧enter/d", "dry run"),
+		key("p", "peek"),
+		key("M", "merge all"),
 		key("o", "open"),
 		key("/", "filter"),
 		m.scopeKey(),
@@ -705,10 +748,52 @@ func (m model) footer() string {
 // scopeKey names what r will do next rather than what is on, so the footer
 // reads as an action.
 func (m model) scopeKey() string {
-	if m.repoOnly {
-		return styleKey.Render("r") + styleDim.Render(" every repo")
+	return styleKey.Render("r") + styleDim.Render(" repo")
+}
+
+// repos are the repositories with sessions, in the order they appear.
+func (m model) repos() []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, row := range m.all {
+		root := strings.TrimSpace(row.RepoRoot)
+		if root == "" {
+			continue
+		}
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		out = append(out, root)
 	}
-	return styleKey.Render("r") + styleDim.Render(" this repo")
+	sort.Strings(out)
+	return out
+}
+
+// cycleRepo steps through "every repo" and each repository that has sessions.
+func (m *model) cycleRepo(step int) {
+	repos := m.repos()
+	if len(repos) == 0 {
+		m.status = "no session recorded a repository"
+		return
+	}
+	// Index 0 is "every repo"; the rest are the repositories themselves.
+	at := 0
+	for index, repo := range repos {
+		if repo == m.repoPick {
+			at = index + 1
+			break
+		}
+	}
+	at = (at + step + len(repos) + 1) % (len(repos) + 1)
+	m.repoOnly = false
+	if at == 0 {
+		m.repoPick = ""
+	} else {
+		m.repoPick = repos[at-1]
+	}
+	m.cursor, m.offset = 0, 0
+	m.applyFilter()
 }
 
 func humanAge(millis int64) string {

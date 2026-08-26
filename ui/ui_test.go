@@ -87,14 +87,55 @@ func TestEnterFallsBackToTheHighlightedSession(t *testing.T) {
 	}
 }
 
-func TestSpaceMarksSessionsForMerge(t *testing.T) {
+// Space marks in place. Advancing would steal the cursor from under someone
+// marking two rows they are comparing.
+func TestSpaceMarksWithoutMovingTheCursor(t *testing.T) {
 	m := NewForTest(fixture())
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
-	m = press(m, " ", " ") // mark row 1, advance, mark row 2
-	after, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	outcome := after.(model).outcome
-	if len(outcome.Merge) != 2 {
-		t.Fatalf("merge = %d sessions, want both marked", len(outcome.Merge))
+	marked := press(m, " ")
+	if marked.(model).cursor != 0 {
+		t.Fatalf("cursor = %d, want it to stay put", marked.(model).cursor)
+	}
+	// Two rows take a deliberate move between the marks.
+	both := press(marked, "j", " ")
+	after, _ := both.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if merged := after.(model).outcome.Merge; len(merged) != 2 {
+		t.Fatalf("merge = %d sessions, want both marked", len(merged))
+	}
+}
+
+// M merges everything on screen, whatever the marks say.
+func TestMergeAllTakesEveryVisibleSession(t *testing.T) {
+	m := NewForTest(fixture())
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	after := press(m, "M").(model)
+	if len(after.outcome.Merge) != 2 {
+		t.Fatalf("merge = %d, want every visible session (the archived one is hidden)", len(after.outcome.Merge))
+	}
+	if after.screen != screenPlanning {
+		t.Error("M did not start planning")
+	}
+}
+
+// r cycles through the repositories that have sessions, so narrowing is one
+// key rather than a filter to type.
+func TestRepoKeyCyclesThroughRepositories(t *testing.T) {
+	rows := fixture()
+	rows[1].RepoRoot = "/other"
+	m := NewForTest(rows)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+
+	first := press(m, "r").(model)
+	if first.repoPick == "" {
+		t.Fatal("r did not narrow to a repository")
+	}
+	second := press(first, "r").(model)
+	if second.repoPick == first.repoPick {
+		t.Fatal("r did not move to the next repository")
+	}
+	third := press(second, "r").(model)
+	if third.repoPick != "" {
+		t.Fatalf("repoPick = %q, want the cycle back to every repo", third.repoPick)
 	}
 }
 

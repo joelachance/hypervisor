@@ -102,8 +102,11 @@ type Options struct {
 	Label string
 	// SessionIDs are recorded on the entry and named in commit trailers.
 	SessionIDs []string
-	// Trailers adds "hv-session: <id>" style trailers to each message.
+	// Trailers maps session id to its title, for the commit trailers.
 	Trailers map[string]string
+	// Why maps session id to what that session was asked to do - the reason a
+	// diff can never supply.
+	Why map[string]string
 }
 
 // Apply commits every revision in a plan and returns what it did.
@@ -241,9 +244,12 @@ func commitRevision(ctx context.Context, repoRoot, parent string, revision demux
 		}
 		// The patch collides with what is already on the branch. Three-way
 		// gets as far as git can on its own; whatever it leaves unmerged is
-		// what the resolver is for.
+		// what the resolver is for. When three-way cannot start either - it
+		// needs the blobs the patch names, which a patch for a file that did
+		// not exist does not have - the first error is the useful one.
+		direct := err
 		if err := applyPatchThreeWay(ctx, repoRoot, env, patch); err != nil {
-			return "", nil, err
+			return "", nil, fmt.Errorf("%w (three-way could not help either: %v)", direct, err)
 		}
 		files, err := resolveUnmerged(ctx, repoRoot, env, revision, options)
 		if err != nil {
@@ -255,7 +261,7 @@ func commitRevision(ctx context.Context, repoRoot, parent string, revision demux
 	if err != nil {
 		return "", nil, err
 	}
-	message := messageFor(revision, options)
+	message := messageFor(revision, patch, options)
 	if len(resolved) > 0 {
 		message = strings.TrimRight(message, "\n") +
 			fmt.Sprintf("\n\nhv-resolved-by: %s (%s)\n", options.Resolver.Name(), strings.Join(resolved, ", "))
@@ -532,22 +538,131 @@ func subjectFor(revision demux.RevisionProposal) string {
 	return subject
 }
 
-func messageFor(revision demux.RevisionProposal, options Options) string {
+// messageFor writes the commit message.
+//
+// A subject like "update internal/limiter.go" says nothing a diff does not,
+// so the body carries the two things a reader actually wants: what changed,
+// file by file with the symbols involved, and why - which hv knows, because it
+// is what the person asked the session for.
+func messageFor(revision demux.RevisionProposal, patch string, options Options) string {
 	var builder strings.Builder
 	builder.WriteString(subjectFor(revision))
 	builder.WriteString("\n")
-	// The sessions that produced the change are recorded as trailers, so the
-	// provenance survives in the commit rather than only in hv's journal.
-	for _, id := range revision.SessionIDs {
-		builder.WriteString("\nhv-session: " + id)
-		if title := options.Trailers[id]; title != "" {
-			builder.WriteString(" (" + title + ")")
+
+	if changes := changeSummary(revision, patch); len(changes) > 0 {
+		builder.WriteString("\n")
+		for _, change := range changes {
+			builder.WriteString(change + "\n")
 		}
 	}
+
+	reasons := reasonsFor(revision, options)
+	if len(reasons) > 0 {
+		builder.WriteString("\nWhy:\n")
+		for _, reason := range reasons {
+			builder.WriteString("  " + reason + "\n")
+		}
+	}
+
+	// The sessions that produced the change are recorded as trailers, so the
+	// provenance survives in the commit rather than only in hv's journal.
 	if len(revision.SessionIDs) > 0 {
 		builder.WriteString("\n")
+		for _, id := range revision.SessionIDs {
+			builder.WriteString("hv-session: " + id)
+			if title := options.Trailers[id]; title != "" {
+				builder.WriteString(" (" + title + ")")
+			}
+			builder.WriteString("\n")
+		}
 	}
 	return builder.String()
+}
+
+// changeSummary describes the patch per file: how many lines moved, whether
+// the file is new, and which symbols the hunks sit in.
+func changeSummary(revision demux.RevisionProposal, patch string) []string {
+	type stat struct {
+		added, removed int
+		created        bool
+	}
+	stats := map[string]*stat{}
+	order := []string{}
+	current := ""
+	for _, line := range strings.Split(patch, "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++ b/"):
+			current = strings.TrimPrefix(line, "+++ b/")
+			if _, ok := stats[current]; !ok {
+				stats[current] = &stat{}
+				order = append(order, current)
+			}
+		case strings.HasPrefix(line, "new file mode") && current != "":
+			stats[current].created = true
+		case current == "":
+			continue
+		case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
+			continue
+		case strings.HasPrefix(line, "+"):
+			stats[current].added++
+		case strings.HasPrefix(line, "-"):
+			stats[current].removed++
+		}
+	}
+	// A new file's "---" line is /dev/null, which the loop above cannot see
+	// because it skips header lines; the mode line covers it.
+	symbols := map[string][]string{}
+	for _, hunk := range revision.Hunks {
+		symbol := strings.TrimSpace(hunk.Symbol)
+		if symbol == "" {
+			continue
+		}
+		if !containsString(symbols[hunk.File], symbol) {
+			symbols[hunk.File] = append(symbols[hunk.File], symbol)
+		}
+	}
+
+	out := make([]string, 0, len(order))
+	for _, file := range order {
+		entry := stats[file]
+		line := fmt.Sprintf("  %s: +%d/-%d", file, entry.added, entry.removed)
+		if entry.created {
+			line += " (new file)"
+		}
+		if names := symbols[file]; len(names) > 0 {
+			line += " in " + strings.Join(names, ", ")
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// reasonsFor is what the sessions behind this revision were asked to do. It is
+// the only part of a commit message a diff can never supply.
+func reasonsFor(revision demux.RevisionProposal, options Options) []string {
+	out := []string{}
+	for _, id := range revision.SessionIDs {
+		why := strings.TrimSpace(options.Why[id])
+		if why == "" {
+			continue
+		}
+		title := strings.TrimSpace(options.Trailers[id])
+		if title != "" {
+			out = append(out, fmt.Sprintf("%s: %s", title, why))
+			continue
+		}
+		out = append(out, why)
+	}
+	return out
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func patchIndex(proposal demux.DemuxProposal) map[string]string {

@@ -21,6 +21,7 @@ import (
 	"github.com/satoricorp/hv/launch"
 	"github.com/satoricorp/hv/parse"
 	hvplan "github.com/satoricorp/hv/plan"
+	"github.com/satoricorp/hv/recall"
 	"github.com/satoricorp/hv/resolve"
 	"github.com/satoricorp/hv/selection"
 	"github.com/satoricorp/hv/session"
@@ -401,6 +402,7 @@ func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions
 	entry, err := apply.Apply(ctx, root, result.Packet, apply.Options{
 		SessionIDs: selection.IDs(sessions),
 		Trailers:   sessionTitles(sessions),
+		Why:        sessionReasons(sessions),
 		Resolver:   resolver,
 	})
 	if err != nil {
@@ -424,8 +426,15 @@ func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions
 	for _, rename := range entry.Renamed {
 		fmt.Printf("\n  %s was taken by unrelated history; used %s instead\n", rename.From, rename.To)
 	}
-	fmt.Printf("\n%d commits on %d branches (%d new, %d extended); working tree untouched\n",
-		len(entry.Commits), len(entry.Branches), created, extended)
+	branch, _ := hvplan.CurrentBranch(ctx, root)
+	fmt.Printf("\n%d commits on %d branch%s (%d new, %d extended)\n",
+		len(entry.Commits), len(entry.Branches), plural("es", len(entry.Branches)), created, extended)
+	// The confusing part, said plainly: the commits are copies. Nothing was
+	// checked out, the branch you are on has not moved, and the same edits are
+	// still sitting uncommitted where they were.
+	fmt.Printf("  you are still on %s, which did not move\n", firstNonEmptyString(branch, "your branch"))
+	fmt.Printf("  your uncommitted changes are still uncommitted - the commits are copies of them\n")
+	fmt.Printf("  see them with: git log %s\n", entry.Branches[0].Name)
 	fmt.Printf("undo with: hv undo -C %s\n", root)
 	return nil
 }
@@ -436,6 +445,31 @@ func sessionTitles(sessions []session.Session) map[string]string {
 		titles[current.ID] = current.Label()
 	}
 	return titles
+}
+
+// sessionReasons is what each session was asked to do, read from its
+// transcript. It is the "why" line of every commit message hv writes.
+func sessionReasons(sessions []session.Session) map[string]string {
+	reasons := map[string]string{}
+	for _, current := range sessions {
+		items, err := recall.Read(current, 0)
+		if err != nil {
+			continue
+		}
+		if intent := recall.Summarize(current, items).Intent; intent != "" {
+			reasons[current.ID] = intent
+		}
+	}
+	return reasons
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func undoCmd(ctx context.Context, args []string) error {

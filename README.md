@@ -85,7 +85,10 @@ real branches and commits:
   978973a1  feature/internal   update internal/alpha.go
   276fc77f  feature/internal   update internal/limiter
 
-2 commits on 1 branches (1 new, 0 extended); working tree untouched
+2 commits on 1 branch (1 new, 0 extended)
+  you are still on main, which did not move
+  your uncommitted changes are still uncommitted - the commits are copies of them
+  see them with: git log feature/internal
 undo with: hv undo -C ~/git/fake/alpha
 ```
 
@@ -93,8 +96,9 @@ Nothing is ever checked out. Each revision's patch goes into a temporary index
 (`read-tree`, `apply --cached`, `write-tree`, `commit-tree`) and the branch ref
 moves last, which has three consequences worth relying on:
 
-- **the working tree keeps every change**, exactly as it was, so nothing is
-  lost if the commits turn out wrong;
+- **nothing is checked out and your branch does not move**. The commits are
+  copies: the same edits are now on their branches *and* still sitting
+  uncommitted in your tree, exactly as they were;
 - a dirty tree is not an obstacle, and it always is one here - committing part
   of a mixed working tree is the whole point;
 - **undo is only ref surgery**, because refs are the only thing that changed.
