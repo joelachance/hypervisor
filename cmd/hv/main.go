@@ -21,6 +21,7 @@ import (
 	"github.com/satoricorp/hv/launch"
 	"github.com/satoricorp/hv/parse"
 	hvplan "github.com/satoricorp/hv/plan"
+	"github.com/satoricorp/hv/resolve"
 	"github.com/satoricorp/hv/selection"
 	"github.com/satoricorp/hv/session"
 	"github.com/satoricorp/hv/ui"
@@ -79,7 +80,9 @@ func usage() {
   hv -store DIR                                 read a different session store
   hv sessions [-tool t] [-since d] [-state s]   list coding sessions
   hv watch [-interval d]                        tail session edits as they land
-  hv merge [-session IDs] [-C dir]              commit the changes n sessions made
+  hv merge [-session IDs] [-C dir]              commit the changes n sessions made,
+                                                asking a harness to settle any
+                                                conflict (-no-resolve to refuse)
   hv merge -dry-run                             …show the plan without committing
   hv open <session>                             reopen a session where it lives
   hv undo [-C dir] [-list]                      undo the last merge
@@ -165,7 +168,7 @@ func uiCmd(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return planPerRepo(ctx, outcome.Merge, events, false)
+	return planPerRepo(ctx, outcome.Merge, events, false, nil)
 }
 
 // planPerRepo plans each repository the chosen sessions worked in.
@@ -174,7 +177,30 @@ func uiCmd(ctx context.Context, args []string) error {
 // but a selection is not: hv lists every session on the machine, so picking
 // three of them can reach three different repositories. Each gets its own
 // plan rather than one being silently chosen.
-func planPerRepo(ctx context.Context, sessions []session.Session, events []capture.SessionEvent, commit bool) error {
+// conflictResolver picks the harness that settles conflicts hit while
+// committing. Merging should finish; a patch that collides with what is
+// already on the branch is exactly the case an agent can decide.
+func conflictResolver(name string, disabled bool) apply.Resolver {
+	if disabled {
+		return nil
+	}
+	harness, err := harnessFor(name, "", "")
+	if err != nil {
+		// No harness is not an error until a conflict actually happens, and
+		// then apply says so plainly.
+		return nil
+	}
+	return resolve.Adapter{Harness: harness}
+}
+
+func resolverName(resolver apply.Resolver) string {
+	if resolver == nil {
+		return "nobody"
+	}
+	return resolver.Name()
+}
+
+func planPerRepo(ctx context.Context, sessions []session.Session, events []capture.SessionEvent, commit bool, resolver apply.Resolver) error {
 	order, groups, problems := hvplan.GroupByRepo(ctx, sessions)
 	for _, problem := range problems {
 		fmt.Fprintf(os.Stderr, "hv: %v\n", problem)
@@ -200,7 +226,7 @@ func planPerRepo(ctx context.Context, sessions []session.Session, events []captu
 		if !commit {
 			continue
 		}
-		if err := commitPlan(ctx, root, result, groups[root]); err != nil {
+		if err := commitPlan(ctx, root, result, groups[root], resolver); err != nil {
 			// One repository failing to commit must not stop the others; the
 			// ones that succeeded each printed their own undo command.
 			fmt.Fprintf(os.Stderr, "hv: %s: %v\n", root, err)
@@ -296,6 +322,8 @@ func mergeCmd(ctx context.Context, args []string) error {
 	intent := flags.String("intent", "", "intent prefix for proposed revisions")
 	repair := flags.Bool("repair", false, "apply demux's deterministic repair hints to the plan")
 	dryRun := flags.Bool("dry-run", false, "show the plan without committing anything")
+	harnessName := flags.String("harness", "", "coding harness to settle conflicts: pi, fx, claude, codex, opencode, or a binary")
+	noResolve := flags.Bool("no-resolve", false, "fail on a conflict instead of asking a harness to settle it")
 	asJSON := flags.Bool("json", false, "print the full demux plan packet as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -340,8 +368,9 @@ func mergeCmd(ctx context.Context, args []string) error {
 	// merge commits. Reviewing without committing is what -dry-run is for, and
 	// -json is an inspection flag, so neither writes anything.
 	commit := !*dryRun && !*asJSON
+	resolver := conflictResolver(*harnessName, *noResolve)
 	if len(named) > 0 {
-		return planPerRepo(ctx, sessions, events, commit)
+		return planPerRepo(ctx, sessions, events, commit, resolver)
 	}
 	result, err := hvplan.Run(ctx, hvplan.Request{
 		RepoRoot: root,
@@ -361,17 +390,18 @@ func mergeCmd(ctx context.Context, args []string) error {
 	}
 	printPlan(result, sessions)
 	if commit {
-		return commitPlan(ctx, root, result, sessions)
+		return commitPlan(ctx, root, result, sessions, resolver)
 	}
 	fmt.Fprintln(os.Stderr, "\ndry run: nothing was committed")
 	return nil
 }
 
 // commitPlan writes a plan to the repository and reports what it wrote.
-func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions []session.Session) error {
+func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions []session.Session, resolver apply.Resolver) error {
 	entry, err := apply.Apply(ctx, root, result.Packet, apply.Options{
 		SessionIDs: selection.IDs(sessions),
 		Trailers:   sessionTitles(sessions),
+		Resolver:   resolver,
 	})
 	if err != nil {
 		return err
@@ -387,6 +417,9 @@ func commitPlan(ctx context.Context, root string, result hvplan.Result, sessions
 		} else {
 			extended++
 		}
+	}
+	for _, path := range entry.Resolved {
+		fmt.Printf("\n  %s conflicted with the branch; settled by %s\n", path, resolverName(resolver))
 	}
 	for _, rename := range entry.Renamed {
 		fmt.Printf("\n  %s was taken by unrelated history; used %s instead\n", rename.From, rename.To)

@@ -253,12 +253,12 @@ func analyzeFile(ctx context.Context, repo, path string, stage [3]string) (FileC
 	merged := runIgnoringStatus(ctx, repo, "merge-file", "-p", "--diff3",
 		"-L", "ours", "-L", "base", "-L", "theirs", paths[1], paths[0], paths[2])
 	fileConflict.Merged = merged
-	fileConflict.Regions = parseRegions(merged)
+	fileConflict.Regions = ParseRegions(merged)
 	return fileConflict, nil
 }
 
-// parseRegions reads git's conflict markers back into structured regions.
-func parseRegions(merged string) []Region {
+// ParseRegions reads git's conflict markers back into structured regions.
+func ParseRegions(merged string) []Region {
 	regions := []Region{}
 	var current *Region
 	section := 0 // 1 ours, 2 base, 3 theirs

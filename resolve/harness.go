@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/satoricorp/hv/apply"
 	"github.com/satoricorp/hv/conflict"
 )
 
@@ -395,4 +396,30 @@ func asExit(err error, target **exec.ExitError) bool {
 		*target = exitErr
 	}
 	return ok
+}
+
+// Adapter lets a Harness settle conflicts that arise while committing, which
+// is the same question in a different frame: two versions of a region, and
+// which side each came from.
+type Adapter struct{ Harness Harness }
+
+// Name implements apply.Resolver.
+func (a Adapter) Name() string { return a.Harness.Name() }
+
+// ResolveConflict implements apply.Resolver.
+func (a Adapter) ResolveConflict(ctx context.Context, request apply.ConflictRequest) ([]string, error) {
+	ask := Request{
+		Path: request.Path, Region: request.Region,
+		Base: request.Base, Ours: request.Ours, Theirs: request.Theirs,
+		OursFrom: request.OursFrom, TheirsFrom: request.TheirsFrom,
+	}
+	resolution, err := a.Harness.Resolve(ctx, ask)
+	if err != nil {
+		return nil, err
+	}
+	if problems := Verify(ask, resolution); len(problems) > 0 {
+		return nil, fmt.Errorf("%s left %d line(s) unaccounted for: %s",
+			a.Harness.Name(), len(problems), problems[0])
+	}
+	return resolution.Resolved, nil
 }

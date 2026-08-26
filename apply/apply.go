@@ -20,10 +20,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/satoricorp/demux"
+	"github.com/satoricorp/hv/conflict"
 )
 
 // Commit is one commit this run created.
@@ -58,7 +60,9 @@ type Entry struct {
 	Branches   []BranchChange `json:"branches"`
 	SessionIDs []string       `json:"session_ids,omitempty"`
 	Renamed    []Rename       `json:"renamed,omitempty"`
-	UndoneAt   int64          `json:"undone_at,omitempty"`
+	// Resolved names the files a Resolver had to settle on the way in.
+	Resolved []string `json:"resolved,omitempty"`
+	UndoneAt int64    `json:"undone_at,omitempty"`
 }
 
 // Rename records a branch hv could not use under its routed name.
@@ -70,8 +74,32 @@ type Rename struct {
 // Undone reports whether this entry has already been undone.
 func (e Entry) Undone() bool { return e.UndoneAt != 0 }
 
+// Resolver settles a conflict that arises while committing. It exists so
+// merging can finish rather than stopping at "does not apply": a patch that
+// collides with a branch's existing work is exactly the case a coding agent
+// can decide, and hv already knows which sessions wrote both sides.
+type Resolver interface {
+	ResolveConflict(ctx context.Context, request ConflictRequest) ([]string, error)
+	Name() string
+}
+
+// ConflictRequest is one region a Resolver has to settle.
+type ConflictRequest struct {
+	Path       string
+	Region     int
+	Base       []string
+	Ours       []string
+	Theirs     []string
+	OursFrom   string
+	TheirsFrom string
+}
+
 // Options configure one apply run.
 type Options struct {
+	// Resolver, when set, is asked to settle conflicts instead of failing.
+	Resolver Resolver
+	// Label names the side the revision came from, for the resolver's prompt.
+	Label string
 	// SessionIDs are recorded on the entry and named in commit trailers.
 	SessionIDs []string
 	// Trailers adds "hv-session: <id>" style trailers to each message.
@@ -142,7 +170,8 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 		if strings.TrimSpace(patch) == "" {
 			return entry, fmt.Errorf("revision %s has no patch text", revision.ID)
 		}
-		sha, err := commitRevision(ctx, repoRoot, parent, revision, patch, options)
+		sha, resolved, err := commitRevision(ctx, repoRoot, parent, revision, patch, options)
+		entry.Resolved = append(entry.Resolved, resolved...)
 		if err != nil {
 			return entry, fmt.Errorf("revision %s: %w", revision.ID, err)
 		}
@@ -191,10 +220,10 @@ func startingPoint(ctx context.Context, repoRoot string, revision demux.Revision
 // commitRevision builds one commit without touching the working tree: read the
 // parent into a scratch index, apply the patch to it, write the tree, and
 // commit that tree.
-func commitRevision(ctx context.Context, repoRoot, parent string, revision demux.RevisionProposal, patch string, options Options) (string, error) {
+func commitRevision(ctx context.Context, repoRoot, parent string, revision demux.RevisionProposal, patch string, options Options) (string, []string, error) {
 	indexFile, err := os.CreateTemp("", "hv-index-*")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	indexPath := indexFile.Name()
 	indexFile.Close()
@@ -203,21 +232,214 @@ func commitRevision(ctx context.Context, repoRoot, parent string, revision demux
 
 	env := append(os.Environ(), "GIT_INDEX_FILE="+indexPath)
 	if _, err := gitEnv(ctx, repoRoot, env, "read-tree", parent); err != nil {
-		return "", err
+		return "", nil, err
 	}
+	resolved := []string{}
 	if err := applyPatch(ctx, repoRoot, env, patch); err != nil {
-		return "", err
+		if options.Resolver == nil {
+			return "", nil, err
+		}
+		// The patch collides with what is already on the branch. Three-way
+		// gets as far as git can on its own; whatever it leaves unmerged is
+		// what the resolver is for.
+		if err := applyPatchThreeWay(ctx, repoRoot, env, patch); err != nil {
+			return "", nil, err
+		}
+		files, err := resolveUnmerged(ctx, repoRoot, env, revision, options)
+		if err != nil {
+			return "", nil, err
+		}
+		resolved = files
 	}
 	tree, err := gitEnv(ctx, repoRoot, env, "write-tree")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	message := messageFor(revision, options)
+	if len(resolved) > 0 {
+		message = strings.TrimRight(message, "\n") +
+			fmt.Sprintf("\n\nhv-resolved-by: %s (%s)\n", options.Resolver.Name(), strings.Join(resolved, ", "))
+	}
 	sha, err := gitInput(ctx, repoRoot, env, message, "commit-tree", tree, "-p", parent, "-F", "-")
+	if err != nil {
+		return "", nil, err
+	}
+	return sha, resolved, nil
+}
+
+// applyPatchThreeWay falls back to git's own three-way merge, which needs the
+// blobs the patch refers to; a patch hv produced from this repository has
+// them.
+func applyPatchThreeWay(ctx context.Context, repoRoot string, env []string, patch string) error {
+	command := exec.CommandContext(ctx, "git", "apply", "--cached", "--3way", "--whitespace=nowarn", "-")
+	command.Dir = repoRoot
+	command.Env = env
+	command.Stdin = strings.NewReader(patch)
+	out, err := command.CombinedOutput()
+	if err != nil {
+		// --3way exits non-zero when it leaves conflicts, which is the case
+		// the resolver handles; only a total failure has no unmerged paths.
+		if !strings.Contains(string(out), "conflict") && !strings.Contains(string(out), "U ") {
+			return fmt.Errorf("git apply --3way: %v: %s", err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+// resolveUnmerged settles every path git left conflicted, staging the answer.
+func resolveUnmerged(ctx context.Context, repoRoot string, env []string, revision demux.RevisionProposal, options Options) ([]string, error) {
+	listing, err := gitEnv(ctx, repoRoot, env, "ls-files", "-u")
+	if err != nil {
+		return nil, err
+	}
+	stages := map[string][3]string{}
+	order := []string{}
+	for _, line := range strings.Split(listing, "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		meta := strings.Fields(parts[0])
+		if len(meta) != 3 {
+			continue
+		}
+		stage, err := strconv.Atoi(meta[2])
+		if err != nil || stage < 1 || stage > 3 {
+			continue
+		}
+		path := parts[1]
+		if _, seen := stages[path]; !seen {
+			order = append(order, path)
+		}
+		entry := stages[path]
+		entry[stage-1] = meta[1]
+		stages[path] = entry
+	}
+	if len(order) == 0 {
+		return nil, nil
+	}
+
+	resolved := make([]string, 0, len(order))
+	for _, path := range order {
+		body, err := resolveFile(ctx, repoRoot, path, stages[path], revision, options)
+		if err != nil {
+			return nil, err
+		}
+		blob, err := hashObject(ctx, repoRoot, body)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := gitEnv(ctx, repoRoot, env, "update-index", "--add", "--cacheinfo",
+			fmt.Sprintf("100644,%s,%s", blob, path)); err != nil {
+			return nil, err
+		}
+		resolved = append(resolved, path)
+	}
+	return resolved, nil
+}
+
+// resolveFile rebuilds one conflicted file, asking the resolver per region.
+func resolveFile(ctx context.Context, repoRoot, path string, stage [3]string, revision demux.RevisionProposal, options Options) (string, error) {
+	dir, err := os.MkdirTemp("", "hv-apply-conflict-*")
 	if err != nil {
 		return "", err
 	}
-	return sha, nil
+	defer os.RemoveAll(dir)
+
+	names := [3]string{"base", "ours", "theirs"}
+	paths := [3]string{}
+	for index, blob := range stage {
+		target := filepath.Join(dir, names[index])
+		paths[index] = target
+		body := ""
+		if blob != "" {
+			if body, err = git(ctx, repoRoot, "cat-file", "blob", blob); err != nil {
+				return "", err
+			}
+			body += "\n"
+		}
+		if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+			return "", err
+		}
+	}
+	merged := runIgnoringStatus(ctx, repoRoot, "merge-file", "-p", "--diff3",
+		"-L", "on the branch", "-L", "base", "-L", "this revision", paths[1], paths[0], paths[2])
+
+	regions := conflict.ParseRegions(merged)
+	if len(regions) == 0 {
+		return merged, nil
+	}
+	replacements := make([][]string, 0, len(regions))
+	for _, region := range regions {
+		lines, err := options.Resolver.ResolveConflict(ctx, ConflictRequest{
+			Path: path, Region: region.Index,
+			Base: region.Base, Ours: region.Ours, Theirs: region.Theirs,
+			OursFrom:   "the work already on the branch",
+			TheirsFrom: labelFor(revision, options),
+		})
+		if err != nil {
+			return "", fmt.Errorf("%s region %d: %w", path, region.Index, err)
+		}
+		replacements = append(replacements, lines)
+	}
+	return replaceRegions(merged, replacements)
+}
+
+func labelFor(revision demux.RevisionProposal, options Options) string {
+	if label := strings.TrimSpace(options.Label); label != "" {
+		return label
+	}
+	if intent := strings.TrimSpace(revision.Intent); intent != "" {
+		return intent
+	}
+	return revision.ID
+}
+
+// replaceRegions swaps every conflict block for its resolution in one pass.
+func replaceRegions(merged string, replacements [][]string) (string, error) {
+	lines := strings.Split(merged, "\n")
+	out := make([]string, 0, len(lines))
+	seen, inBlock := 0, false
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "<<<<<<<"):
+			if seen >= len(replacements) {
+				return "", fmt.Errorf("more conflict blocks than resolutions")
+			}
+			out = append(out, replacements[seen]...)
+			seen++
+			inBlock = true
+		case inBlock && strings.HasPrefix(line, ">>>>>>>"):
+			inBlock = false
+		case inBlock:
+		default:
+			out = append(out, line)
+		}
+	}
+	if seen != len(replacements) {
+		return "", fmt.Errorf("resolved %d regions but the file has %d", len(replacements), seen)
+	}
+	return strings.Join(out, "\n"), nil
+}
+
+func hashObject(ctx context.Context, repoRoot, body string) (string, error) {
+	command := exec.CommandContext(ctx, "git", "hash-object", "-w", "--stdin")
+	command.Dir = repoRoot
+	command.Stdin = strings.NewReader(body)
+	out, err := command.Output()
+	if err != nil {
+		return "", fmt.Errorf("git hash-object: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// runIgnoringStatus returns stdout whatever the exit status: merge-file
+// reports conflicts through the exit code rather than failing.
+func runIgnoringStatus(ctx context.Context, dir string, args ...string) string {
+	command := exec.CommandContext(ctx, "git", args...)
+	command.Dir = dir
+	out, _ := command.Output()
+	return string(out)
 }
 
 // applyPatch stages a patch into the scratch index. --cached keeps it out of

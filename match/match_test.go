@@ -17,7 +17,7 @@ func TestTemporalTierLinksByFile(t *testing.T) {
 		{SessionID: "s3", Tool: capture.ToolClaude, Kind: capture.KindRead, TS: 300, FilePath: "/repo/internal/billing/invoice.go"},
 	}
 
-	result := Matcher{}.Link(hunks, events)
+	result := (Matcher{}).Link(hunks, events)
 	if len(result.Links) != 1 {
 		t.Fatalf("links = %v, want one", result.Links)
 	}
@@ -37,7 +37,7 @@ func TestUnmatchedHunksLowerCoverage(t *testing.T) {
 	hunks := []demux.HunkRange{{ID: "h1", File: "a.go"}, {ID: "h2", File: "handwritten.go"}}
 	events := []capture.SessionEvent{{SessionID: "s1", Kind: capture.KindEdit, TS: 1, FilePath: "a.go"}}
 
-	result := Matcher{}.Link(hunks, events)
+	result := (Matcher{}).Link(hunks, events)
 	if len(result.Links) != 1 {
 		t.Fatalf("links = %v, want only the agent-edited hunk", result.Links)
 	}
@@ -80,5 +80,122 @@ func TestAddedLinesIgnoresFileHeader(t *testing.T) {
 	got := AddedLines(hunk)
 	if len(got) != 1 || got[0] != "added" {
 		t.Fatalf("AddedLines() = %v, want [added]", got)
+	}
+}
+
+const limiterHunk = `diff --git a/limiter.go b/limiter.go
+--- a/limiter.go
++++ b/limiter.go
+@@ -1,3 +1,6 @@
+ package app
+ 
++func Limit(n int) int {
++	return n * 2
++}
+`
+
+// The case the temporal tier cannot get right: two sessions edited the same
+// file in the same window, and only the text says whose work this is.
+func TestExactTextBeatsRecency(t *testing.T) {
+	hunks := []demux.HunkRange{{ID: "h1", File: "limiter.go", Patch: limiterHunk}}
+	events := []capture.SessionEvent{
+		{SessionID: "wrote-it", Tool: capture.ToolClaude, Kind: capture.KindEdit, TS: 100,
+			FilePath: "limiter.go", NewText: "func Limit(n int) int {\n\treturn n * 2\n}\n"},
+		// Later, but a different part of the file - recency alone would pick it.
+		{SessionID: "touched-it-later", Tool: capture.ToolClaude, Kind: capture.KindEdit, TS: 900,
+			FilePath: "limiter.go", NewText: "// unrelated comment somewhere else\n"},
+	}
+	result := (Matcher{}).Link(hunks, events)
+	if len(result.Links) != 1 {
+		t.Fatalf("links = %v, want one", result.Links)
+	}
+	got := result.Links[0]
+	if got.SessionID != "wrote-it" {
+		t.Errorf("session = %q, want the one whose text is in the hunk", got.SessionID)
+	}
+	if got.Tier != matcher.TierExact || got.Confidence != ConfidenceExact {
+		t.Errorf("tier = %d, want exact", got.Tier)
+	}
+}
+
+// Re-indentation must not cost a link: the line is still that agent's.
+func TestExactIgnoresWhitespace(t *testing.T) {
+	hunks := []demux.HunkRange{{ID: "h1", File: "limiter.go", Patch: limiterHunk}}
+	events := []capture.SessionEvent{{SessionID: "s1", Kind: capture.KindEdit, TS: 1,
+		FilePath: "limiter.go", NewText: "        func Limit(n int) int {\n                return n * 2\n        }"}}
+	got := (Matcher{}).Link(hunks, events).Links
+	if len(got) != 1 || got[0].Tier != matcher.TierExact {
+		t.Fatalf("links = %+v, want an exact match despite the indentation", got)
+	}
+}
+
+const bigHunk = `diff --git a/limiter.go b/limiter.go
+--- a/limiter.go
++++ b/limiter.go
+@@ -1,2 +1,8 @@
+ package app
+ 
++// Limiter caps requests per window.
++type Limiter struct {
++	window time.Duration
++	burst  int
++}
++
++func (l *Limiter) Allow() bool { return l.burst > 0 }
+`
+
+// Text that survived a later tweak still matches: overlap is measured against
+// the smaller side, so one changed line out of five is still that session's
+// work rather than a coincidence.
+func TestFuzzyMatchesTextThatWasLaterTweaked(t *testing.T) {
+	hunks := []demux.HunkRange{{ID: "h1", File: "limiter.go", Patch: bigHunk}}
+	events := []capture.SessionEvent{{SessionID: "s1", Kind: capture.KindEdit, TS: 1,
+		FilePath: "limiter.go", NewText: "// Limiter caps requests per window.\n" +
+			"type Limiter struct {\n\twindow time.Duration\n\tburst  int\n}\n" +
+			"func (l *Limiter) Allow() bool { return l.burst > 1 }\n"}}
+	got := (Matcher{}).Link(hunks, events).Links
+	if len(got) != 1 {
+		t.Fatalf("links = %+v, want one", got)
+	}
+	if got[0].Tier != matcher.TierFuzzy {
+		t.Errorf("tier = %d, want fuzzy - two lines of three match", got[0].Tier)
+	}
+}
+
+// Text from another file must never claim a hunk, however similar.
+func TestTextFromAnotherFileDoesNotMatch(t *testing.T) {
+	hunks := []demux.HunkRange{{ID: "h1", File: "limiter.go", Patch: limiterHunk}}
+	events := []capture.SessionEvent{{SessionID: "s1", Kind: capture.KindEdit, TS: 1,
+		FilePath: "elsewhere.go", NewText: "func Limit(n int) int {\n\treturn n * 2\n}\n"}}
+	if got := (Matcher{}).Link(hunks, events).Links; len(got) != 0 {
+		t.Fatalf("links = %+v, want none - the edit was to another file", got)
+	}
+}
+
+// Blank lines and lone braces appear in every file; matching on them would
+// attribute anything to anyone.
+func TestTrivialLinesDoNotCarryAMatch(t *testing.T) {
+	hunks := []demux.HunkRange{{ID: "h1", File: "limiter.go", Patch: limiterHunk}}
+	events := []capture.SessionEvent{{SessionID: "s1", Kind: capture.KindEdit, TS: 1,
+		FilePath: "limiter.go", NewText: "}\n\n"}}
+	got := (Matcher{}).Link(hunks, events).Links
+	if len(got) == 1 && got[0].Tier != matcher.TierTemporal {
+		t.Fatalf("tier = %d, want the temporal fallback, not a text match on a brace", got[0].Tier)
+	}
+}
+
+// Same inputs, same links, whatever order the logs were read in.
+func TestLinkingIsDeterministic(t *testing.T) {
+	hunks := []demux.HunkRange{{ID: "h1", File: "limiter.go", Patch: limiterHunk}}
+	text := "func Limit(n int) int {\n\treturn n * 2\n}\n"
+	forward := []capture.SessionEvent{
+		{SessionID: "aaa", Kind: capture.KindEdit, TS: 5, FilePath: "limiter.go", NewText: text},
+		{SessionID: "bbb", Kind: capture.KindEdit, TS: 5, FilePath: "limiter.go", NewText: text},
+	}
+	backward := []capture.SessionEvent{forward[1], forward[0]}
+	first := (Matcher{}).Link(hunks, forward).Links[0].SessionID
+	second := (Matcher{}).Link(hunks, backward).Links[0].SessionID
+	if first != second {
+		t.Fatalf("the same events in a different order produced %q and %q", first, second)
 	}
 }

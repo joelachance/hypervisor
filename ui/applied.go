@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/satoricorp/hv/apply"
+	"github.com/satoricorp/hv/resolve"
 	"github.com/satoricorp/hv/selection"
 )
 
@@ -31,10 +32,17 @@ func applyCmd(group planGroup) tea.Cmd {
 		for _, current := range group.Sessions {
 			titles[current.ID] = current.Label()
 		}
-		entry, err := apply.Apply(context.Background(), group.Root, group.Result.Packet, apply.Options{
+		options := apply.Options{
 			SessionIDs: selection.IDs(group.Sessions),
 			Trailers:   titles,
-		})
+		}
+		// A patch that collides with what is already on the branch is settled
+		// by whichever harness is installed, so enter finishes the merge
+		// rather than stopping at "does not apply".
+		if harness, ok := resolve.Detect(); ok {
+			options.Resolver = resolve.Adapter{Harness: harness}
+		}
+		entry, err := apply.Apply(context.Background(), group.Root, group.Result.Packet, options)
 		return appliedMsg{entry: entry, err: err}
 	}
 }
@@ -103,6 +111,10 @@ func (m model) appliedView() string {
 			styleDim.Render(fmt.Sprintf("%-9s", verb)), styleValue.Render(branch.Name)))
 	}
 	lines = append(lines, "")
+	for _, path := range entry.Resolved {
+		lines = append(lines, styleKey.Render("  settled ")+styleValue.Render(path)+
+			styleDim.Render(" — it conflicted with the branch"))
+	}
 	lines = append(lines, styleDim.Render("  the working tree is untouched; every change is still there"))
 	if m.status != "" {
 		lines = append(lines, styleDim.Render("  "+m.status))

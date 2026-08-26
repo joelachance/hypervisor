@@ -321,3 +321,85 @@ func TestBranchNameTakenByUnrelatedHistoryGetsItsOwn(t *testing.T) {
 		t.Errorf("feature/x = %q, want it left alone", subject)
 	}
 }
+
+// fakeResolver settles conflicts without a model, so the path is testable.
+type fakeResolver struct {
+	reply func(ConflictRequest) []string
+	seen  []ConflictRequest
+}
+
+func (f *fakeResolver) Name() string { return "fake" }
+func (f *fakeResolver) ResolveConflict(_ context.Context, request ConflictRequest) ([]string, error) {
+	f.seen = append(f.seen, request)
+	return f.reply(request), nil
+}
+
+// A patch that collides with what is already on the branch used to stop the
+// merge at "does not apply". With a resolver it finishes.
+func TestConflictOnApplyIsSettledAndCommitted(t *testing.T) {
+	repo := repoWith(t, map[string]string{"version.go": "package main // 1\n"})
+	run := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	// The branch already carries a different change to the same line.
+	run("checkout", "-q", "-b", "feature/x")
+	if err := os.WriteFile(filepath.Join(repo, "version.go"), []byte("package main // branch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "-qm", "branch work")
+	run("checkout", "-q", "main")
+
+	// A real patch, produced by git, because --3way needs the index line that
+	// names the blob it merges against. A hand-written patch has no such line
+	// and git falls back to direct application, which is what conflicts.
+	if err := os.WriteFile(filepath.Join(repo, "version.go"), []byte("package main // 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	realPatch := gitOut(t, repo, "diff", "--no-color")
+	if !strings.Contains(realPatch, "index ") {
+		t.Fatalf("the fixture patch has no index line: %q", realPatch)
+	}
+	plan := packet(
+		[]demux.RevisionProposal{{ID: "u1", Intent: "bump", HunkIDs: []string{"h1"}, TargetStack: "feature/x"}},
+		[]demux.HunkRange{{ID: "h1", File: "version.go", Patch: realPatch}})
+
+	// Without a resolver it refuses, which is the behaviour to keep.
+	if _, err := Apply(context.Background(), repo, plan, Options{}); err == nil {
+		t.Fatal("a colliding patch was committed with no resolver")
+	}
+
+	resolver := &fakeResolver{reply: func(ConflictRequest) []string {
+		return []string{"package main // branch and 2"}
+	}}
+	entry, err := Apply(context.Background(), repo, plan, Options{Resolver: resolver, Label: "the limiter session"})
+	if err != nil {
+		t.Fatalf("Apply() with a resolver = %v", err)
+	}
+	if len(entry.Resolved) != 1 || entry.Resolved[0] != "version.go" {
+		t.Fatalf("resolved = %v, want version.go", entry.Resolved)
+	}
+	if body := gitOut(t, repo, "show", "feature/x:version.go"); !strings.Contains(body, "branch and 2") {
+		t.Fatalf("the resolution is not in the commit: %q", body)
+	}
+	if body := gitOut(t, repo, "log", "-1", "--format=%B", "feature/x"); !strings.Contains(body, "hv-resolved-by: fake") {
+		t.Errorf("commit message = %q, want the resolver recorded", body)
+	}
+	// The resolver must be told whose work each side is.
+	if len(resolver.seen) != 1 {
+		t.Fatalf("resolver saw %d regions, want 1", len(resolver.seen))
+	}
+	if resolver.seen[0].TheirsFrom != "the limiter session" {
+		t.Errorf("theirs = %q, want the label naming the incoming work", resolver.seen[0].TheirsFrom)
+	}
+	if len(resolver.seen[0].Base) == 0 || len(resolver.seen[0].Ours) == 0 {
+		t.Error("the resolver was not given all three versions")
+	}
+	// And the branch keeps its own history: this extended it, not replaced it.
+	if count := gitOut(t, repo, "rev-list", "--count", "feature/x"); count != "3" {
+		t.Errorf("feature/x has %s commits, want 3 - seed, branch work, and this", count)
+	}
+}

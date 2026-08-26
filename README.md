@@ -326,14 +326,16 @@ The layout beneath it is exactly what the tools produce
 
 | Piece | State |
 |---|---|
-| `match` exact tier | not implemented - returns no match |
-| `match` fuzzy tier | not implemented - returns no match |
-| temporal tier | works; attribution is by file and recency |
+| `match` exact tier | works - added lines matched verbatim, whitespace aside |
+| `match` fuzzy tier | works - overlap against the smaller side, 0.8 |
+| temporal tier | works; the fallback when text says nothing |
 | Cursor edit evidence | needs the SQLite store |
 | watcher mid-write records | a sweep landing mid-append can cut the last record |
 
-Only the temporal tier runs today, so a hunk is attributed to whichever
-selected session last edited that file. That is right far more often than not
-and wrong in exactly one situation worth caring about: two sessions editing
-the same file in the same window. The exact tier is what fixes it - it must
-stay deterministic, because everything downstream in the planner is.
+All three tiers run. A hunk is attributed to the session whose written text is
+actually in it, falling back to recency only when the text says nothing - which
+is what separates two sessions editing the same file in the same window.
+
+The comparison is a set of trimmed, meaningful lines: whitespace changes do not
+cost a link, blank lines and lone braces cannot earn one, and ties break on
+session id so the same logs always produce the same links.
