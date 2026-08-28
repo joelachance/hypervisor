@@ -570,7 +570,7 @@ fn main() {
                 .items(&[&toggle_item, &quit_item])
                 .build()?;
             tauri::tray::TrayIconBuilder::with_id("hv-tray")
-                .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?)
+                .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "toggle" => toggle_overlay(app),
