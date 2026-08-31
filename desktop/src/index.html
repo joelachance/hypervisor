@@ -100,11 +100,11 @@
       white-space: nowrap;
       font-family: var(--mono);
     }
-    .tick .title { font-size: 13px; color: #eae7e7; }
-    .tick .adds { font-size: 11.5px; color: var(--adds); }
-    .tick .dels { font-size: 11.5px; color: var(--dels); }
-    .tick .dot-sep { font-size: 11.5px; color: #4a4746; }
-    .tick .summary { font-family: var(--sans); font-size: 12px; color: #8d8a89; }
+    .tick .title { font-size: 12px; color: #eae7e7; }
+    .tick .adds { font-size: 10.5px; color: var(--adds); }
+    .tick .dels { font-size: 10.5px; color: var(--dels); }
+    .tick .dot-sep { font-size: 10.5px; color: #4a4746; }
+    .tick .summary { font-family: var(--sans); font-size: 11px; color: #8d8a89; }
 
     #matrix {
       display: grid;
@@ -162,11 +162,11 @@
     .u-bubble {
       align-self: flex-end;
       max-width: 74%;
-      padding: 10px 14px;
+      padding: 9px 13px;
       border-radius: 12px;
       background: rgba(248, 244, 244, 0.075);
       font-family: var(--mono);
-      font-size: 12.5px;
+      font-size: 11.5px;
       line-height: 1.55;
       color: #f2eeee;
       user-select: text;
@@ -178,7 +178,7 @@
       gap: 9px;
       padding-left: 2px;
       font-family: var(--mono);
-      font-size: 11px;
+      font-size: 10.5px;
     }
     .tool-row .caret { color: var(--magenta); }
     .tool-row .tool { color: #7d7979; }
@@ -186,7 +186,7 @@
     .a-prose {
       max-width: 86%;
       font-family: var(--sans);
-      font-size: 13.5px;
+      font-size: 12.5px;
       line-height: 1.6;
       color: var(--prose);
       text-wrap: pretty;
@@ -249,11 +249,11 @@
       padding: 0 20px 0 18px;
       border-bottom: 1px solid var(--line);
       font-family: var(--mono);
-      font-size: 14px;
+      font-size: 12.5px;
     }
     #panel-head .sigil { color: #7d7979; }
     #panel-head .query { color: var(--text); letter-spacing: 0.005em; }
-    .vimcaret { width: 7px; height: 16px; background: #eae7e7; display: block; animation: vimcaret 1.2s steps(1, end) infinite; }
+    .vimcaret { width: 6px; height: 14px; background: #eae7e7; display: block; animation: vimcaret 1.2s steps(1, end) infinite; }
     @keyframes vimcaret { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
     #panel-head .count { margin-left: auto; font-size: 10px; letter-spacing: 0.14em; color: var(--faint); }
 
@@ -298,32 +298,37 @@
     #panel-foot b { color: #bab6b6; font-weight: 400; }
 
     /* session rows */
-    .s-row { height: 38px; }
+    .s-row { height: 34px; }
     .s-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; max-width: 660px; }
-    .s-title { font-size: 12.5px; line-height: 1; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .s-title { font-size: 11.5px; line-height: 1; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .sel .s-title { color: var(--text); }
-    .s-meta { display: flex; align-items: center; gap: 9px; font-size: 10.5px; line-height: 1; color: var(--muted); white-space: nowrap; }
+    .s-meta { display: flex; align-items: center; gap: 9px; font-size: 9.5px; line-height: 1; color: var(--muted); white-space: nowrap; }
     .s-meta .sep { color: #4a4746; }
     .s-meta .wt { color: var(--blue); }
     .s-meta .when { color: var(--faint); }
 
     /* command rows */
-    .c-row { height: 30px; display: grid; grid-template-columns: 148px 1fr 92px; gap: 16px; align-items: center; }
-    .c-cmd { font-size: 12.5px; color: var(--text-dim); }
+    .c-row { height: 27px; display: grid; grid-template-columns: 148px 1fr 92px; gap: 16px; align-items: center; }
+    .c-cmd { font-size: 11.5px; color: var(--text-dim); }
     .sel .c-cmd { color: var(--text); }
-    .c-desc { font-size: 11.5px; color: var(--muted); }
-    .c-key { font-size: 11px; color: var(--faint); text-align: right; }
+    .c-desc { font-size: 10.5px; color: var(--muted); }
+    .c-key { font-size: 10px; color: var(--faint); text-align: right; }
     .sel .c-key { color: #bab6b6; }
     .c-row.stub .c-cmd, .c-row.stub .c-desc { opacity: 0.45; }
 
     /* directory rows */
-    .d-row { height: 32px; display: grid; grid-template-columns: 1fr 104px 168px; gap: 16px; align-items: center; }
-    .d-path { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+    .d-row { height: 29px; display: grid; grid-template-columns: 1fr 104px 168px; gap: 16px; align-items: center; }
+    .d-path { font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
     .d-path b { font-weight: 400; color: #eae7e7; }
     .sel .d-path { color: #9b9797; }
     .sel .d-path b { color: var(--text); }
     .d-kind { font-size: 10px; letter-spacing: 0.14em; color: #8d8a89; }
-    .d-meta { font-size: 11px; color: var(--muted); text-align: right; }
+    .d-meta { font-size: 10px; color: var(--muted); text-align: right; }
+
+    /* health rows */
+    .h-row { height: 29px; display: grid; grid-template-columns: 170px 1fr; gap: 16px; align-items: center; }
+    .h-label { font-size: 10px; letter-spacing: 0.14em; color: var(--faint); }
+    .h-value { font-size: 11.5px; color: var(--text-dim); }
 
     /* ---- status bar ---- */
     #statusbar {
@@ -408,7 +413,10 @@
       <span id="sb-wt"><span id="sb-wt-text"></span></span>
       <span id="sb-branch"><span class="b" id="sb-branch-text">-</span><span class="arrow">→</span><span id="sb-target-text">main</span></span>
       <div id="sb-right">
-        <span id="sb-cpu">0% cpu</span>
+        <span id="sb-cpu-wrap" style="display: flex; align-items: center; gap: 7px; color: #7d7979;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>
+          <span id="sb-cpu">0% cpu</span>
+        </span>
         <span class="sb-div"></span>
         <span class="keyhint" data-open="commands"><b>/</b><span>COMMANDS</span></span>
         <span class="keyhint" data-open="sessions"><b>⌘L</b><span>SESSIONS</span></span>
@@ -608,7 +616,6 @@
     ];
 
     async function openPanel(mode) {
-      if (mode === "health") mode = "healthstub";
       panel = { mode, sel: 0, query: "", items: [] };
       if (mode === "dir") {
         try { panel.items = await invoke("list_dirs"); } catch (e) { panel.items = []; }
@@ -646,7 +653,8 @@
     function panelRows() {
       if (!panel) return [];
       if (panel.mode === "sessions") {
-        return sessions.filter((s) => !panel.query || (s.prompt + s.label).toLowerCase().includes(panel.query.toLowerCase()));
+        return sessions.filter((s) => s.alive)
+          .filter((s) => !panel.query || (s.prompt + s.label).toLowerCase().includes(panel.query.toLowerCase()));
       }
       if (panel.mode === "commands") {
         return COMMANDS.filter((c) => !panel.query || c.cmd.includes(panel.query.toLowerCase()));
@@ -664,8 +672,8 @@
       const rows = panelRows();
       panel.sel = Math.max(0, Math.min(panel.sel, rows.length - 1));
       const head = $("panel-head"), body = $("panel-body"), foot = $("panel-foot");
-      const sigil = { sessions: ">", commands: "/", dir: "", healthstub: "⌘K" }[panel.mode] || ">";
-      const label = { sessions: "sessions", commands: "", dir: "", healthstub: "health" }[panel.mode] || "";
+      const sigil = { sessions: ">", commands: "/", dir: "", health: ">" }[panel.mode] || ">";
+      const label = { sessions: "sessions", commands: "", dir: "", health: "health" }[panel.mode] || "";
       const count = panel.mode === "commands" ? `${rows.length} COMMANDS`
         : panel.mode === "dir" ? `${rows.length} OF ${panel.items.length}`
         : panel.mode === "sessions" ? `${rows.length} SESSIONS` : "";
@@ -676,17 +684,31 @@
         <span class="count">${esc(count)}</span>`;
 
       let html = "";
-      if (panel.mode === "healthstub") {
-        html = `<div class="t-empty" style="padding: 40px 0;">health board — next phase</div>`;
+      if (panel.mode === "health") {
+        const alive = sessions.filter((s) => s.alive);
+        const adds = alive.reduce((n, s) => n + s.adds, 0);
+        const dels = alive.reduce((n, s) => n + s.dels, 0);
+        const stat = (label, value) =>
+          `<div class="p-row h-row"><span class="h-label">${label}</span><span class="h-value">${value}</span></div>`;
+        html =
+          stat("SESSIONS", `${alive.length} running · ${sessions.length - alive.length} ended`) +
+          stat("WORKING DIFF", `<span style="color: var(--adds);">+${adds}</span> <span style="color: var(--dels);">−${dels}</span>`) +
+          stat("CPU", `${$("sb-cpu").textContent}`) +
+          stat("TOKENS / CONTEXT", `<span style="color: var(--faint);">needs the headless driver — next phase</span>`) +
+          stat("TESTS / REVIEW", `<span style="color: var(--faint);">not wired yet</span>`);
       } else if (panel.mode === "sessions") {
         const groups = new Map();
         rows.forEach((s, i) => {
-          const g = (s.cwd || "").split("/").pop() || "sessions";
+          const g = s.repo || (s.cwd || "").split("/").pop() || "sessions";
           if (!groups.has(g)) groups.set(g, []);
           groups.get(g).push([s, i]);
         });
         for (const [g, list] of groups) {
-          html += `<div class="group-label"><span style="color: var(--prose); margin-right: 9px;">${esc(g)}</span>${list.length} session${list.length > 1 ? "s" : ""}</div>`;
+          html += `<div class="group-label" style="font-size: 10.5px; letter-spacing: 0.04em; gap: 9px; display: flex; align-items: center;">
+            <span style="color: var(--prose);">${esc(g)}</span>
+            <span style="width: 1px; height: 9px; background: rgba(248,244,244,0.14); display: block;"></span>
+            <span>${list.length} session${list.length > 1 ? "s" : ""}</span>
+          </div>`;
           for (const [s, i] of list) {
             html += `<div class="p-row s-row ${i === panel.sel ? "sel" : ""}" data-i="${i}">
               ${iconTile(s.provider)}
@@ -734,7 +756,7 @@
       const sel = body.querySelector(".p-row.sel");
       if (sel) sel.scrollIntoView({ block: "nearest" });
 
-      const action = { sessions: "SELECT", commands: "RUN", dir: "SET DIRECTORY", healthstub: "DISMISS" }[panel.mode];
+      const action = { sessions: "SELECT", commands: "RUN", dir: "SET DIRECTORY", health: "DISMISS" }[panel.mode] || "DISMISS";
       foot.innerHTML = `
         <span><b>J/K</b> NAVIGATE</span>
         <span><b>⏎</b> ${action}</span>
@@ -821,6 +843,9 @@
 
     // ---------------- keyboard ----------------
     window.addEventListener("keydown", (e) => {
+      try { handleKey(e); } catch (err) { panel = null; $("panel").classList.remove("open"); }
+    });
+    function handleKey(e) {
       const inInput = document.activeElement === $("composer");
       if (e.metaKey && e.key.toLowerCase() === "l") { e.preventDefault(); openPanel("sessions"); return; }
       if (e.metaKey && e.key.toLowerCase() === "k") { e.preventDefault(); openPanel("health"); return; }
@@ -847,7 +872,7 @@
       }
       if (e.key === "/") { e.preventDefault(); openPanel("commands"); return; }
       if (e.key === "Escape") { window.__TAURI__?.core.invoke("hide_overlay"); }
-    });
+    }
 
     // ---------------- boot ----------------
     async function boot() {

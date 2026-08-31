@@ -208,6 +208,28 @@ struct Session {
     dels: u32,
     #[serde(default)]
     branch: String,
+    #[serde(default)]
+    repo: String,
+}
+
+/// Repo name a directory belongs to: the directory holding the shared .git,
+/// so sessions in worktrees group under their repo.
+fn repo_name(cwd: &str) -> String {
+    let fallback = || {
+        PathBuf::from(cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    match git(cwd, &["rev-parse", "--git-common-dir"]) {
+        Some(dir) if dir != ".git" && !dir.is_empty() => PathBuf::from(dir)
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(fallback),
+        Some(_) => fallback(),
+        None => fallback(),
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -442,6 +464,7 @@ fn start_session(
 
     tmux(&["new-session", "-d", "-s", &name, "-c", &cwd, &cmd])?;
 
+    let repo = repo_name(&cwd);
     let session = Session {
         name: name.clone(),
         provider,
@@ -454,6 +477,7 @@ fn start_session(
         adds: 0,
         dels: 0,
         branch: String::new(),
+        repo,
     };
     let dir = sessions_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -486,6 +510,7 @@ fn list_sessions() -> Vec<Session> {
                     s.dels = dels;
                 }
                 s.branch = git(&s.cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+                s.repo = repo_name(&s.cwd);
                 Some(s)
             })
             .collect()
