@@ -53,6 +53,7 @@
     }
     #stage.masked { clip-path: inset(0 0 100% 0); transition: none; }
 
+    #frame { position: absolute; inset: 0; }
     #shell { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 
     #chrome {
@@ -370,8 +371,9 @@
 </head>
 <body>
   <div id="stage" class="masked">
+    <div id="frame">
     <svg id="shell" xmlns="http://www.w3.org/2000/svg">
-      <path id="hull" fill="rgba(16,15,14,0.985)" stroke="rgba(248,244,244,0.12)" stroke-width="1" />
+      <path id="hull" fill="rgba(16,15,14,0.985)" />
     </svg>
 
     <div id="chrome">
@@ -413,6 +415,7 @@
         <span class="keyhint" data-open="health"><b>⌘K</b><span>HEALTH</span></span>
       </div>
     </div>
+    </div>
   </div>
 
   <script>
@@ -431,7 +434,7 @@
     // ---------------- hull ----------------
     function draw() {
       const W = window.innerWidth, H = window.innerHeight;
-      const R = 24, rc = 12;
+      const R = 30, rc = 12;
       $("shell").setAttribute("viewBox", `0 0 ${W} ${H}`);
       let d;
       if (cutout && cutout.left > R + rc && cutout.right < W - R - rc) {
@@ -454,6 +457,9 @@
         d = `M ${R} 0 H ${W - R} A ${R} ${R} 0 0 1 ${W} ${R} V ${H - R} A ${R} ${R} 0 0 1 ${W - R} ${H} H ${R} A ${R} ${R} 0 0 1 0 ${H - R} V ${R} A ${R} ${R} 0 0 1 ${R} 0 Z`;
       }
       $("hull").setAttribute("d", d);
+      // Clip the whole frame to the hull, so the status bar and panels take
+      // the rounded corners instead of overflowing them.
+      $("frame").style.clipPath = `path("${d}")`;
       $("topbar").style.paddingTop = (cutout ? Math.max(20, cutout.depth - 18) : 20) + "px";
     }
 
