@@ -236,6 +236,8 @@ fn repo_name(cwd: &str) -> String {
 struct Peek {
     session: Session,
     blocks: Vec<String>,
+    /// True while the pane shows the CLI's working spinner.
+    thinking: bool,
 }
 
 fn sessions_dir() -> PathBuf {
@@ -528,13 +530,17 @@ fn peek_session(name: String) -> Result<Peek, String> {
     let raw = fs::read(sessions_dir().join(format!("{name}.json"))).map_err(|e| e.to_string())?;
     let mut session: Session = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
     session.alive = live_sessions().contains(&name);
-    let blocks = if session.alive {
+    let (blocks, thinking) = if session.alive {
         let text = tmux(&["capture-pane", "-p", "-t", &name, "-S", "-400"]).unwrap_or_default();
-        parse_blocks(&text)
+        (parse_blocks(&text), is_thinking(&text))
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
-    Ok(Peek { session, blocks })
+    Ok(Peek {
+        session,
+        blocks,
+        thinking,
+    })
 }
 
 #[tauri::command]
@@ -562,6 +568,83 @@ fn kill_session(name: String) -> Result<(), String> {
         return Err("invalid session name".into());
     }
     tmux(&["kill-session", "-t", &name]).map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// GitHub identity
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct GithubUser {
+    login: String,
+    name: String,
+    avatar_url: String,
+}
+
+fn auth_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".hypervisor").join("auth.json")
+}
+
+/// The signed-in user, if any. Identity is app-level: a file we wrote at
+/// sign-in, so signing out forgets it without touching gh's credentials.
+#[tauri::command]
+fn auth_user() -> Option<GithubUser> {
+    let raw = fs::read(auth_path()).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// Sign in by borrowing the gh CLI's identity: `gh api user` answers as the
+/// authenticated account. A missing or signed-out gh is a readable error the
+/// sign-in modal shows verbatim.
+#[tauri::command]
+fn sign_in() -> Result<GithubUser, String> {
+    let out = Command::new("gh")
+        .args(["api", "user"])
+        .output()
+        .map_err(|_| "GitHub CLI not found — brew install gh, then gh auth login".to_string())?;
+    if !out.status.success() {
+        return Err("gh is signed out — run `gh auth login` in a terminal, then retry".into());
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("gh api user: {e}"))?;
+    let field = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let user = GithubUser {
+        login: field("login"),
+        name: field("name"),
+        avatar_url: field("avatar_url"),
+    };
+    if user.login.is_empty() {
+        return Err("gh answered without a user".into());
+    }
+    let path = auth_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_vec(&user).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(user)
+}
+
+#[tauri::command]
+fn sign_out() -> Result<(), String> {
+    match fs::remove_file(auth_path()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// A live pane is thinking while the CLI shows its working spinner, and the
+/// spinner line is the only one that carries the interrupt hint ("✻ Brewing…
+/// (esc to interrupt)"). The done line drops the hint, so a finished exchange
+/// reads as idle. Only the tail matters: an old hint scrolled up the pane is
+/// history, not state.
+fn is_thinking(text: &str) -> bool {
+    text.lines()
+        .rev()
+        .take(30)
+        .any(|l| l.to_ascii_lowercase().contains("esc to interrupt"))
 }
 
 /// Slice a captured pane into per-exchange blocks (a "> …" prompt line plus
@@ -633,7 +716,7 @@ fn parse_blocks(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_blocks;
+    use super::{is_thinking, parse_blocks};
 
     // Verbatim capture of a real `claude` pane from the smoke test.
     const PANE: &str = "\
@@ -664,6 +747,28 @@ mod tests {
         }
         // The bare trailing input prompt must not become its own block.
         assert!(blocks.iter().all(|b| b.trim() != "❯"));
+    }
+
+    #[test]
+    fn finished_pane_is_not_thinking() {
+        // PANE ends on the done line ("✻ Brewed for 1s · done"), no hint.
+        assert!(!is_thinking(PANE));
+    }
+
+    #[test]
+    fn spinner_pane_is_thinking() {
+        let pane = PANE.replace(
+            "✻ Brewed for 1s · done 8:32 PM",
+            "✻ Brewing… (esc to interrupt)",
+        );
+        assert!(is_thinking(&pane));
+    }
+
+    #[test]
+    fn scrolled_off_hint_is_history_not_state() {
+        let mut pane = String::from("✻ Brewing… (esc to interrupt)\n");
+        pane.push_str(&"⏺ output line\n".repeat(40));
+        assert!(!is_thinking(&pane));
     }
 
     #[test]
@@ -703,7 +808,10 @@ fn main() {
             kill_session,
             status_info,
             list_dirs,
-            set_cwd
+            set_cwd,
+            auth_user,
+            sign_in,
+            sign_out
         ])
         .setup(|app| {
             // Overlay, not an app: no Dock icon, no Cmd-Tab entry.

@@ -116,11 +116,11 @@
     #matrix span { width: 3px; height: 3px; border-radius: 50%; display: block; }
     @keyframes mtxdot { 0%, 100% { opacity: 0.16; } 45% { opacity: 1; } }
 
+    #avatar-wrap { position: relative; flex: none; }
     #avatar {
       width: 30px;
       height: 30px;
       border-radius: 50%;
-      flex: none;
       display: grid;
       place-items: center;
       background: #2b2927;
@@ -129,7 +129,67 @@
       font-size: 11px;
       color: var(--text-dim);
       letter-spacing: 0.05em;
+      cursor: pointer;
+      overflow: hidden;
     }
+    #avatar:hover { box-shadow: inset 0 0 0 1px rgba(248, 244, 244, 0.4); }
+    #avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    #avatar-menu {
+      position: absolute;
+      top: 37px;
+      right: 0;
+      display: none;
+      min-width: 190px;
+      padding: 5px;
+      background: var(--panel);
+      border: 1px solid var(--line-strong);
+      border-radius: 9px;
+      box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45);
+      z-index: 70;
+      font-family: var(--mono);
+    }
+    .am-user { padding: 7px 10px 5px; font-size: 9.5px; letter-spacing: 0.06em; color: var(--muted); white-space: nowrap; }
+    .am-user b { color: var(--text-dim); font-weight: 400; }
+    .am-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 6px; font-size: 11px; color: var(--text-dim); cursor: pointer; white-space: nowrap; }
+    .am-row:hover { background: var(--panel-active); color: var(--text); }
+
+    /* ---- sign-in lock ---- */
+    #lock {
+      position: absolute;
+      inset: 0;
+      z-index: 60;
+      display: none;
+      place-items: center;
+      background: var(--bg);
+    }
+    #lock.on { display: grid; }
+    #lock-card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 13px;
+    }
+    #lock-logo { font-family: "Xer0", var(--sans); font-size: 14px; letter-spacing: 0.2em; color: var(--text-dim); }
+    #lock-sub { font-family: var(--mono); font-size: 10px; letter-spacing: 0.16em; color: var(--muted); }
+    #lock-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      margin-top: 8px;
+      width: 300px;
+      padding: 12px 0;
+      border: 0;
+      border-radius: 0;
+      background: #fff;
+      color: #10100f;
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #lock-btn:hover { background: #ece9e9; }
+    #lock-err { min-height: 14px; max-width: 340px; font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--dels); text-align: center; }
 
     .icon-tile {
       width: 15px;
@@ -425,8 +485,11 @@
         <span id="logo" data-tauri-drag-region>HYPERVISOR</span>
         <div id="ticker"><div id="ticker-track"></div></div>
         <div style="flex: 1;" data-tauri-drag-region></div>
-        <div id="matrix" title="session strength"></div>
-        <div id="avatar">JL</div>
+        <div id="matrix"></div>
+        <div id="avatar-wrap">
+          <div id="avatar"></div>
+          <div id="avatar-menu"></div>
+        </div>
       </div>
 
       <div id="transcript"><div class="t-empty">no session focused — ⌘L</div></div>
@@ -473,6 +536,18 @@
         <span class="keyhint" data-open="commands"><b>/</b><span>COMMANDS</span></span>
         <span class="keyhint" data-open="sessions"><b>⌘L</b><span>SESSIONS</span></span>
         <span class="keyhint" data-open="health"><b>⌘K</b><span>HEALTH</span></span>
+      </div>
+    </div>
+
+    <div id="lock">
+      <div id="lock-card">
+        <div id="lock-logo">HYPERVISOR</div>
+        <div id="lock-sub">SIGN IN TO CONTINUE</div>
+        <button id="lock-btn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="#10100f" xmlns="http://www.w3.org/2000/svg"><path d="M12 0C5.37 0 0 5.373 0 12c0 5.303 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.09-.745.082-.73.082-.73 1.205.085 1.838 1.238 1.838 1.238 1.07 1.834 2.807 1.304 3.492.997.108-.775.418-1.305.762-1.605-2.665-.305-5.467-1.334-5.467-5.93 0-1.31.468-2.382 1.235-3.22-.123-.304-.535-1.524.117-3.176 0 0 1.008-.322 3.3 1.23.957-.266 1.983-.4 3.003-.404 1.02.005 2.047.138 3.006.404 2.29-1.552 3.297-1.23 3.297-1.23.653 1.653.24 2.873.118 3.176.77.838 1.233 1.91 1.233 3.22 0 4.61-2.807 5.624-5.48 5.92.43.372.814 1.103.814 2.223 0 1.606-.015 2.898-.015 3.293 0 .32.216.694.825.576C20.565 21.796 24 17.3 24 12c0-6.627-5.373-12-12-12z"/></svg>
+          Sign in with GitHub
+        </button>
+        <div id="lock-err"></div>
       </div>
     </div>
     </div>
@@ -583,19 +658,54 @@
       return '<span class="icon-tile icon-other" style="font-size: 10px;">▲</span>';
     }
 
+    // The matrix is an instrument, not decoration. Motion means the focused
+    // session is thinking right now; color is the verdict on its change — the
+    // unit tests and gx review — once those are wired. With no verdict it
+    // sits still and grey.
+    const matrixState = { thinking: false, verdict: null }; // verdict: null | "pass" | "fail"
+
+    function matrixPalette() {
+      if (matrixState.verdict === "pass") return [[0x26, 0xf0, 0x98], [0x26, 0xf0, 0x98]];
+      if (matrixState.verdict === "fail") return [[0xdd, 0x5f, 0x52], [0xdd, 0x5f, 0x52]];
+      return [[0x6a, 0x66, 0x66], [0x6a, 0x66, 0x66]];
+    }
+
     function buildMatrix() {
-      const from = [0xe8, 0xc8, 0x4a], to = [0x26, 0xf0, 0x98];
       let html = "";
-      for (let row = 0; row < 3; row++) {
-        for (let col = 0; col < 24; col++) {
-          const t = col / 23;
-          const c = from.map((f, i) => Math.round(f + (to[i] - f) * t));
-          const dur = (1.1 + Math.random() * 1.3).toFixed(2);
-          const delay = (Math.random() * 2.2).toFixed(2);
-          html += `<span style="background: rgb(${c.join(",")}); animation: mtxdot ${dur}s ease-in-out ${delay}s infinite;"></span>`;
-        }
+      for (let i = 0; i < 3 * 24; i++) {
+        const dur = (1.1 + Math.random() * 1.3).toFixed(2);
+        const delay = (Math.random() * 2.2).toFixed(2);
+        html += `<span data-dur="${dur}" data-delay="${delay}"></span>`;
       }
       $("matrix").innerHTML = html;
+      renderMatrix();
+    }
+
+    function renderMatrix() {
+      const [from, to] = matrixPalette();
+      const dots = $("matrix").children;
+      for (let i = 0; i < dots.length; i++) {
+        const t = (i % 24) / 23;
+        const c = from.map((f, ci) => Math.round(f + (to[ci] - f) * t));
+        const d = dots[i];
+        d.style.background = `rgb(${c.join(",")})`;
+        if (matrixState.thinking) {
+          d.style.animation = `mtxdot ${d.dataset.dur}s ease-in-out ${d.dataset.delay}s infinite`;
+          d.style.opacity = "";
+        } else {
+          d.style.animation = "none";
+          d.style.opacity = "0.22";
+        }
+      }
+      $("matrix").title = (matrixState.thinking ? "thinking" : "idle")
+        + " · " + (matrixState.verdict ? `checks ${matrixState.verdict}` : "tests & review not wired");
+    }
+
+    function setMatrix(patch) {
+      const next = { ...matrixState, ...patch };
+      if (next.thinking === matrixState.thinking && next.verdict === matrixState.verdict) return;
+      Object.assign(matrixState, next);
+      renderMatrix();
     }
 
     let tickerKey = "";
@@ -861,6 +971,65 @@
       }
     }
 
+    // ---------------- github identity ----------------
+    // The app is locked until someone signs in: the lock overlay greys the
+    // whole frame out and the only live control is the GitHub button. The
+    // avatar mirrors the account and drops down to sign in/out.
+    let user = null;
+    let avatarMenuOpen = false;
+
+    function renderAuth() {
+      const av = $("avatar");
+      if (user && user.avatar_url) {
+        av.innerHTML = `<img src="${esc(user.avatar_url)}" alt="${esc(user.login)}" />`;
+      } else {
+        av.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7a7676" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+      }
+      $("lock").classList.toggle("on", !user);
+      if (!user) { avatarMenuOpen = false; closePanel(); }
+      renderAvatarMenu();
+    }
+
+    function renderAvatarMenu() {
+      const m = $("avatar-menu");
+      if (!avatarMenuOpen) { m.style.display = "none"; return; }
+      m.style.display = "block";
+      m.innerHTML = user
+        ? `<div class="am-user">signed in as <b>${esc(user.login)}</b></div>
+           <div class="am-row" data-act="signout">Sign out</div>`
+        : `<div class="am-row" data-act="signin">Sign in with GitHub</div>`;
+      m.querySelectorAll(".am-row").forEach((el) => {
+        el.addEventListener("click", (e) => {
+          e.stopPropagation();
+          avatarMenuOpen = false;
+          renderAvatarMenu();
+          if (el.dataset.act === "signout") signOut(); else signIn();
+        });
+      });
+    }
+
+    async function refreshAuth() {
+      try { user = await invoke("auth_user"); } catch (e) { user = null; }
+      renderAuth();
+    }
+
+    async function signIn() {
+      $("lock-err").textContent = "";
+      try {
+        user = await invoke("sign_in");
+      } catch (e) {
+        $("lock-err").textContent = String(e);
+        return;
+      }
+      renderAuth();
+    }
+
+    async function signOut() {
+      try { await invoke("sign_out"); } catch (e) {}
+      user = null;
+      renderAuth();
+    }
+
     // ---------------- data refresh ----------------
     async function refreshSessions() {
       try { sessions = await invoke("list_sessions"); } catch (e) { return; }
@@ -872,9 +1041,10 @@
     }
 
     async function refreshDetail() {
-      if (!focused) { renderTranscript(null); return; }
+      if (!focused) { setMatrix({ thinking: false }); renderTranscript(null); return; }
       let peek;
       try { peek = await invoke("peek_session", { name: focused }); } catch (e) { return; }
+      setMatrix({ thinking: !!(peek.session.alive && peek.thinking) });
       renderTranscript(peek);
     }
 
@@ -925,6 +1095,11 @@
       try { handleKey(e); } catch (err) { panel = null; $("panel").classList.remove("open"); }
     });
     function handleKey(e) {
+      // Locked: nothing works but hiding the overlay.
+      if (!user) {
+        if (e.key === "Escape") window.__TAURI__?.core.invoke("hide_overlay");
+        return;
+      }
       const inInput = document.activeElement === $("composer");
       if (e.metaKey && e.key.toLowerCase() === "l") { e.preventDefault(); openPanel("sessions"); return; }
       if (e.metaKey && e.key.toLowerCase() === "k") { e.preventDefault(); openPanel("health"); return; }
@@ -958,6 +1133,16 @@
       buildMatrix();
       try { cutout = await invoke("geometry"); } catch (e) { cutout = null; }
       draw();
+      await refreshAuth();
+      $("lock-btn").addEventListener("click", signIn);
+      $("avatar").addEventListener("click", (e) => {
+        e.stopPropagation();
+        avatarMenuOpen = !avatarMenuOpen;
+        renderAvatarMenu();
+      });
+      document.addEventListener("click", () => {
+        if (avatarMenuOpen) { avatarMenuOpen = false; renderAvatarMenu(); }
+      });
       $("sb-cwd").addEventListener("click", () => openPanel("dir"));
       $("chip-cwd").addEventListener("click", () => openPanel("dir"));
       $("chip-model").addEventListener("click", () => { modelIdx = (modelIdx + 1) % MODELS.length; renderModelChip(); });
