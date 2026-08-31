@@ -756,8 +756,10 @@
         : panel.mode === "sessions" ? `${rows.length} SESSIONS` : "";
       head.innerHTML = `
         <span class="sigil">${esc(sigil)}</span>
-        <span class="query">${esc(label ? label : panel.query)}${label && panel.query ? " " + esc(panel.query) : ""}</span>
-        <span class="vimcaret"></span>
+        <span style="display: flex; align-items: center;">
+          <span class="query">${esc(label ? label : panel.query)}${label && panel.query ? " " + esc(panel.query) : ""}</span>
+          <span class="vimcaret"></span>
+        </span>
         <span class="count">${esc(count)}</span>`;
 
       let html = "";
