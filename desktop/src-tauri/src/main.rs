@@ -13,7 +13,7 @@ use tauri::Emitter;
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager};
 use tauri_plugin_global_shortcut::ShortcutState;
 
-const MARGIN: f64 = 8.0;
+const MARGIN: f64 = 14.0;
 const TOGGLE_SHORTCUT: &str = "cmd+shift+space";
 
 // ---------------------------------------------------------------------------
@@ -199,7 +199,15 @@ struct Session {
     prompt: String,
     created_at: u64,
     #[serde(default)]
+    cwd: String,
+    #[serde(default)]
     alive: bool,
+    #[serde(default)]
+    adds: u32,
+    #[serde(default)]
+    dels: u32,
+    #[serde(default)]
+    branch: String,
 }
 
 #[derive(serde::Serialize)]
@@ -240,6 +248,171 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+fn git(cwd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn tilde(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && path.starts_with(&home) {
+        format!("~{}", &path[home.len()..])
+    } else {
+        path.to_string()
+    }
+}
+
+/// The default working directory for new sessions and the status bar,
+/// settable from the /cd panel.
+static DEFAULT_CWD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn default_cwd() -> String {
+    if let Some(c) = DEFAULT_CWD.lock().unwrap().clone() {
+        return c;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let repo = format!("{home}/git/hv");
+    if PathBuf::from(&repo).is_dir() {
+        repo
+    } else {
+        home
+    }
+}
+
+#[tauri::command]
+fn set_cwd(path: String) -> Result<(), String> {
+    if !PathBuf::from(&path).is_dir() {
+        return Err("not a directory".into());
+    }
+    *DEFAULT_CWD.lock().unwrap() = Some(path);
+    Ok(())
+}
+
+fn diffstat(cwd: &str) -> (u32, u32) {
+    let Some(out) = git(cwd, &["diff", "--numstat", "HEAD"]) else {
+        return (0, 0);
+    };
+    let mut adds = 0u32;
+    let mut dels = 0u32;
+    for line in out.lines() {
+        let mut cols = line.split_whitespace();
+        adds += cols.next().and_then(|c| c.parse::<u32>().ok()).unwrap_or(0);
+        dels += cols.next().and_then(|c| c.parse::<u32>().ok()).unwrap_or(0);
+    }
+    (adds, dels)
+}
+
+#[derive(serde::Serialize)]
+struct StatusInfo {
+    cwd: String,
+    branch: String,
+    target: String,
+    worktree: Option<String>,
+    cpu: u32,
+}
+
+#[tauri::command]
+fn status_info(cwd: Option<String>) -> StatusInfo {
+    let cwd = cwd.filter(|c| !c.is_empty()).unwrap_or_else(default_cwd);
+    let branch = git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "-".into());
+    let git_dir = git(&cwd, &["rev-parse", "--absolute-git-dir"]);
+    let common = git(&cwd, &["rev-parse", "--git-common-dir"]);
+    let worktree = match (&git_dir, &common) {
+        (Some(g), Some(c)) if g != c && !c.is_empty() => PathBuf::from(&cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned()),
+        _ => None,
+    };
+    let cpu = Command::new("sh")
+        .arg("-c")
+        .arg("ps -A -o %cpu= | awk -v n=$(sysctl -n hw.ncpu) '{s+=$1} END {printf \"%d\", s/n}'")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    StatusInfo {
+        cwd: tilde(&cwd),
+        branch,
+        target: "main".into(),
+        worktree,
+        cpu,
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DirEntry {
+    path: String,
+    display: String,
+    kind: String, // "current" | "worktree" | ""
+    files: u32,
+    modified: u64,
+}
+
+#[tauri::command]
+fn list_dirs() -> Vec<DirEntry> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let current = default_cwd();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    let push = |path: String, kind: &str, out: &mut Vec<DirEntry>, seen: &mut HashSet<String>| {
+        if !seen.insert(path.clone()) {
+            return;
+        }
+        let Ok(meta) = fs::metadata(&path) else { return };
+        let files = fs::read_dir(&path).map(|rd| rd.count() as u32).unwrap_or(0);
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push(DirEntry {
+            display: tilde(&path),
+            path,
+            kind: kind.into(),
+            files,
+            modified,
+        });
+    };
+
+    push(current.clone(), "current", &mut out, &mut seen);
+    // Worktrees of the current repo.
+    if let Some(list) = git(&current, &["worktree", "list", "--porcelain"]) {
+        for line in list.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                let kind = if p == current { "current" } else { "worktree" };
+                push(p.to_string(), kind, &mut out, &mut seen);
+            }
+        }
+    }
+    // One level under ~/git.
+    if let Ok(rd) = fs::read_dir(format!("{home}/git")) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                push(p.to_string_lossy().into_owned(), "", &mut out, &mut seen);
+            }
+        }
+    }
+    // Session directories.
+    for s in list_sessions() {
+        if !s.cwd.is_empty() {
+            push(s.cwd, "", &mut out, &mut seen);
+        }
+    }
+    out
+}
+
 #[tauri::command]
 fn start_session(
     provider: String,
@@ -265,12 +438,7 @@ fn start_session(
     // this app's PATH (nvm, homebrew, …) into the session explicitly.
     let path = std::env::var("PATH").unwrap_or_default();
     let cmd = format!("export PATH={}; exec {agent_cmd}", shq(&path));
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
-    // Agent CLIs gate untrusted directories behind an interactive prompt the
-    // overlay can't answer, so sessions start in the (trusted) hv repo until
-    // there's a real working-directory picker.
-    let repo = format!("{home}/git/hv");
-    let cwd = if PathBuf::from(&repo).is_dir() { repo } else { home };
+    let cwd = default_cwd();
 
     tmux(&["new-session", "-d", "-s", &name, "-c", &cwd, &cmd])?;
 
@@ -281,7 +449,11 @@ fn start_session(
         label,
         prompt,
         created_at: created,
+        cwd,
         alive: true,
+        adds: 0,
+        dels: 0,
+        branch: String::new(),
     };
     let dir = sessions_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -305,6 +477,15 @@ fn list_sessions() -> Vec<Session> {
                 }
                 let mut s: Session = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
                 s.alive = live.contains(&s.name);
+                if s.cwd.is_empty() {
+                    s.cwd = default_cwd();
+                }
+                if s.alive {
+                    let (adds, dels) = diffstat(&s.cwd);
+                    s.adds = adds;
+                    s.dels = dels;
+                }
+                s.branch = git(&s.cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
                 Some(s)
             })
             .collect()
@@ -494,7 +675,10 @@ fn main() {
             list_sessions,
             peek_session,
             send_prompt,
-            kill_session
+            kill_session,
+            status_info,
+            list_dirs,
+            set_cwd
         ])
         .setup(|app| {
             // Overlay, not an app: no Dock icon, no Cmd-Tab entry.
