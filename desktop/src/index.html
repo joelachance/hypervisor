@@ -673,7 +673,7 @@
       panel.sel = Math.max(0, Math.min(panel.sel, rows.length - 1));
       const head = $("panel-head"), body = $("panel-body"), foot = $("panel-foot");
       const sigil = { sessions: ">", commands: "/", dir: "", health: ">" }[panel.mode] || ">";
-      const label = { sessions: "sessions", commands: "", dir: "", health: "health" }[panel.mode] || "";
+      const label = { sessions: "", commands: "", dir: "", health: "health" }[panel.mode] || "";
       const count = panel.mode === "commands" ? `${rows.length} COMMANDS`
         : panel.mode === "dir" ? `${rows.length} OF ${panel.items.length}`
         : panel.mode === "sessions" ? `${rows.length} SESSIONS` : "";
