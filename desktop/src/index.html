@@ -429,7 +429,7 @@
         <div id="avatar">JL</div>
       </div>
 
-      <div id="transcript"><div class="t-empty">no session focused — ⌘L</div></div>
+      <div id="transcript"><div class="t-empty">no session focused</div></div>
       <div style="flex: none; height: 158px;"></div>
     </div>
 
@@ -654,7 +654,7 @@
     function renderTranscript(peek) {
       const el = $("transcript");
       if (!peek || !peek.blocks.length) {
-        const msg = !focused ? "no session focused — ⌘L"
+        const msg = !focused ? "no session focused"
           : (peek && !peek.session.alive ? "session ended" : "waiting for output…");
         el.innerHTML = `<div class="t-empty">${msg}</div>`;
         transcriptKey = "";
@@ -888,7 +888,7 @@
       $("chip-cwd-text").textContent = info.cwd;
       $("sb-branch-text").textContent = info.branch;
       $("sb-target-text").textContent = info.target;
-      $("sb-cpu").textContent = info.cpu + "% cpu";
+      $("sb-cpu").textContent = info.cpu + "%";
       const wt = $("sb-wt");
       if (info.worktree) {
         $("sb-wt-text").textContent = "wt/" + info.worktree.slice(0, 12);
