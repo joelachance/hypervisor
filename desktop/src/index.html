@@ -565,10 +565,22 @@
     });
 
     // ---------------- top bar ----------------
+    // Claude starburst: rays from near-center, drawn inline so it stays
+    // sharp at any tile size.
+    const CLAUDE_MARK = (() => {
+      const rays = [];
+      for (let i = 0; i < 9; i++) {
+        const a = ((i * 40 - 90) * Math.PI) / 180;
+        const r = i % 2 ? 8.4 : 10;
+        rays.push(`<line x1="${(12 + Math.cos(a) * 2.2).toFixed(2)}" y1="${(12 + Math.sin(a) * 2.2).toFixed(2)}" x2="${(12 + Math.cos(a) * r).toFixed(2)}" y2="${(12 + Math.sin(a) * r).toFixed(2)}"/>`);
+      }
+      return `<svg viewBox="0 0 24 24" width="11" height="11"><g stroke="#fff" stroke-width="2.5" stroke-linecap="round">${rays.join("")}</g></svg>`;
+    })();
+
     function iconTile(provider) {
-      if (provider === "anthropic") return '<span class="icon-tile icon-anthropic">✳</span>';
-      if (provider === "openai") return '<span class="icon-tile icon-openai">◎</span>';
-      return '<span class="icon-tile icon-other">▲</span>';
+      if (provider === "anthropic") return `<span class="icon-tile icon-anthropic">${CLAUDE_MARK}</span>`;
+      if (provider === "openai") return '<span class="icon-tile icon-openai" style="font-size: 11px;">◎</span>';
+      return '<span class="icon-tile icon-other" style="font-size: 10px;">▲</span>';
     }
 
     function buildMatrix() {
