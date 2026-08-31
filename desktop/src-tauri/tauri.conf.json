@@ -17,6 +17,7 @@
         "height": 480,
         "decorations": false,
         "transparent": true,
+        "shadow": false,
         "visible": false
       }
     ],
