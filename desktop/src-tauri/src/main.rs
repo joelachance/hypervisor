@@ -601,63 +601,107 @@ fn kill_session(name: String) -> Result<(), String> {
     tmux(&["kill-session", "-t", &name]).map(|_| ())
 }
 
-/// Slice a captured pane into per-exchange blocks (a "> …" prompt line plus
-/// the response that follows it) and keep the last three.
-fn parse_blocks(text: &str) -> Vec<String> {
-    let mut lines: Vec<&str> = text.lines().collect();
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
+/// True for a line that is Claude/agent TUI chrome, not transcript content:
+/// the startup banner (block/braille art, version and model lines), the
+/// spinner/status line, the input hints, and rule separators.
+fn is_chrome(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false; // blank lines are handled by segmentation, not dropped here
     }
-    // Drop the TUI's input box if it's the trailing element of the pane.
-    if let Some(idx) = lines.iter().rposition(|l| l.trim_start().starts_with('╭')) {
-        if lines.len() - idx <= 6 {
-            lines.truncate(idx);
+    // Bare input prompt (the empty box), no text after the marker.
+    if matches!(t, "❯" | ">" | "›") {
+        return true;
+    }
+    // Rule separators around the input box.
+    if t.chars().all(|c| matches!(c, '─' | '━' | '═' | '-')) && t.chars().count() > 3 {
+        return true;
+    }
+    // Startup banner art (block-drawing / braille glyphs). The version, model
+    // and cwd lines each carry these glyphs, so this clears the whole banner.
+    if t.chars()
+        .any(|c| matches!(c, '\u{2580}'..='\u{259F}' | '\u{2800}'..='\u{28FF}'))
+    {
+        return true;
+    }
+    let markers = [
+        "Claude Code v",
+        "· Claude",
+        "Claude Max",
+        "Claude Pro",
+        "Updated to latest",
+        "code.claude.com",
+        "? for shortcuts",
+        "esc to interrupt",
+        "shift+tab to cycle",
+        "-- INSERT --",
+        "-- NORMAL --",
+        "auto mode on",
+        "for agents",
+    ];
+    if markers.iter().any(|m| t.contains(m)) {
+        return true;
+    }
+    // Spinner / status line: "✻ Cooked for 3s · done 10:52 PM".
+    t.starts_with('✻') || t.starts_with("● ")
+}
+
+/// Is this a user-prompt line ("> …", "❯ …", "› …")? Requires text after the
+/// marker so a bare trailing input prompt is not treated as one.
+fn prompt_text(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    for marker in ["> ", "❯ ", "› "] {
+        if let Some(rest) = t.strip_prefix(marker) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(rest);
+            }
         }
     }
-    let cleaned: Vec<&str> = lines
-        .into_iter()
-        .filter(|l| {
-            let t = l.trim();
-            if t.is_empty() {
-                return true;
-            }
-            // Horizontal-rule separators between the transcript and input box.
-            if t.chars().all(|c| matches!(c, '─' | '━' | '═')) {
-                return false;
-            }
-            !(t.contains("? for shortcuts")
-                || t.contains("esc to interrupt")
-                || t.contains("shift+tab to cycle")
-                || t.contains("-- INSERT --")
-                || t.contains("-- NORMAL --")
-                || t.starts_with("● "))
-        })
+    None
+}
+
+/// Slice a captured pane into per-exchange blocks (a user prompt line plus the
+/// response that follows it) and keep the last three. Everything before the
+/// first prompt (the startup banner) is discarded.
+fn parse_blocks(text: &str) -> Vec<String> {
+    let cleaned: Vec<&str> = text
+        .lines()
+        .filter(|l| !is_chrome(l))
         .collect();
 
     let mut blocks: Vec<Vec<&str>> = Vec::new();
     let mut cur: Vec<&str> = Vec::new();
-    for l in cleaned {
-        let t = l.trim_start();
-        if t.starts_with("> ") || t.starts_with("❯ ") || t.starts_with("› ") {
-            if !cur.is_empty() {
-                blocks.push(std::mem::take(&mut cur));
-            }
+    for &l in &cleaned {
+        let is_prompt = prompt_text(l).is_some();
+        if is_prompt && !cur.is_empty() {
+            blocks.push(std::mem::take(&mut cur));
         }
-        cur.push(l);
+        // Only start collecting once we've seen the first real prompt, so the
+        // banner and any pre-prompt noise never become a block.
+        if is_prompt || !cur.is_empty() || !blocks.is_empty() {
+            cur.push(l);
+        }
     }
     if !cur.is_empty() {
         blocks.push(cur);
+    }
+    // No prompt was ever seen (non-claude CLI, or output-only): fall back to
+    // the tail of the cleaned lines so the transcript isn't blank.
+    if blocks.is_empty() {
+        let non_empty: Vec<&str> = cleaned.iter().copied().filter(|l| !l.trim().is_empty()).collect();
+        if !non_empty.is_empty() {
+            blocks.push(non_empty);
+        }
     }
 
     let mut out: Vec<String> = blocks
         .into_iter()
         .map(|b| {
-            // An unsegmented pane comes through as one giant block; cap it.
             let tail: Vec<&str> = b.iter().rev().take(40).rev().copied().collect();
-            tail.join("\n").trim_matches('\n').to_string()
+            tail.join("\n").trim_matches(|c| c == '\n' || c == ' ').to_string()
         })
         .filter(|b| {
-            // Drop empty blocks and the TUI's bare input prompt.
             let t = b.trim();
             !t.is_empty() && t != "❯" && t != ">" && t != "›"
         })
@@ -701,6 +745,33 @@ mod tests {
         }
         // The bare trailing input prompt must not become its own block.
         assert!(blocks.iter().all(|b| b.trim() != "❯"));
+    }
+
+    // The exact pane the app captured live (banner + spinner + trailing prompt).
+    const LIVE_PANE: &str = "\
+ ▐▛███▛█   Claude Code v2.1.252
+▝▜██████▀  Sonnet 5 · Claude Max
+  ▝▝ ▝▝    ~/git/hv
+❯ Reply with exactly HV_LIVE_OK
+⏺ HV_LIVE_OK
+✻ Cooked for 3s · done 10:52 PM
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents         /rc
+";
+
+    #[test]
+    fn strips_all_claude_chrome() {
+        let blocks = parse_blocks(LIVE_PANE);
+        assert_eq!(blocks.len(), 1, "should be exactly one exchange: {blocks:?}");
+        let b = &blocks[0];
+        // Only the prompt and the response survive.
+        assert_eq!(b, "❯ Reply with exactly HV_LIVE_OK\n⏺ HV_LIVE_OK");
+        // No banner, model line, cwd echo, spinner, or box art anywhere.
+        for needle in ["Claude Code", "Claude Max", "Sonnet", "git/hv", "✻", "Cooked", "▐", "▜", "──", "INSERT"] {
+            assert!(!b.contains(needle), "chrome leaked ({needle}): {b:?}");
+        }
     }
 
     #[test]
