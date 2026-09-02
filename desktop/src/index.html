@@ -492,7 +492,13 @@
     let cutout = null;
     let sessions = [];
     let focused = null;      // session name
+    let focusedAt = 0;       // when it was focused, for the start-up grace window
     let panel = null;        // null | {mode, sel, query, items}
+
+    function setFocused(name) {
+      focused = name;
+      focusedAt = Date.now();
+    }
 
     const MODELS = [
       { provider: "anthropic", model: "sonnet", label: "CLAUDE SONNET", display: "claude-sonnet" },
@@ -657,8 +663,11 @@
     function renderTranscript(peek) {
       const el = $("transcript");
       if (!peek || !peek.blocks.length) {
+        const gone = peek && !peek.session.alive && !peek.session.done;
+        const fresh = Date.now() - focusedAt < 4000;
         const msg = !focused ? "no session focused"
-          : (peek && !peek.session.alive && !peek.session.done ? "session gone — its tmux pane no longer exists" : "waiting for output…");
+          : (gone ? (fresh ? "starting…" : "session gone — its tmux pane no longer exists")
+                  : "waiting for output…");
         el.innerHTML = `<div class="t-empty">${msg}</div>`;
         transcriptKey = "";
         return;
@@ -853,7 +862,7 @@
       const row = rows[panel.sel];
       if (!row) return;
       if (panel.mode === "sessions") {
-        focused = row.name;
+        setFocused(row.name);
         closePanel();
         refreshDetail();
       } else if (panel.mode === "commands") {
@@ -872,7 +881,7 @@
       try { sessions = await invoke("list_sessions"); } catch (e) { return; }
       if (!focused) {
         const first = sessions.find((s) => s.alive) || sessions.find((s) => s.done);
-        if (first) { focused = first.name; refreshDetail(); }
+        if (first) { setFocused(first.name); refreshDetail(); }
       }
       if (panel && panel.mode === "sessions") renderPanel();
     }
@@ -903,6 +912,15 @@
     }
 
     // ---------------- composer ----------------
+    async function startSession(text) {
+      const m = MODELS[modelIdx];
+      const created = await invoke("start_session", {
+        provider: m.provider, model: m.model, label: m.label, prompt: text,
+      });
+      setFocused(created.name);
+      renderTranscript(null); // clears to "starting…" during the grace window
+    }
+
     async function submitComposer() {
       const input = $("composer");
       const text = input.value.trim();
@@ -911,16 +929,18 @@
       input.value = "";
       try {
         if (s) {
-          await invoke("send_prompt", { name: s.name, text });
+          try {
+            await invoke("send_prompt", { name: s.name, text });
+          } catch (e) {
+            // The focused session ended out from under us — start a fresh
+            // one with this prompt rather than dropping it.
+            await startSession(text);
+          }
         } else {
-          const m = MODELS[modelIdx];
-          const created = await invoke("start_session", {
-            provider: m.provider, model: m.model, label: m.label, prompt: text,
-          });
-          focused = created.name;
+          await startSession(text);
         }
-        setTimeout(refreshDetail, 700);
-        setTimeout(refreshSessions, 700);
+        setTimeout(refreshDetail, 500);
+        setTimeout(refreshSessions, 500);
       } catch (e) {
         input.value = text;
       }
