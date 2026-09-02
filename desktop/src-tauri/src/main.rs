@@ -251,8 +251,16 @@ fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Dedicated tmux server socket, so every hypervisor process — across
+/// rebuilds and regardless of inherited env — shares one server and sees the
+/// same sessions. Without this, a new app instance can bind a different
+/// default socket and find none of the running sessions.
+const TMUX_SOCKET: &str = "hypervisor";
+
 fn tmux(args: &[&str]) -> Result<String, String> {
     let out = Command::new("tmux")
+        .arg("-L")
+        .arg(TMUX_SOCKET)
         .args(args)
         .output()
         .map_err(|e| format!("tmux: {e}"))?;
@@ -263,14 +271,21 @@ fn tmux(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// session name -> pane_dead for every tmux session.
+/// session name -> pane_dead for every tmux session. The format puts the
+/// single-char pane_dead flag first so parsing needs no delimiter (a literal
+/// tab in the -F string does not survive to the output on this tmux).
 fn pane_states() -> std::collections::HashMap<String, bool> {
-    tmux(&["list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}"])
+    tmux(&["list-panes", "-a", "-F", "#{pane_dead}#{session_name}"])
         .map(|out| {
             out.lines()
                 .filter_map(|l| {
-                    let (name, dead) = l.split_once('\t')?;
-                    Some((name.to_string(), dead == "1"))
+                    let mut chars = l.chars();
+                    let dead = chars.next()? == '1';
+                    let name = chars.as_str();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some((name.to_string(), dead))
                 })
                 .collect()
         })
@@ -689,6 +704,23 @@ mod tests {
     }
 
     #[test]
+    fn pane_state_line_parses_flag_first() {
+        // Format is "#{pane_dead}#{session_name}": leading 0/1 then the name.
+        let parse = |l: &str| -> Option<(String, bool)> {
+            let mut chars = l.chars();
+            let dead = chars.next()? == '1';
+            let name = chars.as_str();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), dead))
+        };
+        assert_eq!(parse("0hv-1788321122"), Some(("hv-1788321122".into(), false)));
+        assert_eq!(parse("1hv-42"), Some(("hv-42".into(), true)));
+        assert_eq!(parse(""), None);
+    }
+
+    #[test]
     fn unsegmented_output_returns_tail() {
         let text = (0..100).map(|i| format!("line {i}\n")).collect::<String>();
         let blocks = parse_blocks(&text);
@@ -802,6 +834,9 @@ fn main() {
                 .build()?;
             tauri::tray::TrayIconBuilder::with_id("hv-tray")
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+                // Template mode: macOS tints the black glyph to match native
+                // menu bar icons (dark on light bars, light on dark bars).
+                .icon_as_template(true)
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "toggle" => toggle_overlay(app),
