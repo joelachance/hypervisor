@@ -202,6 +202,9 @@ struct Session {
     cwd: String,
     #[serde(default)]
     alive: bool,
+    /// Agent exited but the tmux pane is retained (remain-on-exit).
+    #[serde(default)]
+    done: bool,
     #[serde(default)]
     adds: u32,
     #[serde(default)]
@@ -260,9 +263,17 @@ fn tmux(args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn live_sessions() -> HashSet<String> {
-    tmux(&["list-sessions", "-F", "#S"])
-        .map(|s| s.lines().map(str::to_string).collect())
+/// session name -> pane_dead for every tmux session.
+fn pane_states() -> std::collections::HashMap<String, bool> {
+    tmux(&["list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}"])
+        .map(|out| {
+            out.lines()
+                .filter_map(|l| {
+                    let (name, dead) = l.split_once('\t')?;
+                    Some((name.to_string(), dead == "1"))
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -463,6 +474,9 @@ fn start_session(
     let cwd = default_cwd();
 
     tmux(&["new-session", "-d", "-s", &name, "-c", &cwd, &cmd])?;
+    // Keep the pane readable after the agent exits, so sessions that finish
+    // in the background don't vanish with their transcript.
+    let _ = tmux(&["set-option", "-t", &name, "remain-on-exit", "on"]);
 
     let repo = repo_name(&cwd);
     let session = Session {
@@ -474,6 +488,7 @@ fn start_session(
         created_at: created,
         cwd,
         alive: true,
+        done: false,
         adds: 0,
         dels: 0,
         branch: String::new(),
@@ -491,7 +506,7 @@ fn start_session(
 
 #[tauri::command]
 fn list_sessions() -> Vec<Session> {
-    let live = live_sessions();
+    let states = pane_states();
     let mut sessions: Vec<Session> = fs::read_dir(sessions_dir())
         .map(|rd| {
             rd.filter_map(|entry| {
@@ -500,7 +515,9 @@ fn list_sessions() -> Vec<Session> {
                     return None;
                 }
                 let mut s: Session = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-                s.alive = live.contains(&s.name);
+                let dead = states.get(&s.name).copied();
+                s.alive = dead == Some(false);
+                s.done = dead == Some(true);
                 if s.cwd.is_empty() {
                     s.cwd = default_cwd();
                 }
@@ -527,8 +544,11 @@ fn peek_session(name: String) -> Result<Peek, String> {
     }
     let raw = fs::read(sessions_dir().join(format!("{name}.json"))).map_err(|e| e.to_string())?;
     let mut session: Session = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    session.alive = live_sessions().contains(&name);
-    let blocks = if session.alive {
+    let dead = pane_states().get(&name).copied();
+    session.alive = dead == Some(false);
+    session.done = dead == Some(true);
+    let blocks = if dead.is_some() {
+        // Dead panes (remain-on-exit) still capture their final screen.
         let text = tmux(&["capture-pane", "-p", "-t", &name, "-S", "-400"]).unwrap_or_default();
         parse_blocks(&text)
     } else {
@@ -547,8 +567,10 @@ fn send_prompt(name: String, text: String) -> Result<(), String> {
     if text.is_empty() {
         return Err("empty prompt".into());
     }
-    if !live_sessions().contains(&name) {
-        return Err("session is not running".into());
+    match pane_states().get(&name) {
+        Some(false) => {}
+        Some(true) => return Err("session has finished".into()),
+        None => return Err("session is not running".into()),
     }
     tmux(&["send-keys", "-t", &name, "-l", "--", &text])?;
     // Let the TUI ingest the literal text before the submit keypress.

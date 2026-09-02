@@ -345,6 +345,9 @@
     .s-meta .sep { color: #4a4746; }
     .s-meta .wt { color: var(--blue); }
     .s-meta .when { color: var(--faint); }
+    .dot { width: 5px; height: 5px; border-radius: 50%; flex: none; }
+    .dot.alive { background: #26f098; box-shadow: 0 0 5px rgba(38, 240, 152, 0.6); }
+    .dot.donedot { background: #e8c84a; }
 
     /* command rows */
     .c-row { height: 27px; display: grid; grid-template-columns: 148px 1fr 92px; gap: 16px; align-items: center; }
@@ -655,7 +658,7 @@
       const el = $("transcript");
       if (!peek || !peek.blocks.length) {
         const msg = !focused ? "no session focused"
-          : (peek && !peek.session.alive ? "session ended" : "waiting for output…");
+          : (peek && !peek.session.alive && !peek.session.done ? "session gone — its tmux pane no longer exists" : "waiting for output…");
         el.innerHTML = `<div class="t-empty">${msg}</div>`;
         transcriptKey = "";
         return;
@@ -730,7 +733,7 @@
     function panelRows() {
       if (!panel) return [];
       if (panel.mode === "sessions") {
-        return sessions.filter((s) => s.alive)
+        return sessions.filter((s) => s.alive || s.done)
           .filter((s) => !panel.query || (s.prompt + s.label).toLowerCase().includes(panel.query.toLowerCase()));
       }
       if (panel.mode === "commands") {
@@ -790,6 +793,7 @@
           </div>`;
           for (const [s, i] of list) {
             html += `<div class="p-row s-row ${i === panel.sel ? "sel" : ""}" data-i="${i}">
+              <span class="dot ${s.alive ? "alive" : "donedot"}"></span>
               ${iconTile(s.provider)}
               <span class="s-main">
                 <span class="s-title">${esc(shortTitle(s))}</span>
@@ -798,7 +802,7 @@
                   <span style="color: var(--dels);">−${s.dels}</span>
                   <span class="sep">·</span>
                   ${s.branch ? `<span>${esc(s.branch)}</span><span class="sep">·</span>` : ""}
-                  <span class="when">${s.alive ? relTime(s.created_at) : "ended"}</span>
+                  <span class="when">${s.alive ? relTime(s.created_at) : "done"}</span>
                 </span>
               </span>
             </div>`;
@@ -867,8 +871,8 @@
     async function refreshSessions() {
       try { sessions = await invoke("list_sessions"); } catch (e) { return; }
       if (!focused) {
-        const firstAlive = sessions.find((s) => s.alive);
-        if (firstAlive) { focused = firstAlive.name; refreshDetail(); }
+        const first = sessions.find((s) => s.alive) || sessions.find((s) => s.done);
+        if (first) { focused = first.name; refreshDetail(); }
       }
       if (panel && panel.mode === "sessions") renderPanel();
     }
