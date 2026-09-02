@@ -709,6 +709,10 @@
       if (mode === "dir") {
         try { panel.items = await invoke("list_dirs"); } catch (e) { panel.items = []; }
       }
+      if (mode === "sessions" || mode === "health") {
+        // Pull a fresh list so a just-started session shows immediately.
+        try { sessions = await invoke("list_sessions"); } catch (e) {}
+      }
       renderPanel();
     }
     function closePanel() {
@@ -919,6 +923,9 @@
       });
       setFocused(created.name);
       renderTranscript(null); // clears to "starting…" during the grace window
+      // Reflect the new session immediately, in the list and any open panel.
+      try { sessions = await invoke("list_sessions"); } catch (e) {}
+      if (panel && panel.mode === "sessions") renderPanel();
     }
 
     async function submitComposer() {
