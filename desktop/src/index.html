@@ -682,11 +682,21 @@
       { group: "SESSION", cmd: "/agents", desc: "inspect and steer subagents", key: "", stub: true },
       { group: "SESSION", cmd: "/compact", desc: "summarize and reclaim context", key: "", stub: true },
       { group: "SESSION", cmd: "/clear", desc: "discard context, keep the worktree", key: "", stub: true },
-      { group: "CODE", cmd: "/branch", desc: "switch or create a branch", key: "", stub: true },
-      { group: "CODE", cmd: "/worktree", desc: "open a session in a new worktree", key: "", stub: true },
-      { group: "CODE", cmd: "/diff", desc: "review the working diff", key: "⌘D", stub: true },
-      { group: "CODE", cmd: "/tests", desc: "run the suite in this worktree", key: "", stub: true },
-      { group: "CODE", cmd: "/review", desc: "run review over the working diff", key: "", stub: true },
+      { group: "CODE", cmd: "/branch", desc: "switch or create a branch", key: "", run: () => openInput("branch", "branch name…", async (v) => {
+        await invoke("switch_branch", { name: v }); refreshStatus(); setComposerNote("switched to " + v);
+      }) },
+      { group: "CODE", cmd: "/worktree", desc: "open a session in a new worktree", key: "", run: () => openInput("worktree", "new worktree name…", async (v) => {
+        const cwd = await invoke("create_worktree", { name: v }); refreshStatus(); setComposerNote("worktree ready — next session opens in " + cwd.split("/").pop());
+      }) },
+      { group: "CODE", cmd: "/diff", desc: "review the working diff", key: "⌘D", run: async () => {
+        const d = await invoke("working_diff"); openText("diff", d);
+      } },
+      { group: "CODE", cmd: "/tests", desc: "run the suite in this worktree", key: "", run: () => {
+        closePanel(); startSession("Run the test suite in this repository and report the results — pass/fail counts and any failures.");
+      } },
+      { group: "CODE", cmd: "/review", desc: "run review over the working diff", key: "", run: () => {
+        closePanel(); startSession("Review the current working diff (git diff HEAD) for bugs, regressions, and issues. Be specific with file:line references.");
+      } },
     ];
 
     async function openPanel(mode) {
@@ -703,6 +713,17 @@
     function closePanel() {
       panel = null;
       $("panel").classList.remove("open");
+    }
+
+    // Command that takes a single typed argument.
+    function openInput(title, placeholder, submit) {
+      panel = { mode: "input", title, placeholder, submit, query: "", busy: false, err: "" };
+      renderPanel();
+    }
+    // Read-only text view (e.g. a diff).
+    function openText(title, content) {
+      panel = { mode: "text", title, content };
+      renderPanel();
     }
 
     function fuzzy(query, text) {
@@ -747,9 +768,34 @@
 
     function renderPanel() {
       if (!panel) return;
+      const head = $("panel-head"), body = $("panel-body"), foot = $("panel-foot");
+
+      // Input mode: one typed argument for a command.
+      if (panel.mode === "input") {
+        head.innerHTML = `
+          <span class="sigil">${esc(panel.title)}</span>
+          <span style="display: flex; align-items: center;">
+            <span class="query">${esc(panel.query)}</span>
+            <span class="vimcaret"></span>
+          </span>`;
+        body.innerHTML = `<div class="t-empty" style="padding: 24px 0; color: ${panel.err ? "var(--dels)" : "var(--faint)"};">${
+          panel.busy ? "working…" : (panel.err ? esc(panel.err) : esc(panel.placeholder))
+        }</div>`;
+        foot.innerHTML = `<span><b>⏎</b> CONFIRM</span><span><b>ESC</b> CANCEL</span>`;
+        $("panel").classList.add("open");
+        return;
+      }
+      // Text mode: read-only content (e.g. a diff).
+      if (panel.mode === "text") {
+        head.innerHTML = `<span class="sigil">${esc(panel.title)}</span>`;
+        body.innerHTML = `<pre style="margin:0;padding:12px 18px;font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--text-dim);white-space:pre;user-select:text;-webkit-user-select:text;">${esc(panel.content)}</pre>`;
+        foot.innerHTML = `<span><b>ESC</b> CLOSE</span>`;
+        $("panel").classList.add("open");
+        return;
+      }
+
       const rows = panelRows();
       panel.sel = Math.max(0, Math.min(panel.sel, rows.length - 1));
-      const head = $("panel-head"), body = $("panel-body"), foot = $("panel-foot");
       const sigil = { sessions: ">", commands: "/", dir: "", health: ">" }[panel.mode] || ">";
       const label = { sessions: "", commands: "", dir: "", health: "health" }[panel.mode] || "";
       const count = panel.mode === "commands" ? `${rows.length} COMMANDS`
@@ -943,6 +989,19 @@
       }
     }
 
+    async function submitInput() {
+      if (!panel || panel.mode !== "input" || panel.busy) return;
+      const v = panel.query.trim();
+      if (!v) return;
+      panel.busy = true; panel.err = ""; renderPanel();
+      try {
+        await panel.submit(v);
+        closePanel();
+      } catch (e) {
+        if (panel) { panel.busy = false; panel.err = String(e); renderPanel(); }
+      }
+    }
+
     // ---------------- keyboard ----------------
     window.addEventListener("keydown", (e) => {
       try { handleKey(e); } catch (err) { panel = null; $("panel").classList.remove("open"); }
@@ -951,6 +1010,18 @@
       const inInput = document.activeElement === $("composer");
       if (e.metaKey && e.key.toLowerCase() === "l") { e.preventDefault(); openPanel("sessions"); return; }
       if (e.metaKey && e.key.toLowerCase() === "k") { e.preventDefault(); openPanel("health"); return; }
+
+      if (panel && panel.mode === "text") {
+        if (e.key === "Escape") closePanel();
+        return;
+      }
+      if (panel && panel.mode === "input") {
+        if (e.key === "Escape") { closePanel(); return; }
+        if (e.key === "Enter") { submitInput(); return; }
+        if (e.key === "Backspace") { panel.query = panel.query.slice(0, -1); panel.err = ""; renderPanel(); return; }
+        if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) { panel.query += e.key; panel.err = ""; renderPanel(); return; }
+        return;
+      }
 
       if (panel) {
         if (e.key === "Escape") { closePanel(); return; }

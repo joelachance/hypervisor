@@ -586,6 +586,74 @@ fn set_cwd(path: String) -> Result<(), String> {
     Ok(())
 }
 
+fn slug_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/'))
+}
+
+/// Create a git worktree off the current repo on a new branch, and switch the
+/// default working directory to it so the next session opens there.
+#[tauri::command]
+fn create_worktree(name: String) -> Result<String, String> {
+    let name = name.trim().to_string();
+    if !slug_ok(&name) {
+        return Err("use letters, digits, - _ /".into());
+    }
+    let cwd = default_cwd();
+    let common = git(&cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .ok_or("not a git repo")?;
+    let repo_root = PathBuf::from(&common)
+        .parent()
+        .ok_or("no repo root")?
+        .to_path_buf();
+    let parent = repo_root.parent().ok_or("no parent dir")?;
+    let leaf = name.rsplit('/').next().unwrap_or(&name);
+    let wt_path = parent.join(format!("{}-{}", repo_name(&cwd), leaf));
+    let wt_str = wt_path.to_string_lossy().into_owned();
+    if wt_path.exists() {
+        return Err("worktree path already exists".into());
+    }
+    git(
+        &repo_root.to_string_lossy(),
+        &["worktree", "add", &wt_str, "-b", &name],
+    )
+    .ok_or("git worktree add failed")?;
+    *DEFAULT_CWD.lock().unwrap() = Some(wt_str.clone());
+    Ok(wt_str)
+}
+
+/// Create (or switch to) a branch in the current working directory.
+#[tauri::command]
+fn switch_branch(name: String) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if !slug_ok(&name) {
+        return Err("use letters, digits, - _ /".into());
+    }
+    let cwd = default_cwd();
+    // -B creates or resets-to; use switch -c, fall back to switch.
+    if git(&cwd, &["switch", "-c", &name]).is_some() {
+        return Ok(());
+    }
+    git(&cwd, &["switch", &name])
+        .map(|_| ())
+        .ok_or_else(|| "could not switch branch".into())
+}
+
+/// The working diff of the current directory, capped for display.
+#[tauri::command]
+fn working_diff() -> String {
+    let cwd = default_cwd();
+    let out = git(&cwd, &["diff", "--stat", "HEAD"]).unwrap_or_default();
+    let full = git(&cwd, &["diff", "HEAD"]).unwrap_or_default();
+    let body: String = full.lines().take(400).collect::<Vec<_>>().join("\n");
+    if out.trim().is_empty() && body.trim().is_empty() {
+        "no working changes".into()
+    } else {
+        format!("{out}\n\n{body}")
+    }
+}
+
 fn diffstat(cwd: &str) -> (u32, u32) {
     let Some(out) = git(cwd, &["diff", "--numstat", "HEAD"]) else {
         return (0, 0);
@@ -1159,7 +1227,10 @@ fn main() {
             kill_session,
             status_info,
             list_dirs,
-            set_cwd
+            set_cwd,
+            create_worktree,
+            switch_branch,
+            working_diff
         ])
         .setup(|app| {
             // Overlay, not an app: no Dock icon, no Cmd-Tab entry.
