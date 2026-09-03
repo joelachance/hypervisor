@@ -1113,7 +1113,7 @@ fn parse_blocks(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_blocks;
+    use super::{git, parse_blocks};
 
     // Verbatim capture of a real `claude` pane from the smoke test.
     const PANE: &str = "\
@@ -1197,6 +1197,66 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].contains("line 99"));
         assert!(!blocks[0].contains("line 10\n"), "should cap to a tail");
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    // Exercises the real /branch, /worktree, /diff command functions against a
+    // throwaway repo. One test (not several) because they share the global
+    // DEFAULT_CWD, which parallel tests would race.
+    #[test]
+    fn code_commands_drive_real_git() {
+        let base = std::env::temp_dir().join(format!("hvtest-{}", std::process::id()));
+        let repo = base.join("myrepo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-qm", "init"]);
+
+        *super::DEFAULT_CWD.lock().unwrap() = Some(repo.to_string_lossy().into_owned());
+
+        // /diff — clean, then dirty.
+        assert_eq!(super::working_diff().trim(), "no working changes");
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        assert!(super::working_diff().contains("two"), "diff should show the change");
+
+        // /branch — creates and switches.
+        super::switch_branch("feature-x".into()).expect("switch_branch");
+        let cur = git(&repo.to_string_lossy(), &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert_eq!(cur, "feature-x");
+
+        // Commit the change so worktree add starts clean.
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-qm", "two"]);
+
+        // /worktree — creates a worktree on a new branch and switches cwd to it.
+        let wt = super::create_worktree("wt1".into()).expect("create_worktree");
+        assert!(std::path::Path::new(&wt).is_dir(), "worktree dir exists");
+        assert!(wt.ends_with("myrepo-wt1"), "worktree named <repo>-<name>: {wt}");
+        let wt_branch = git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert_eq!(wt_branch, "wt1");
+        assert_eq!(*super::DEFAULT_CWD.lock().unwrap(), Some(wt.clone()));
+
+        // Bad names are rejected.
+        assert!(super::switch_branch("bad name!".into()).is_err());
+        assert!(super::create_worktree("".into()).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+        *super::DEFAULT_CWD.lock().unwrap() = None;
     }
 }
 
