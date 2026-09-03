@@ -276,12 +276,23 @@ fn append_user_prompt(name: &str, text: &str) {
     }
 }
 
-/// The Claude Code session id from a stream log's init event, for --resume.
-fn read_session_id(name: &str) -> Option<String> {
+/// The resumable session id from a stream log, per provider. Claude puts it
+/// in the init event's `session_id`; Codex in the `thread.started` event's
+/// `thread_id`.
+fn read_session_id(name: &str, provider: &str) -> Option<String> {
     let text = fs::read_to_string(stream_path(name)).ok()?;
     for line in text.lines() {
-        let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        if v.get("type").and_then(|t| t.as_str()) == Some("system")
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ty = v.get("type").and_then(|t| t.as_str());
+        if provider == "openai" {
+            if ty == Some("thread.started") {
+                if let Some(id) = v.get("thread_id").and_then(|s| s.as_str()) {
+                    return Some(id.to_string());
+                }
+            }
+        } else if ty == Some("system")
             && v.get("subtype").and_then(|s| s.as_str()) == Some("init")
         {
             if let Some(id) = v.get("session_id").and_then(|s| s.as_str()) {
@@ -372,6 +383,82 @@ fn parse_stream(text: &str) -> Vec<Ev> {
         events = events.split_off(events.len() - 24);
     }
     events
+}
+
+/// Trim a value to a single line and cap its length for a tool label.
+fn short(detail: &str) -> String {
+    let detail = detail.replace('\n', " ");
+    let detail = detail.trim();
+    if detail.chars().count() > 72 {
+        format!("{}…", detail.chars().take(72).collect::<String>())
+    } else {
+        detail.to_string()
+    }
+}
+
+/// Parse a Codex `exec --json` log into transcript events.
+fn parse_codex_stream(text: &str) -> Vec<Ev> {
+    let mut events = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("user_prompt") => {
+                if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                    events.push(Ev { kind: "user".into(), text: t.to_string() });
+                }
+            }
+            Some("item.completed") => {
+                let Some(item) = v.get("item") else { continue };
+                match item.get("type").and_then(|t| t.as_str()) {
+                    Some("agent_message") => {
+                        if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                            if !t.trim().is_empty() {
+                                events.push(Ev { kind: "assistant".into(), text: t.to_string() });
+                            }
+                        }
+                    }
+                    Some("command_execution") => {
+                        // Strip the "/bin/zsh -lc '…'" shell wrapper if present.
+                        let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        let inner = cmd
+                            .split_once("-lc ")
+                            .map(|(_, r)| r.trim().trim_matches('\''))
+                            .unwrap_or(cmd);
+                        events.push(Ev { kind: "tool".into(), text: format!("bash  {}", short(inner)) });
+                    }
+                    Some("file_change") => {
+                        let path = item
+                            .get("path")
+                            .or_else(|| item.get("file_path"))
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("");
+                        events.push(Ev { kind: "tool".into(), text: format!("edit  {}", short(path)) });
+                    }
+                    // Skip Codex's noisy warning items and internal reasoning.
+                    Some("error") | Some("reasoning") | None => {}
+                    Some(other) => {
+                        events.push(Ev { kind: "tool".into(), text: other.replace('_', " ") });
+                    }
+                }
+            }
+            _ => {} // thread.started, turn.*, usage — not rendered
+        }
+    }
+    if events.len() > 24 {
+        events = events.split_off(events.len() - 24);
+    }
+    events
+}
+
+/// Parse a stream log into events, dispatching on provider.
+fn parse_stream_for(text: &str, provider: &str) -> Vec<Ev> {
+    if provider == "openai" {
+        parse_codex_stream(text)
+    } else {
+        parse_stream(text)
+    }
 }
 
 /// Convert scraped pane blocks (tui driver) into the same event shape.
@@ -631,22 +718,29 @@ fn start_session(
         .as_secs();
     let name = format!("hv-{created}");
     let cwd = default_cwd();
-    // Anthropic runs through the headless stream-json driver (exact transcript
-    // + native subagents); other providers keep the TUI/pane-scrape path.
-    let driver = if provider == "anthropic" { "stream" } else { "tui" };
+    // Anthropic and OpenAI run through headless structured drivers (exact
+    // transcript + native subagents); other providers keep the TUI path.
+    let driver = if provider == "anthropic" || provider == "openai" {
+        "stream"
+    } else {
+        "tui"
+    };
+    let jsonl = stream_path(&name);
+    let jsonl_s = jsonl.to_string_lossy();
 
-    let agent_cmd = match (driver, provider.as_str()) {
-        ("stream", _) => {
-            // Turn runs headless; append its stream-json events to the log.
-            let jsonl = stream_path(&name);
-            format!(
-                "claude -p {} --model {} --output-format stream-json --verbose >> {} 2>&1",
-                shq(&prompt),
-                shq(&model),
-                shq(&jsonl.to_string_lossy())
-            )
-        }
-        (_, "openai") => format!("codex --model {} {}", shq(&model), shq(&prompt)),
+    let agent_cmd = match provider.as_str() {
+        "anthropic" => format!(
+            "claude -p {} --model {} --output-format stream-json --verbose >> {} 2>&1",
+            shq(&prompt),
+            shq(&model),
+            shq(&jsonl_s)
+        ),
+        "openai" => format!(
+            "codex exec --json --dangerously-bypass-approvals-and-sandbox -m {} {} >> {} 2>&1",
+            shq(&model),
+            shq(&prompt),
+            shq(&jsonl_s)
+        ),
         _ => format!("opencode --model {} --prompt {}", shq(&model), shq(&prompt)),
     };
     // The tmux server may have been spawned with a bare environment; carry
@@ -712,7 +806,7 @@ fn list_sessions() -> Vec<Session> {
                     s.alive = stream_path(&s.name).exists();
                     s.done = false;
                     if s.session_id.is_empty() {
-                        s.session_id = read_session_id(&s.name).unwrap_or_default();
+                        s.session_id = read_session_id(&s.name, &s.provider).unwrap_or_default();
                     }
                 } else {
                     s.running = pane_alive;
@@ -753,10 +847,10 @@ fn peek_session(name: String) -> Result<Peek, String> {
         session.alive = stream_path(&name).exists();
         session.done = false;
         if session.session_id.is_empty() {
-            session.session_id = read_session_id(&name).unwrap_or_default();
+            session.session_id = read_session_id(&name, &session.provider).unwrap_or_default();
         }
         let text = fs::read_to_string(stream_path(&name)).unwrap_or_default();
-        parse_stream(&text)
+        parse_stream_for(&text, &session.provider)
     } else {
         session.running = pane_alive;
         session.alive = pane_alive;
@@ -790,16 +884,26 @@ fn send_prompt(name: String, text: String) -> Result<(), String> {
         if pane_states().get(&name).copied() == Some(false) {
             return Err("a turn is still running".into());
         }
-        let session_id = read_session_id(&name).ok_or("session not ready yet")?;
+        let session_id = read_session_id(&name, &session.provider).ok_or("session not ready yet")?;
         let jsonl = stream_path(&name);
+        let jsonl_s = jsonl.to_string_lossy();
+        let agent = if session.provider == "openai" {
+            format!(
+                "codex exec resume {} {} --json --dangerously-bypass-approvals-and-sandbox >> {} 2>&1",
+                shq(&session_id),
+                shq(&text),
+                shq(&jsonl_s)
+            )
+        } else {
+            format!(
+                "claude -p {} --resume {} --model {} --output-format stream-json --verbose >> {} 2>&1",
+                shq(&text),
+                shq(&session_id),
+                shq(&session.model),
+                shq(&jsonl_s)
+            )
+        };
         let path = std::env::var("PATH").unwrap_or_default();
-        let agent = format!(
-            "claude -p {} --resume {} --model {} --output-format stream-json --verbose >> {} 2>&1",
-            shq(&text),
-            shq(&session_id),
-            shq(&session.model),
-            shq(&jsonl.to_string_lossy())
-        );
         let cmd = format!("export PATH={}; exec {agent}", shq(&path));
         append_user_prompt(&name, &text);
         // Reuse the session name: clear the retired (dead) pane first.
