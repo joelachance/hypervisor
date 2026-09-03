@@ -1262,7 +1262,30 @@ mod tests {
 
 // ---------------------------------------------------------------------------
 
+/// A GUI app launched from Finder/Spotlight inherits only a minimal PATH
+/// (/usr/bin:/bin), so tmux, claude, codex and git would not resolve. Pull the
+/// real PATH from a login shell and adopt it, unless we clearly already have a
+/// full one (e.g. launched from a terminal / `tauri dev`).
+fn adopt_login_path() {
+    let have = std::env::var("PATH").unwrap_or_default();
+    if have.contains("/opt/homebrew/bin") || have.contains("/.nvm/") {
+        return;
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    if let Ok(out) = Command::new(&shell)
+        .args(["-lic", "printf %s \"$PATH\""])
+        .output()
+    {
+        let path = String::from_utf8_lossy(&out.stdout);
+        let path = path.trim();
+        if !path.is_empty() {
+            std::env::set_var("PATH", path);
+        }
+    }
+}
+
 fn main() {
+    adopt_login_path();
     tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
