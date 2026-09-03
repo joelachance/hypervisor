@@ -200,8 +200,17 @@ struct Session {
     created_at: u64,
     #[serde(default)]
     cwd: String,
+    /// "stream" = headless Claude Code stream-json driver; "tui" = pane scrape.
+    #[serde(default)]
+    driver: String,
+    /// Claude Code session id, for --resume across turns (stream driver).
+    #[serde(default)]
+    session_id: String,
     #[serde(default)]
     alive: bool,
+    /// A turn is currently executing (its tmux pane is live).
+    #[serde(default)]
+    running: bool,
     /// Agent exited but the tmux pane is retained (remain-on-exit).
     #[serde(default)]
     done: bool,
@@ -235,10 +244,155 @@ fn repo_name(cwd: &str) -> String {
     }
 }
 
+/// One rendered transcript item. kind: "user" | "assistant" | "tool".
+#[derive(serde::Serialize, Clone)]
+struct Ev {
+    kind: String,
+    text: String,
+}
+
 #[derive(serde::Serialize)]
 struct Peek {
     session: Session,
-    blocks: Vec<String>,
+    events: Vec<Ev>,
+}
+
+fn stream_path(name: &str) -> PathBuf {
+    sessions_dir().join(format!("{name}.jsonl"))
+}
+
+/// Append our own user-prompt event to the stream log. Claude's stream-json
+/// does not echo the human prompt, so we record it ourselves to keep the
+/// transcript (and turn ordering) complete.
+fn append_user_prompt(name: &str, text: &str) {
+    let line = serde_json::json!({ "type": "user_prompt", "text": text }).to_string();
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(stream_path(name))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// The Claude Code session id from a stream log's init event, for --resume.
+fn read_session_id(name: &str) -> Option<String> {
+    let text = fs::read_to_string(stream_path(name)).ok()?;
+    for line in text.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) == Some("system")
+            && v.get("subtype").and_then(|s| s.as_str()) == Some("init")
+        {
+            if let Some(id) = v.get("session_id").and_then(|s| s.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A short human label for a tool call from its input JSON.
+fn tool_summary(name: &str, input: &serde_json::Value) -> String {
+    let pick = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| {
+            input
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+    };
+    let detail = pick(&[
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+        "prompt",
+    ])
+    .unwrap_or_default();
+    let detail = detail.replace('\n', " ");
+    let detail = if detail.chars().count() > 72 {
+        format!("{}…", detail.chars().take(72).collect::<String>())
+    } else {
+        detail
+    };
+    let tool = name.to_lowercase();
+    if detail.is_empty() {
+        tool
+    } else {
+        format!("{tool}  {detail}")
+    }
+}
+
+/// Parse a Claude stream-json log into transcript events.
+fn parse_stream(text: &str) -> Vec<Ev> {
+    let mut events = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("user_prompt") => {
+                if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                    events.push(Ev { kind: "user".into(), text: t.to_string() });
+                }
+            }
+            Some("assistant") => {
+                let content = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array());
+                for item in content.into_iter().flatten() {
+                    match item.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                                if !t.trim().is_empty() {
+                                    events.push(Ev { kind: "assistant".into(), text: t.to_string() });
+                                }
+                            }
+                        }
+                        Some("tool_use") => {
+                            let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                            let empty = serde_json::json!({});
+                            let input = item.get("input").unwrap_or(&empty);
+                            events.push(Ev { kind: "tool".into(), text: tool_summary(name, input) });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {} // tool_result, system, result, rate_limit — not rendered
+        }
+    }
+    // Keep the last few exchanges: cap to the trailing 24 events.
+    if events.len() > 24 {
+        events = events.split_off(events.len() - 24);
+    }
+    events
+}
+
+/// Convert scraped pane blocks (tui driver) into the same event shape.
+fn blocks_to_events(blocks: &[String]) -> Vec<Ev> {
+    let mut events = Vec::new();
+    for block in blocks {
+        for line in block.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Some(rest) = prompt_text(line) {
+                events.push(Ev { kind: "user".into(), text: rest.to_string() });
+            } else if let Some(rest) = t.strip_prefix("⏺ ") {
+                events.push(Ev { kind: "assistant".into(), text: rest.to_string() });
+            } else {
+                events.push(Ev { kind: "assistant".into(), text: t.to_string() });
+            }
+        }
+    }
+    events
 }
 
 fn sessions_dir() -> PathBuf {
@@ -476,18 +630,33 @@ fn start_session(
         .unwrap()
         .as_secs();
     let name = format!("hv-{created}");
+    let cwd = default_cwd();
+    // Anthropic runs through the headless stream-json driver (exact transcript
+    // + native subagents); other providers keep the TUI/pane-scrape path.
+    let driver = if provider == "anthropic" { "stream" } else { "tui" };
 
-    let agent_cmd = match provider.as_str() {
-        "anthropic" => format!("claude --model {} {}", shq(&model), shq(&prompt)),
-        "openai" => format!("codex --model {} {}", shq(&model), shq(&prompt)),
+    let agent_cmd = match (driver, provider.as_str()) {
+        ("stream", _) => {
+            // Turn runs headless; append its stream-json events to the log.
+            let jsonl = stream_path(&name);
+            format!(
+                "claude -p {} --model {} --output-format stream-json --verbose >> {} 2>&1",
+                shq(&prompt),
+                shq(&model),
+                shq(&jsonl.to_string_lossy())
+            )
+        }
+        (_, "openai") => format!("codex --model {} {}", shq(&model), shq(&prompt)),
         _ => format!("opencode --model {} --prompt {}", shq(&model), shq(&prompt)),
     };
     // The tmux server may have been spawned with a bare environment; carry
     // this app's PATH (nvm, homebrew, …) into the session explicitly.
     let path = std::env::var("PATH").unwrap_or_default();
     let cmd = format!("export PATH={}; exec {agent_cmd}", shq(&path));
-    let cwd = default_cwd();
 
+    if driver == "stream" {
+        append_user_prompt(&name, &prompt);
+    }
     tmux(&["new-session", "-d", "-s", &name, "-c", &cwd, &cmd])?;
     // Keep the pane readable after the agent exits, so sessions that finish
     // in the background don't vanish with their transcript.
@@ -502,7 +671,10 @@ fn start_session(
         prompt,
         created_at: created,
         cwd,
+        driver: driver.into(),
+        session_id: String::new(),
         alive: true,
+        running: true,
         done: false,
         adds: 0,
         dels: 0,
@@ -530,9 +702,23 @@ fn list_sessions() -> Vec<Session> {
                     return None;
                 }
                 let mut s: Session = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-                let dead = states.get(&s.name).copied();
-                s.alive = dead == Some(false);
-                s.done = dead == Some(true);
+                let pane_alive = states.get(&s.name).copied() == Some(false);
+                let pane_dead = states.get(&s.name).copied() == Some(true);
+                if s.driver == "stream" {
+                    // A stream session is a resumable conversation: alive as
+                    // long as its log exists, running only while a turn's pane
+                    // is live, and it never "finishes".
+                    s.running = pane_alive;
+                    s.alive = stream_path(&s.name).exists();
+                    s.done = false;
+                    if s.session_id.is_empty() {
+                        s.session_id = read_session_id(&s.name).unwrap_or_default();
+                    }
+                } else {
+                    s.running = pane_alive;
+                    s.alive = pane_alive;
+                    s.done = pane_dead;
+                }
                 if s.cwd.is_empty() {
                     s.cwd = default_cwd();
                 }
@@ -559,17 +745,31 @@ fn peek_session(name: String) -> Result<Peek, String> {
     }
     let raw = fs::read(sessions_dir().join(format!("{name}.json"))).map_err(|e| e.to_string())?;
     let mut session: Session = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    let dead = pane_states().get(&name).copied();
-    session.alive = dead == Some(false);
-    session.done = dead == Some(true);
-    let blocks = if dead.is_some() {
-        // Dead panes (remain-on-exit) still capture their final screen.
-        let text = tmux(&["capture-pane", "-p", "-t", &name, "-S", "-400"]).unwrap_or_default();
-        parse_blocks(&text)
+    let pane = pane_states().get(&name).copied();
+    let pane_alive = pane == Some(false);
+
+    let events = if session.driver == "stream" {
+        session.running = pane_alive;
+        session.alive = stream_path(&name).exists();
+        session.done = false;
+        if session.session_id.is_empty() {
+            session.session_id = read_session_id(&name).unwrap_or_default();
+        }
+        let text = fs::read_to_string(stream_path(&name)).unwrap_or_default();
+        parse_stream(&text)
     } else {
-        Vec::new()
+        session.running = pane_alive;
+        session.alive = pane_alive;
+        session.done = pane == Some(true);
+        let blocks = if pane.is_some() {
+            let text = tmux(&["capture-pane", "-p", "-t", &name, "-S", "-400"]).unwrap_or_default();
+            parse_blocks(&text)
+        } else {
+            Vec::new()
+        };
+        blocks_to_events(&blocks)
     };
-    Ok(Peek { session, blocks })
+    Ok(Peek { session, events })
 }
 
 #[tauri::command]
@@ -577,18 +777,45 @@ fn send_prompt(name: String, text: String) -> Result<(), String> {
     if !valid_name(&name) {
         return Err("invalid session name".into());
     }
-    // A newline inside the literal text would submit the TUI input early.
     let text = text.replace(['\n', '\r'], " ").trim().to_string();
     if text.is_empty() {
         return Err("empty prompt".into());
     }
-    match pane_states().get(&name) {
+
+    let raw = fs::read(sessions_dir().join(format!("{name}.json"))).map_err(|e| e.to_string())?;
+    let session: Session = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+
+    if session.driver == "stream" {
+        // A stream turn runs to completion and exits; only one at a time.
+        if pane_states().get(&name).copied() == Some(false) {
+            return Err("a turn is still running".into());
+        }
+        let session_id = read_session_id(&name).ok_or("session not ready yet")?;
+        let jsonl = stream_path(&name);
+        let path = std::env::var("PATH").unwrap_or_default();
+        let agent = format!(
+            "claude -p {} --resume {} --model {} --output-format stream-json --verbose >> {} 2>&1",
+            shq(&text),
+            shq(&session_id),
+            shq(&session.model),
+            shq(&jsonl.to_string_lossy())
+        );
+        let cmd = format!("export PATH={}; exec {agent}", shq(&path));
+        append_user_prompt(&name, &text);
+        // Reuse the session name: clear the retired (dead) pane first.
+        let _ = tmux(&["kill-session", "-t", &name]);
+        tmux(&["new-session", "-d", "-s", &name, "-c", &session.cwd, &cmd])?;
+        let _ = tmux(&["set-option", "-t", &name, "remain-on-exit", "on"]);
+        return Ok(());
+    }
+
+    // TUI driver: type into the live pane.
+    match pane_states().get(&name).copied() {
         Some(false) => {}
         Some(true) => return Err("session has finished".into()),
         None => return Err("session is not running".into()),
     }
     tmux(&["send-keys", "-t", &name, "-l", "--", &text])?;
-    // Let the TUI ingest the literal text before the submit keypress.
     std::thread::sleep(std::time::Duration::from_millis(120));
     tmux(&["send-keys", "-t", &name, "Enter"]).map(|_| ())
 }
