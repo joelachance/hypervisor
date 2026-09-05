@@ -97,12 +97,16 @@ type model struct {
 	repoPick   string
 	repoCursor int
 	repoBefore string
-	peek       peekState
-	short      map[string]string
-	status     string
-	err        error
-	outcome    Outcome
-	now        int64
+	// repoOnlyBefore remembers a -repo launch scope while the picker is open,
+	// so cancelling out of it restores that scope instead of widening to
+	// every repository.
+	repoOnlyBefore bool
+	peek           peekState
+	short          map[string]string
+	status         string
+	err            error
+	outcome        Outcome
+	now            int64
 }
 
 type refreshedMsg struct {

@@ -34,10 +34,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	// Bare `hv` opens the browser. Every one of its actions is also a flag,
-	// so nothing here is reachable only by hand.
-	if len(os.Args) < 2 {
-		if err := uiCmd(ctx, nil); err != nil && err != context.Canceled {
+	// Bare `hv` opens the browser, and so does `hv -repo` or `hv -store DIR`:
+	// a leading flag is browser flags, not a misspelled subcommand. Every one
+	// of the browser's actions is also a flag, so nothing here is reachable
+	// only by hand.
+	if len(os.Args) < 2 || strings.HasPrefix(os.Args[1], "-") && os.Args[1] != "-h" && os.Args[1] != "--help" {
+		if err := uiCmd(ctx, os.Args[1:]); err != nil && err != context.Canceled {
 			fmt.Fprintf(os.Stderr, "hv: %v\n", err)
 			os.Exit(1)
 		}

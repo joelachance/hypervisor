@@ -100,6 +100,10 @@ func (m model) updateRepoPicker(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeBrowse
 		m.repoPick = m.repoBefore
 		m.selectRepo()
+		// selectRepo clears the -repo launch scope because a pick replaces
+		// it; a cancel restores it instead.
+		m.repoOnly = m.repoOnlyBefore
+		m.applyFilter()
 		return m, nil
 	case "q", "ctrl+c":
 		return m, tea.Quit

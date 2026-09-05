@@ -159,6 +159,26 @@ func TestRepoPickerListsRepositoriesAndFiltersAsYouMove(t *testing.T) {
 }
 
 // esc puts back whatever was showing before the picker opened.
+// Cancelling out of the picker in a browser started with -repo must land back
+// on that scope, not widen to every repository.
+func TestRepoPickerEscapeRestoresARepoLaunchScope(t *testing.T) {
+	rows := fixture()
+	rows[1].RepoRoot = "/other"
+	rows[1].Files = []string{"/other/b.go"}
+	opened := press(NewForTestScoped(rows, "/repo"), "r").(model)
+	moved, _ := opened.updateRepoPicker(tea.KeyMsg{Type: tea.KeyDown})
+	cancelled, _ := moved.(model).updateRepoPicker(tea.KeyMsg{Type: tea.KeyEscape})
+	after := cancelled.(model)
+	if !after.repoOnly || after.repoPick != "" {
+		t.Fatalf("after esc: repoOnly=%v pick=%q, want the -repo scope back", after.repoOnly, after.repoPick)
+	}
+	for _, row := range after.rows {
+		if row.RepoRoot != "/repo" {
+			t.Fatalf("rows include %q, want only /repo after cancelling", row.RepoRoot)
+		}
+	}
+}
+
 func TestRepoPickerEscapeRestoresTheScope(t *testing.T) {
 	rows := fixture()
 	rows[1].RepoRoot = "/other"

@@ -67,6 +67,7 @@ func (m model) updateBrowse(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.mode = modeRepo
 		m.repoBefore = m.repoPick
+		m.repoOnlyBefore = m.repoOnly
 		m.repoCursor = m.repoIndex()
 	case "M":
 		// Merge everything on screen, whatever the marks say.

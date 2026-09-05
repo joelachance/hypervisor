@@ -2,6 +2,8 @@ package session
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -131,6 +133,42 @@ func TestSummaryRedactsSecrets(t *testing.T) {
 func rawCWD(dir string) map[string]json.RawMessage {
 	encoded, _ := json.Marshal(dir)
 	return map[string]json.RawMessage{"cwd": encoded}
+}
+
+// A session moved to another repository belongs to where it is now, not where
+// it started - the browser, the plan, and reopen all follow RepoRoot.
+func TestObserveFollowsTheSessionToItsLatestDirectory(t *testing.T) {
+	index := NewIndex()
+	index.Observe(capture.SessionEvent{SessionID: "s1", Kind: capture.KindMessage, TS: 1, Raw: rawCWD("/repo")})
+	index.Observe(capture.SessionEvent{SessionID: "s1", Kind: capture.KindMessage, TS: 2, Raw: rawCWD("/elsewhere")})
+	got, _ := index.Get("s1")
+	if got.RepoRoot != "/elsewhere" {
+		t.Errorf("repo root = %q, want the directory the session moved to", got.RepoRoot)
+	}
+}
+
+// cd is not a move: a recorded directory resolves to its worktree root, so a
+// session that wanders into a subdirectory stays filed under its repository -
+// while one that enters a nested worktree, which shares the repository's path
+// prefix, correctly moves to it.
+func TestObserveResolvesDirectoriesToWorktreeRoots(t *testing.T) {
+	repo := t.TempDir()
+	for _, dir := range []string{".git", "sub", ".claude/worktrees/wt/.git"} {
+		if err := os.MkdirAll(filepath.Join(repo, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nested := filepath.Join(repo, ".claude", "worktrees", "wt")
+
+	index := NewIndex()
+	index.Observe(capture.SessionEvent{SessionID: "s1", Kind: capture.KindMessage, TS: 1, Raw: rawCWD(filepath.Join(repo, "sub"))})
+	if got, _ := index.Get("s1"); got.RepoRoot != repo {
+		t.Errorf("repo root = %q, want %q: a subdirectory is still the same worktree", got.RepoRoot, repo)
+	}
+	index.Observe(capture.SessionEvent{SessionID: "s1", Kind: capture.KindMessage, TS: 2, Raw: rawCWD(nested)})
+	if got, _ := index.Get("s1"); got.RepoRoot != nested {
+		t.Errorf("repo root = %q, want the nested worktree %q", got.RepoRoot, nested)
+	}
 }
 
 func TestAbbreviateGrowsUntilUnique(t *testing.T) {

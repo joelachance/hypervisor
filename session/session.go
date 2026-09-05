@@ -7,6 +7,8 @@
 package session
 
 import (
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -59,7 +61,10 @@ type Session struct {
 	Tool string `json:"tool"`
 	// Model is the last model observed on an event in this session.
 	Model string `json:"model,omitempty"`
-	// RepoRoot is the worktree the session edited, when it can be resolved.
+	// RepoRoot is the worktree the session is working in, when it can be
+	// resolved: the root of the worktree containing its most recent working
+	// directory. A session can be moved - the desktop app changes a session's
+	// directory routinely - and the latest position is the one every UI shows.
 	RepoRoot string `json:"repo_root,omitempty"`
 	// LogPath is the JSONL file the session was read from.
 	LogPath string `json:"log_path,omitempty"`
@@ -141,6 +146,7 @@ func (s Session) Touched(file string) bool {
 type Index struct {
 	sessions map[string]*Session
 	files    map[string]map[string]struct{}
+	roots    map[string]string
 }
 
 // NewIndex returns an empty index.
@@ -148,6 +154,7 @@ func NewIndex() *Index {
 	return &Index{
 		sessions: map[string]*Session{},
 		files:    map[string]map[string]struct{}{},
+		roots:    map[string]string{},
 	}
 }
 
@@ -172,7 +179,10 @@ func (i *Index) Observe(event capture.SessionEvent) {
 	if model := strings.TrimSpace(event.Model); model != "" {
 		current.Model = model
 	}
-	if root := strings.TrimSpace(parse.CWD(event)); root != "" && current.RepoRoot == "" {
+	// The latest directory wins, like the title below: a session can be moved
+	// to another repository mid-flight, and pinning the first directory ever
+	// seen leaves it filed - and planned, and reopened - where it no longer is.
+	if root := i.rootOf(parse.CWD(event)); root != "" {
 		current.RepoRoot = root
 	}
 	// A session can be renamed, and the last name is the one its UI shows.
@@ -197,6 +207,45 @@ func (i *Index) Observe(event capture.SessionEvent) {
 		if file := strings.TrimSpace(event.FilePath); file != "" {
 			i.files[id][file] = struct{}{}
 		}
+	}
+}
+
+// rootOf resolves a recorded working directory to its worktree root, memoized
+// per directory - Observe sees the same few directories tens of thousands of
+// times on a first sweep.
+func (i *Index) rootOf(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return ""
+	}
+	root, ok := i.roots[cwd]
+	if !ok {
+		root = worktreeRoot(cwd)
+		i.roots[cwd] = root
+	}
+	return root
+}
+
+// worktreeRoot is the nearest ancestor of dir holding a .git entry - a
+// directory for the repository itself, a file for a linked worktree. This is a
+// filesystem question, not a git one, so the index needs no git binary.
+//
+// Resolving matters twice over: an agent that cds into a subdirectory has not
+// left its worktree, and one that cds into a nested worktree - the desktop
+// app parks them inside the repository they branch from - has, even though the
+// path still shares the old prefix. A dir outside any worktree, or one that no
+// longer exists, is returned as it is: the recorded directory is still the
+// best available answer.
+func worktreeRoot(dir string) string {
+	for probe := dir; ; {
+		if _, err := os.Stat(filepath.Join(probe, ".git")); err == nil {
+			return probe
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return dir
+		}
+		probe = parent
 	}
 }
 
