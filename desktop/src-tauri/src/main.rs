@@ -379,8 +379,8 @@ fn parse_stream(text: &str) -> Vec<Ev> {
         }
     }
     // Keep the last few exchanges: cap to the trailing 24 events.
-    if events.len() > 24 {
-        events = events.split_off(events.len() - 24);
+    if events.len() > 500 {
+        events = events.split_off(events.len() - 500);
     }
     events
 }
@@ -446,8 +446,8 @@ fn parse_codex_stream(text: &str) -> Vec<Ev> {
             _ => {} // thread.started, turn.*, usage — not rendered
         }
     }
-    if events.len() > 24 {
-        events = events.split_off(events.len() - 24);
+    if events.len() > 500 {
+        events = events.split_off(events.len() - 500);
     }
     events
 }

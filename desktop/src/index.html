@@ -156,9 +156,24 @@
       flex-direction: column;
       justify-content: flex-end;
       gap: 13px;
-      overflow: hidden;
+      overflow-y: auto;
+      overflow-x: hidden;
       padding-bottom: 6px;
+      scroll-behavior: smooth;
     }
+    /* When content overflows, flex-end must yield so scrolling reaches the top. */
+    #transcript.scrolls { justify-content: flex-start; }
+    .a-prose.stream::after {
+      content: "";
+      display: inline-block;
+      width: 6px;
+      height: 12px;
+      margin-left: 3px;
+      background: var(--magenta);
+      vertical-align: text-bottom;
+      animation: caretblink 1s steps(1) infinite;
+    }
+    @keyframes caretblink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
     .u-bubble {
       align-self: flex-end;
       max-width: 74%;
@@ -635,7 +650,20 @@
       return i === -1 ? [text, ""] : [text.slice(0, i), text.slice(i + 2)];
     }
 
-    let transcriptKey = "";
+    function eventEl(e) {
+      const d = document.createElement("div");
+      if (e.kind === "user") { d.className = "u-bubble"; d.textContent = e.text; }
+      else if (e.kind === "tool") {
+        d.className = "tool-row";
+        const [tool, args] = toolParts(e.text);
+        d.innerHTML = `<span class="caret">▸</span><span class="tool">${esc(tool)}</span><span class="args">${esc(args)}</span>`;
+      } else { d.className = "a-prose"; d.textContent = e.text; }
+      return d;
+    }
+    function atBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 40; }
+
+    // Rendered event signatures for the focused session, for incremental append.
+    let tState = { name: "", sigs: [] };
     function renderTranscript(peek) {
       const el = $("transcript");
       const events = peek && peek.events ? peek.events : [];
@@ -647,26 +675,43 @@
           : (gone ? (fresh ? "starting…" : "session gone — its tmux pane no longer exists")
                   : (working ? "working…" : "waiting for output…"));
         el.innerHTML = `<div class="t-empty">${msg}</div>`;
-        transcriptKey = "";
+        el.classList.remove("scrolls");
+        tState = { name: "", sigs: [] };
         return;
       }
-      const key = peek.session.name + "|" + peek.session.running + "|" +
-        events.map((e) => e.kind + e.text).join("\x00");
-      if (key === transcriptKey) return;
-      transcriptKey = key;
-      let html = events.map((e) => {
-        if (e.kind === "user") return `<div class="u-bubble">${esc(e.text)}</div>`;
-        if (e.kind === "tool") {
-          const [tool, args] = toolParts(e.text);
-          return `<div class="tool-row"><span class="caret">▸</span><span class="tool">${esc(tool)}</span><span class="args">${esc(args)}</span></div>`;
-        }
-        return `<div class="a-prose">${esc(e.text)}</div>`;
-      }).join("");
-      if (peek.session.running) {
-        html += `<div class="tool-row" style="opacity:0.7"><span class="caret">▸</span><span class="tool">working…</span></div>`;
+      const sigs = events.map((e) => e.kind + "\x00" + e.text);
+      const wasBottom = atBottom(el);
+      // Longest common prefix with what's already rendered for this session.
+      let common = 0;
+      if (peek.session.name === tState.name) {
+        while (common < sigs.length && common < tState.sigs.length && sigs[common] === tState.sigs[common]) common++;
       }
-      el.innerHTML = html;
-      // ticker summary: last assistant text
+      const pureAppend = peek.session.name === tState.name && common === tState.sigs.length;
+
+      if (!pureAppend) {
+        // Session changed or history rewritten: render fresh.
+        el.innerHTML = "";
+        events.forEach((e) => el.appendChild(eventEl(e)));
+      } else {
+        // Append only the new events.
+        for (let i = common; i < events.length; i++) el.appendChild(eventEl(events[i]));
+      }
+      // A trailing "working…" chip while a turn runs; mark the last prose live.
+      el.querySelector(".working-chip")?.remove();
+      el.querySelectorAll(".a-prose.stream").forEach((n) => n.classList.remove("stream"));
+      if (peek.session.running) {
+        const chip = document.createElement("div");
+        chip.className = "tool-row working-chip";
+        chip.style.opacity = "0.7";
+        chip.innerHTML = `<span class="caret">▸</span><span class="tool">working…</span>`;
+        el.appendChild(chip);
+      }
+      el.classList.toggle("scrolls", el.scrollHeight > el.clientHeight);
+      tState = { name: peek.session.name, sigs };
+
+      // Auto-scroll: follow new output while running, or if already at bottom.
+      if (peek.session.running || wasBottom || !pureAppend) el.scrollTop = el.scrollHeight;
+
       const s = sessions.find((x) => x.name === focused);
       const lastText = [...events].reverse().find((e) => e.kind === "assistant");
       if (s) renderTicker(s, lastText ? lastText.text.slice(0, 110) : "");
@@ -922,11 +967,20 @@
       if (panel && panel.mode === "sessions") renderPanel();
     }
 
+    let lastRunning = false;
     async function refreshDetail() {
-      if (!focused) { renderTranscript(null); return; }
+      if (!focused) { renderTranscript(null); lastRunning = false; return; }
       let peek;
       try { peek = await invoke("peek_session", { name: focused }); } catch (e) { return; }
+      lastRunning = !!(peek && peek.session.running);
       renderTranscript(peek);
+    }
+
+    // Poll the transcript fast while a turn is running (live feel), slow when
+    // idle. A single self-scheduling loop instead of a fixed interval.
+    function scheduleDetail() {
+      const delay = lastRunning ? 400 : 2500;
+      setTimeout(async () => { await refreshDetail(); scheduleDetail(); }, delay);
     }
 
     async function refreshStatus() {
@@ -1070,7 +1124,7 @@
       refreshDetail();
       refreshStatus();
       setInterval(refreshSessions, 5000);
-      setInterval(refreshDetail, 3000);
+      scheduleDetail();
       setInterval(refreshStatus, 5000);
       showFlow();
     }
