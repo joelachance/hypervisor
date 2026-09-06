@@ -770,6 +770,94 @@ fn list_dirs() -> Vec<DirEntry> {
     out
 }
 
+#[derive(serde::Serialize)]
+struct SearchHit {
+    name: String,
+    provider: String,
+    label: String,
+    prompt: String,
+    created_at: u64,
+    messages: u32,
+    snippet: String,
+}
+
+#[derive(serde::Serialize)]
+struct SearchResult {
+    sessions: Vec<SearchHit>,
+    dirs: Vec<DirEntry>,
+    file_count: u32,
+}
+
+/// Unified search across session transcripts and directories. Session hits
+/// match the query terms anywhere in a session's parsed events; directory hits
+/// match the query in their path. `file_count` totals files across dir hits,
+/// for the synthesized-answer row's "N sessions · M files" label.
+#[tauri::command]
+fn search_all(query: String) -> SearchResult {
+    let q = query.trim().to_lowercase();
+    let terms: Vec<&str> = q.split_whitespace().collect();
+    if terms.is_empty() {
+        return SearchResult { sessions: Vec::new(), dirs: Vec::new(), file_count: 0 };
+    }
+
+    let mut sessions: Vec<SearchHit> = fs::read_dir(sessions_dir())
+        .map(|rd| {
+            rd.filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension()? != "json" {
+                    return None;
+                }
+                let s: Session = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+                let events = if s.driver == "stream" {
+                    let text = fs::read_to_string(stream_path(&s.name)).unwrap_or_default();
+                    parse_stream_for(&text, &s.provider)
+                } else {
+                    Vec::new()
+                };
+                // Search the prompt plus all event text.
+                let hay_lines: Vec<String> = std::iter::once(s.prompt.clone())
+                    .chain(events.iter().map(|e| e.text.clone()))
+                    .collect();
+                let hay = hay_lines.join("\n").to_lowercase();
+                if !terms.iter().all(|t| hay.contains(t)) {
+                    return None;
+                }
+                // Snippet: first line containing any term.
+                let snippet = hay_lines
+                    .iter()
+                    .find(|l| {
+                        let low = l.to_lowercase();
+                        terms.iter().any(|t| low.contains(t))
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| s.prompt.clone());
+                Some(SearchHit {
+                    name: s.name,
+                    provider: s.provider,
+                    label: s.label,
+                    prompt: s.prompt,
+                    created_at: s.created_at,
+                    messages: events.len() as u32,
+                    snippet: short(&snippet),
+                })
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let dirs: Vec<DirEntry> = list_dirs()
+        .into_iter()
+        .filter(|d| {
+            let low = d.display.to_lowercase();
+            terms.iter().all(|t| low.contains(t))
+        })
+        .collect();
+    let file_count = dirs.iter().map(|d| d.files).sum();
+
+    SearchResult { sessions, dirs, file_count }
+}
+
 #[tauri::command]
 fn start_session(
     provider: String,
@@ -1258,6 +1346,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         *super::DEFAULT_CWD.lock().unwrap() = None;
     }
+
+    // Seeds a throwaway stream session with a unique token and checks search.
+    #[test]
+    fn search_finds_session_by_content() {
+        let dir = super::sessions_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = format!("hv-searchtest-{}", std::process::id());
+        let token = "ZQXWORDUNIQUE";
+        let json = format!(
+            r#"{{"name":"{name}","provider":"anthropic","model":"sonnet","label":"CLAUDE SONNET","prompt":"debugging the {token} snapshot","created_at":1,"cwd":"/tmp","driver":"stream","session_id":"x","alive":true,"running":false,"done":false,"adds":0,"dels":0,"branch":"","repo":"hv"}}"#
+        );
+        std::fs::write(dir.join(format!("{name}.json")), json).unwrap();
+        let jsonl = format!(
+            "{{\"type\":\"user_prompt\",\"text\":\"debugging the {token} snapshot\"}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"the {token} flush lands after memory\"}}]}}}}\n"
+        );
+        std::fs::write(super::stream_path(&name), jsonl).unwrap();
+
+        let hit = super::search_all(token.into());
+        let mine = hit.sessions.iter().find(|s| s.name == name);
+        assert!(mine.is_some(), "seeded session should be found");
+        let mine = mine.unwrap();
+        assert_eq!(mine.messages, 2, "prompt + assistant reply");
+        assert!(mine.snippet.to_lowercase().contains(&token.to_lowercase()));
+
+        // A term nowhere in the session yields no match for it.
+        let none = super::search_all("nonexistent_kjhgfdsa".into());
+        assert!(none.sessions.iter().all(|s| s.name != name));
+
+        let _ = std::fs::remove_file(dir.join(format!("{name}.json")));
+        let _ = std::fs::remove_file(super::stream_path(&name));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,7 +1433,8 @@ fn main() {
             set_cwd,
             create_worktree,
             switch_branch,
-            working_diff
+            working_diff,
+            search_all
         ])
         .setup(|app| {
             // Overlay, not an app: no Dock icon, no Cmd-Tab entry.
