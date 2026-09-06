@@ -99,8 +99,12 @@ fn reveal_ready(app: AppHandle) {
         let ns_win = ns_win as *mut AnyObject;
         unsafe {
             let _: () = msg_send![ns_win, setLevel: l.level];
-            // Shows without activating the app; keyboard focus stays put.
-            let _: () = msg_send![ns_win, orderFrontRegardless];
+            // Become key so the composer can be typed into immediately (the
+            // page focuses it on overlay-show). Activate the app so an
+            // accessory-policy window can take keyboard focus.
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+            let _: () = msg_send![ns_win, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         }
     }
 }
@@ -782,22 +786,141 @@ struct SearchHit {
 }
 
 #[derive(serde::Serialize)]
-struct SearchResult {
-    sessions: Vec<SearchHit>,
-    dirs: Vec<DirEntry>,
-    file_count: u32,
+struct FileHit {
+    repo: String,
+    path: String,   // repo-relative
+    full: String,   // absolute, for opening
+    line: u32,
+    snippet: String,
 }
 
-/// Unified search across session transcripts and directories. Session hits
-/// match the query terms anywhere in a session's parsed events; directory hits
-/// match the query in their path. `file_count` totals files across dir hits,
-/// for the synthesized-answer row's "N sessions · M files" label.
+#[derive(serde::Serialize)]
+struct MemoryHit {
+    title: String,
+    full: String,
+    snippet: String,
+}
+
+#[derive(serde::Serialize)]
+struct SearchResult {
+    sessions: Vec<SearchHit>,
+    files: Vec<FileHit>,
+    memory: Vec<MemoryHit>,
+}
+
+/// Git repos one level under ~/git, as (name, absolute path).
+fn all_repos() -> Vec<(String, String)> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(format!("{home}/git")) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() && p.join(".git").exists() {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                out.push((name, p.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// git grep (tracked files, all terms must appear) across one repo.
+fn grep_repo(repo: &str, name: &str, terms: &[&str], cap: usize) -> Vec<FileHit> {
+    let mut args: Vec<&str> = vec!["grep", "-n", "-i", "-I", "--all-match"];
+    for t in terms {
+        args.push("-e");
+        args.push(t);
+    }
+    let Some(out) = git(repo, &args) else {
+        return Vec::new();
+    };
+    out.lines()
+        .take(cap)
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, ':');
+            let path = parts.next()?.to_string();
+            let line: u32 = parts.next()?.parse().ok()?;
+            let content = parts.next()?.trim();
+            Some(FileHit {
+                repo: name.to_string(),
+                full: format!("{repo}/{path}"),
+                path,
+                line,
+                snippet: short(content),
+            })
+        })
+        .collect()
+}
+
+/// Search the user's memory markdown (~/.claude/projects/*/memory/*.md).
+fn grep_memory(terms: &[&str], cap: usize) -> Vec<MemoryHit> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = Vec::new();
+    let Ok(projects) = fs::read_dir(format!("{home}/.claude/projects")) else {
+        return out;
+    };
+    for proj in projects.flatten() {
+        let mem = proj.path().join("memory");
+        let Ok(files) = fs::read_dir(&mem) else { continue };
+        for f in files.flatten() {
+            let p = f.path();
+            if p.extension().map(|e| e != "md").unwrap_or(true) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&p) else { continue };
+            let low = text.to_lowercase();
+            if !terms.iter().all(|t| low.contains(t)) {
+                continue;
+            }
+            let snippet = text
+                .lines()
+                .find(|l| {
+                    let ll = l.to_lowercase();
+                    terms.iter().any(|t| ll.contains(t)) && !l.trim().is_empty()
+                })
+                .unwrap_or("")
+                .trim_start_matches(['#', ' ']);
+            out.push(MemoryHit {
+                title: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                full: p.to_string_lossy().into_owned(),
+                snippet: short(snippet),
+            });
+            if out.len() >= cap {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Read a window of a file around `line` (0 = whole file), for viewing a hit.
+#[tauri::command]
+fn read_context(path: String, line: u32) -> Result<String, String> {
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let lines: Vec<&str> = text.lines().collect();
+    if line == 0 || lines.len() <= 80 {
+        return Ok(lines.into_iter().take(400).collect::<Vec<_>>().join("\n"));
+    }
+    let l = line as usize;
+    let start = l.saturating_sub(20);
+    let end = (l + 20).min(lines.len());
+    let body = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{:>5}  {}", start + i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(body)
+}
+
+/// Unified retrieval across session transcripts, repo file contents, and the
+/// user's memory. Pure retrieval — it never starts a session.
 #[tauri::command]
 fn search_all(query: String) -> SearchResult {
     let q = query.trim().to_lowercase();
     let terms: Vec<&str> = q.split_whitespace().collect();
     if terms.is_empty() {
-        return SearchResult { sessions: Vec::new(), dirs: Vec::new(), file_count: 0 };
+        return SearchResult { sessions: Vec::new(), files: Vec::new(), memory: Vec::new() };
     }
 
     let mut sessions: Vec<SearchHit> = fs::read_dir(sessions_dir())
@@ -814,7 +937,6 @@ fn search_all(query: String) -> SearchResult {
                 } else {
                     Vec::new()
                 };
-                // Search the prompt plus all event text.
                 let hay_lines: Vec<String> = std::iter::once(s.prompt.clone())
                     .chain(events.iter().map(|e| e.text.clone()))
                     .collect();
@@ -822,7 +944,6 @@ fn search_all(query: String) -> SearchResult {
                 if !terms.iter().all(|t| hay.contains(t)) {
                     return None;
                 }
-                // Snippet: first line containing any term.
                 let snippet = hay_lines
                     .iter()
                     .find(|l| {
@@ -846,16 +967,18 @@ fn search_all(query: String) -> SearchResult {
         .unwrap_or_default();
     sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    let dirs: Vec<DirEntry> = list_dirs()
-        .into_iter()
-        .filter(|d| {
-            let low = d.display.to_lowercase();
-            terms.iter().all(|t| low.contains(t))
-        })
-        .collect();
-    let file_count = dirs.iter().map(|d| d.files).sum();
+    let mut files = Vec::new();
+    for (name, repo) in all_repos() {
+        if files.len() >= 12 {
+            break;
+        }
+        files.extend(grep_repo(&repo, &name, &terms, 4));
+    }
+    files.truncate(12);
 
-    SearchResult { sessions, dirs, file_count }
+    let memory = grep_memory(&terms, 6);
+
+    SearchResult { sessions, files, memory }
 }
 
 #[tauri::command]
@@ -1434,7 +1557,8 @@ fn main() {
             create_worktree,
             switch_branch,
             working_diff,
-            search_all
+            search_all,
+            read_context
         ])
         .setup(|app| {
             // Overlay, not an app: no Dock icon, no Cmd-Tab entry.
