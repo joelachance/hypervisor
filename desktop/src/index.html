@@ -456,6 +456,10 @@
     <div id="composer-card">
       <input id="composer" placeholder="Ask, steer, or hand off to a subagent…" spellcheck="false" />
       <div id="composer-tools">
+        <span class="chip" id="chip-new" title="new session (⌘N)">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          <span>new</span>
+        </span>
         <span class="chip" id="chip-model">
           <span id="chip-model-icon"></span>
           <span id="chip-model-text">sonnet</span>
@@ -490,6 +494,7 @@
           <span id="sb-cpu">0% cpu</span>
         </span>
         <span class="sb-div"></span>
+        <span class="keyhint" data-open="new"><b>⌘N</b><span>NEW</span></span>
         <span class="keyhint" data-open="commands"><b>/</b><span>COMMANDS</span></span>
         <span class="keyhint" data-open="sessions"><b>⌘L</b><span>SESSIONS</span></span>
         <span class="keyhint" data-open="health"><b>⌘K</b><span>HEALTH</span></span>
@@ -511,10 +516,27 @@
     let focused = null;      // session name
     let focusedAt = 0;       // when it was focused, for the start-up grace window
     let panel = null;        // null | {mode, sel, query, items}
+    // A draft is "the next message starts a NEW session": focus is cleared and
+    // stays cleared until the person picks a session or the draft becomes one.
+    // Without it, auto-focus grabs the first live session right back and there
+    // is no way to leave the one on screen.
+    let draft = false;
 
     function setFocused(name) {
       focused = name;
       focusedAt = Date.now();
+      draft = false;
+    }
+
+    function newDraft() {
+      draft = true;
+      focused = null;
+      closePanel();
+      tState = { name: "", sigs: [] };
+      renderTranscript(null);
+      renderTicker(null, "");
+      refreshStatus();
+      $("composer").focus();
     }
 
     const MODELS = [
@@ -671,7 +693,8 @@
         const gone = peek && !peek.session.alive && !peek.session.done;
         const fresh = Date.now() - focusedAt < 4000;
         const working = peek && peek.session.running;
-        const msg = !focused ? "no session focused"
+        const msg = draft ? "new session — type a prompt to begin"
+          : !focused ? "no session focused"
           : (gone ? (fresh ? "starting…" : "session gone — its tmux pane no longer exists")
                   : (working ? "working…" : "waiting for output…"));
         el.innerHTML = `<div class="t-empty">${msg}</div>`;
@@ -719,6 +742,7 @@
 
     // ---------------- panel system ----------------
     const COMMANDS = [
+      { group: "GO", cmd: "/new", desc: "start a new session in the current directory", key: "⌘N", run: () => newDraft() },
       { group: "GO", cmd: "/sessions", desc: "browse and resume past sessions", key: "⌘L", run: () => openPanel("sessions") },
       { group: "GO", cmd: "/health", desc: "tokens, context, tests, review", key: "⌘K", run: () => openPanel("health") },
       { group: "GO", cmd: "/cd", desc: "fuzzy find a working directory", key: "", run: () => openPanel("dir") },
@@ -949,9 +973,14 @@
       } else if (panel.mode === "commands") {
         if (row.run) { row.run(); } else { /* stub */ }
       } else if (panel.mode === "dir") {
-        try { await invoke("set_cwd", { path: row.path }); } catch (e) {}
-        closePanel();
-        refreshStatus();
+        const dir = row.path;
+        try { await invoke("set_cwd", { path: dir }); }
+        catch (e) { closePanel(); setComposerNote(String(e)); return; }
+        // A focused session cannot move, so picking a directory means "work
+        // THERE next": begin a draft, which shows the new directory in the
+        // status bar and routes the next message to a session started in it.
+        newDraft();
+        setComposerNote("new session in " + dir.split("/").pop() + " — type a prompt");
       } else {
         closePanel();
       }
@@ -960,7 +989,7 @@
     // ---------------- data refresh ----------------
     async function refreshSessions() {
       try { sessions = await invoke("list_sessions"); } catch (e) { return; }
-      if (!focused) {
+      if (!focused && !draft) {
         const first = sessions.find((s) => s.alive) || sessions.find((s) => s.done);
         if (first) { setFocused(first.name); refreshDetail(); }
       }
@@ -984,7 +1013,9 @@
     }
 
     async function refreshStatus() {
-      const s = sessions.find((x) => x.name === focused);
+      // A draft belongs to the default directory (the one the picker just
+      // set), not to whatever session was focused before.
+      const s = draft ? null : sessions.find((x) => x.name === focused);
       let info;
       try { info = await invoke("status_info", { cwd: s ? s.cwd : null }); } catch (e) { return; }
       $("sb-cwd-text").textContent = info.cwd;
@@ -1064,6 +1095,7 @@
       const inInput = document.activeElement === $("composer");
       if (e.metaKey && e.key.toLowerCase() === "l") { e.preventDefault(); openPanel("sessions"); return; }
       if (e.metaKey && e.key.toLowerCase() === "k") { e.preventDefault(); openPanel("health"); return; }
+      if (e.metaKey && e.key.toLowerCase() === "n") { e.preventDefault(); newDraft(); return; }
 
       if (panel && panel.mode === "text") {
         if (e.key === "Escape") closePanel();
@@ -1108,11 +1140,15 @@
       draw();
       $("sb-cwd").addEventListener("click", () => openPanel("dir"));
       $("chip-cwd").addEventListener("click", () => openPanel("dir"));
+      $("chip-new").addEventListener("click", newDraft);
       $("chip-model").addEventListener("click", () => { modelIdx = (modelIdx + 1) % MODELS.length; renderModelChip(); });
       $("send-btn").addEventListener("click", submitComposer);
       renderModelChip();
       document.querySelectorAll(".keyhint").forEach((el) => {
-        el.addEventListener("click", () => openPanel(el.dataset.open === "commands" ? "commands" : el.dataset.open));
+        el.addEventListener("click", () => {
+          if (el.dataset.open === "new") { newDraft(); return; }
+          openPanel(el.dataset.open === "commands" ? "commands" : el.dataset.open);
+        });
       });
       try {
         const listen = window.__TAURI__.event.listen;
