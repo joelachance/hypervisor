@@ -128,8 +128,15 @@ func Apply(sessions []session.Session, records map[string]Record) []session.Sess
 		if branch := strings.TrimSpace(record.Branch); branch != "" {
 			current.Branch = branch
 		}
-		if current.RepoRoot == "" {
-			current.RepoRoot = record.CWD
+		// The registry is also where a moved session shows up first: the app's
+		// directory control writes cwd here the moment it is changed, while the
+		// transcript only records the new directory on the session's next turn.
+		// So the registry wins whenever its record is at least as fresh as the
+		// transcript, and an older record - a session resumed in a terminal
+		// after the app last saw it - defers to what the transcript says.
+		if cwd := strings.TrimSpace(record.CWD); cwd != "" &&
+			(current.RepoRoot == "" || record.LastActivityAt >= current.LastActiveAt) {
+			current.RepoRoot = session.WorktreeRoot(cwd)
 		}
 		current.AppSessionID = record.AppSessionID
 		out = append(out, current)

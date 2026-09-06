@@ -220,13 +220,13 @@ func (i *Index) rootOf(cwd string) string {
 	}
 	root, ok := i.roots[cwd]
 	if !ok {
-		root = worktreeRoot(cwd)
+		root = WorktreeRoot(cwd)
 		i.roots[cwd] = root
 	}
 	return root
 }
 
-// worktreeRoot is the nearest ancestor of dir holding a .git entry - a
+// WorktreeRoot is the nearest ancestor of dir holding a .git entry - a
 // directory for the repository itself, a file for a linked worktree. This is a
 // filesystem question, not a git one, so the index needs no git binary.
 //
@@ -236,7 +236,7 @@ func (i *Index) rootOf(cwd string) string {
 // path still shares the old prefix. A dir outside any worktree, or one that no
 // longer exists, is returned as it is: the recorded directory is still the
 // best available answer.
-func worktreeRoot(dir string) string {
+func WorktreeRoot(dir string) string {
 	for probe := dir; ; {
 		if _, err := os.Stat(filepath.Join(probe, ".git")); err == nil {
 			return probe

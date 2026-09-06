@@ -84,6 +84,27 @@ func TestApplyPrefersTheAppTitle(t *testing.T) {
 	}
 }
 
+// Changing a session's directory in the app writes the registry immediately;
+// the transcript catches up only on the next turn. Until then the registry is
+// the fresher fact and must win, or the change looks like it did nothing.
+func TestApplyFollowsTheAppsDirectoryChange(t *testing.T) {
+	sessions := []session.Session{{ID: "cli-1", RepoRoot: "/old", LastActiveAt: 100}}
+	records := map[string]Record{"cli-1": {CLISessionID: "cli-1", CWD: "/new", LastActivityAt: 200}}
+	if got := Apply(sessions, records)[0]; got.RepoRoot != "/new" {
+		t.Fatalf("repo root = %q, want the directory the app moved the session to", got.RepoRoot)
+	}
+}
+
+// A session resumed in a terminal after the app last saw it has a stale
+// registry record; the transcript is the fresher fact there.
+func TestApplyKeepsTheTranscriptRootWhenTheRecordIsStale(t *testing.T) {
+	sessions := []session.Session{{ID: "cli-1", RepoRoot: "/current", LastActiveAt: 900}}
+	records := map[string]Record{"cli-1": {CLISessionID: "cli-1", CWD: "/abandoned", LastActivityAt: 100}}
+	if got := Apply(sessions, records)[0]; got.RepoRoot != "/current" {
+		t.Fatalf("repo root = %q, want the transcript's root over a stale registry record", got.RepoRoot)
+	}
+}
+
 func TestApplyLeavesUnknownSessionsAlone(t *testing.T) {
 	sessions := []session.Session{{ID: "cli-9", Title: "from the transcript"}}
 	got := Apply(sessions, map[string]Record{})[0]
