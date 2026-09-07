@@ -824,23 +824,45 @@ fn all_repos() -> Vec<(String, String)> {
     out
 }
 
-/// git grep (tracked files, all terms must appear) across one repo.
+/// git grep (tracked files, all terms must appear) across one repo, skipping
+/// data/generated files and minified blobs so results stay readable source.
 fn grep_repo(repo: &str, name: &str, terms: &[&str], cap: usize) -> Vec<FileHit> {
     let mut args: Vec<&str> = vec!["grep", "-n", "-i", "-I", "--all-match"];
     for t in terms {
         args.push("-e");
         args.push(t);
     }
+    // Pathspec exclusions: data, lockfiles, minified, maps, and snapshots.
+    args.push("--");
+    args.push(".");
+    for excl in [
+        ":(exclude)*.jsonl",
+        ":(exclude)*.lock",
+        ":(exclude)*-lock.json",
+        ":(exclude)package-lock.json",
+        ":(exclude)*.min.js",
+        ":(exclude)*.min.css",
+        ":(exclude)*.map",
+        ":(exclude)*.snap",
+        ":(exclude)**/fixtures/**",
+        ":(exclude)**/testdata/**",
+        ":(exclude)**/*.json", // data blobs; keeps config .json rare miss over noise
+    ] {
+        args.push(excl);
+    }
     let Some(out) = git(repo, &args) else {
         return Vec::new();
     };
     out.lines()
-        .take(cap)
         .filter_map(|l| {
             let mut parts = l.splitn(3, ':');
             let path = parts.next()?.to_string();
             let line: u32 = parts.next()?.parse().ok()?;
             let content = parts.next()?.trim();
+            // Skip minified/data lines: a readable source line isn't 300+ chars.
+            if content.chars().count() > 300 {
+                return None;
+            }
             Some(FileHit {
                 repo: name.to_string(),
                 full: format!("{repo}/{path}"),
@@ -849,6 +871,7 @@ fn grep_repo(repo: &str, name: &str, terms: &[&str], cap: usize) -> Vec<FileHit>
                 snippet: short(content),
             })
         })
+        .take(cap)
         .collect()
 }
 
