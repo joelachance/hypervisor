@@ -916,6 +916,77 @@ fn grep_memory(terms: &[&str], cap: usize) -> Vec<MemoryHit> {
     out
 }
 
+/// Synthesize a natural-language answer to a query from the user's sessions,
+/// repos, and memory. Runs one headless `claude -p` turn and returns its prose
+/// — ephemeral: it is NOT saved as a hypervisor session.
+#[tauri::command]
+fn search_answer(query: String) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("empty query".into());
+    }
+    let found = search_all(q.to_string());
+
+    // Assemble grounding context from the retrieval hits.
+    let mut ctx = String::new();
+    if !found.sessions.is_empty() {
+        ctx.push_str("## Past sessions\n");
+        for s in found.sessions.iter().take(8) {
+            ctx.push_str(&format!("- {} ({}): {}\n", s.label, s.prompt, s.snippet));
+        }
+    }
+    if !found.files.is_empty() {
+        ctx.push_str("\n## Code (repo · path:line)\n");
+        for f in found.files.iter().take(14) {
+            ctx.push_str(&format!("- {} · {}:{}  {}\n", f.repo, f.path, f.line, f.snippet));
+        }
+    }
+    if !found.memory.is_empty() {
+        ctx.push_str("\n## Memory notes\n");
+        for m in found.memory.iter().take(6) {
+            ctx.push_str(&format!("- {}: {}\n", m.title, m.snippet));
+        }
+    }
+    if ctx.is_empty() {
+        ctx.push_str("(no direct matches found in sessions, repos, or memory)\n");
+    }
+
+    let prompt = format!(
+        "You are answering a question about the user's own work across their projects, past agent sessions, and notes. \
+Using the retrieved context below, answer in clear, concise natural language — a few short paragraphs or tight bullet points, not a data dump. \
+Cite specifics (repo names, files) where useful. If the context is thin, say what you can and note what's missing.\n\n\
+Question: {q}\n\n\
+Retrieved context:\n{ctx}"
+    );
+
+    let cwd = default_cwd();
+    let out = Command::new("claude")
+        .args([
+            "-p",
+            &prompt,
+            "--model",
+            "sonnet",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| format!("claude: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let answer: String = parse_stream(&text)
+        .into_iter()
+        .filter(|e| e.kind == "assistant")
+        .map(|e| e.text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if answer.trim().is_empty() {
+        Err("no answer returned".into())
+    } else {
+        Ok(answer)
+    }
+}
+
 /// Read a window of a file around `line` (0 = whole file), for viewing a hit.
 #[tauri::command]
 fn read_context(path: String, line: u32) -> Result<String, String> {
@@ -1581,6 +1652,7 @@ fn main() {
             switch_branch,
             working_diff,
             search_all,
+            search_answer,
             read_context
         ])
         .setup(|app| {
