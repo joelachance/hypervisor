@@ -33,7 +33,9 @@ func press(m tea.Model, keys ...string) tea.Model {
 	for _, key := range keys {
 		switch key {
 		case " ":
-			m, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+			// A real terminal delivers space as KeySpace with the rune
+			// attached; sending both fields is what catches double-appends.
+			m, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
 		case "enter":
 			m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 		default:
@@ -72,6 +74,51 @@ func TestFilterNarrowsRows(t *testing.T) {
 	view := press(m, "/", "b", "e", "n").View()
 	if !strings.Contains(view, "benchmarks") || strings.Contains(view, "How demux works") {
 		t.Fatalf("filter did not narrow the list:\n%s", view)
+	}
+}
+
+// A space typed into the filter must land as one space, or a query like
+// "how demux" can never match a single-spaced title.
+func TestFilterAcceptsSpaces(t *testing.T) {
+	m := NewForTest(fixture())
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	view := press(m, "/", "h", "o", "w", " ", "d", "e", "m", "u", "x").View()
+	if !strings.Contains(view, "How demux works") {
+		t.Fatalf("a filter with a space matched nothing:\n%s", view)
+	}
+	if strings.Contains(view, "benchmarks") {
+		t.Fatal("filter with a space did not narrow the list")
+	}
+}
+
+// A terminal paste arrives as one key event carrying every rune; the filter
+// must take it whole rather than treating it as an unbound key.
+func TestFilterAcceptsPaste(t *testing.T) {
+	m := NewForTest(fixture())
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	m = press(m, "/")
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("how demux"), Paste: true})
+	view := m.View()
+	if !strings.Contains(view, "How demux works") {
+		t.Fatalf("pasted filter matched nothing:\n%s", view)
+	}
+}
+
+// The filter is a real text field: the cursor moves, and edits land where it
+// sits instead of only at the end.
+func TestFilterSupportsEditingKeys(t *testing.T) {
+	m := NewForTest(fixture())
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	m = press(m, "/", "o", "w", " ", "d", "e", "m", "u", "x")
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlA}) // to line start
+	m = press(m, "h")
+	if view := m.View(); !strings.Contains(view, "how demux") {
+		t.Fatalf("h did not land at the cursor after ctrl+a:\n%s", view)
+	}
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlE}) // to line end
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlU}) // delete back to the start
+	if view := m.View(); !strings.Contains(view, "benchmarks") {
+		t.Fatalf("ctrl+e, ctrl+u did not clear the filter:\n%s", view)
 	}
 }
 

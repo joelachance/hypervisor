@@ -91,6 +91,7 @@ func (m model) updateBrowse(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "/":
 		m.mode = modeFilter
+		m.startEntry("/", m.filter)
 	case "ctrl+r":
 		m.status = "rescanning…"
 		return m, refresh(m.watcher)
@@ -294,7 +295,7 @@ func (m model) footer() string {
 		}, styleDim.Render("  ·  ")))
 	}
 	if m.mode == modeFilter {
-		return styleFilter.Width(m.width).Render("/" + m.filter + "█")
+		return styleFilter.Width(m.width).Render(m.entry.View())
 	}
 	key := func(k, label string) string { return styleKey.Render(k) + styleDim.Render(" "+label) }
 	// Ordered by how often they are needed: a narrow terminal loses the tail

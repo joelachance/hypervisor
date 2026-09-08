@@ -120,6 +120,7 @@ func (m model) updatePlan(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "b":
 		// Name the branch these commits land on.
 		m.mode = modeBranch
+		m.startEntry("commit to branch: ", m.target)
 		return m, nil
 
 	case "p":
@@ -370,7 +371,7 @@ func diffLine(line string, width int) string {
 
 func (m model) planFooter() string {
 	if m.mode == modeBranch {
-		return styleFilter.Width(m.width).Render("commit to branch: " + m.target + "█")
+		return styleFilter.Width(m.width).Render(m.entry.View())
 	}
 	key := func(k, label string) string { return styleKey.Render(k) + styleDim.Render(" "+label) }
 	pane := "diff"

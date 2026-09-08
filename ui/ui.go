@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/cursor"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -89,6 +91,9 @@ type model struct {
 	plan       planCursor
 	dryRun     bool
 	target     string
+	// entry edits whichever text field the mode says is open - the filter or
+	// the branch target - so both get the same paste and readline keys.
+	entry textinput.Model
 	applied    journal.Entry
 	filter     string
 	archived   bool
@@ -265,7 +270,41 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateBrowse(msg)
 		}
 	}
+	// Whatever the entry's own commands produce - a clipboard read for
+	// ctrl+v, mostly - comes back as a message only the entry understands.
+	if m.mode == modeFilter || m.mode == modeBranch {
+		return m.forwardToEntry(message)
+	}
 	return m, nil
+}
+
+// startEntry opens the shared text field over an existing value, cursor at
+// the end. The cursor is static because nothing else in the program ticks,
+// and a blink loop is not worth plumbing messages for.
+func (m *model) startEntry(prompt, value string) {
+	entry := textinput.New()
+	entry.Prompt = prompt
+	entry.SetValue(value)
+	entry.Cursor.SetMode(cursor.CursorStatic)
+	entry.Focus()
+	m.entry = entry
+}
+
+// forwardToEntry hands a message to the text field and mirrors its value into
+// whichever string the open mode edits, filtering live as the filter changes.
+func (m model) forwardToEntry(message tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	m.entry, cmd = m.entry.Update(message)
+	switch m.mode {
+	case modeFilter:
+		if m.filter != m.entry.Value() {
+			m.filter = m.entry.Value()
+			m.applyFilter()
+		}
+	case modeBranch:
+		m.target = m.entry.Value()
+	}
+	return m, cmd
 }
 
 func (m model) updateFilter(key tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -276,19 +315,9 @@ func (m model) updateFilter(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filter = ""
 			m.applyFilter()
 		}
-	case tea.KeyBackspace:
-		if m.filter != "" {
-			m.filter = m.filter[:len(m.filter)-1]
-			m.applyFilter()
-		}
-	case tea.KeyRunes, tea.KeySpace:
-		m.filter += string(key.Runes)
-		if key.Type == tea.KeySpace {
-			m.filter += " "
-		}
-		m.applyFilter()
+		return m, nil
 	}
-	return m, nil
+	return m.forwardToEntry(key)
 }
 
 // updateBranch reads the branch to commit to. Typing it here is the difference
@@ -303,18 +332,14 @@ func (m model) updateBranch(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.status = "committing to " + m.target
 		}
+		return m, nil
 	case tea.KeyEscape:
 		m.mode = modeBrowse
 		m.target = ""
 		m.status = "target cleared"
-	case tea.KeyBackspace:
-		if m.target != "" {
-			m.target = m.target[:len(m.target)-1]
-		}
-	case tea.KeyRunes:
-		m.target += string(key.Runes)
+		return m, nil
 	}
-	return m, nil
+	return m.forwardToEntry(key)
 }
 
 type launchedMsg struct {
