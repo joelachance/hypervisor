@@ -154,7 +154,7 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 	// that worktree's index and HEAD would disagree, and git would show its
 	// owner phantom changes. Refused before any ref moves, so nothing needs
 	// undoing.
-	if err := refuseCheckedOutElsewhere(ctx, repoRoot, run.tips); err != nil {
+	if err := RefuseCheckedOutElsewhere(ctx, repoRoot, run.tips); err != nil {
 		return entry, err
 	}
 	// A detached HEAD or an unborn branch has no name, and the error is the
@@ -292,9 +292,9 @@ func (r *run) commitRemainder(last string) (journal.Commit, error) {
 	}, nil
 }
 
-// refuseCheckedOutElsewhere fails when any branch about to move is checked
+// RefuseCheckedOutElsewhere fails when any branch about to move is checked
 // out in a worktree other than this one.
-func refuseCheckedOutElsewhere(ctx context.Context, repoRoot string, tips map[string]string) error {
+func RefuseCheckedOutElsewhere(ctx context.Context, repoRoot string, tips map[string]string) error {
 	elsewhere, err := branchesCheckedOutElsewhere(ctx, repoRoot)
 	if err != nil {
 		return err
@@ -458,8 +458,10 @@ func resolveUnmerged(ctx context.Context, repoRoot string, env []string, revisio
 		if err != nil {
 			return nil, err
 		}
+		// The resolved file keeps the mode the branch gave it; a script
+		// does not stop being executable because a harness touched it.
 		if _, err := gitx.RunIn(ctx, repoRoot, env, "update-index", "--add", "--cacheinfo",
-			fmt.Sprintf("100644,%s,%s", blob, path)); err != nil {
+			fmt.Sprintf("%s,%s,%s", stages[path].Mode(), blob, path)); err != nil {
 			return nil, err
 		}
 		resolved = append(resolved, path)
@@ -468,11 +470,11 @@ func resolveUnmerged(ctx context.Context, repoRoot string, env []string, revisio
 }
 
 // resolveFile rebuilds one conflicted file, asking the resolver per region.
-func resolveFile(ctx context.Context, repoRoot, path string, stage [3]string, revision demux.RevisionProposal, options Options) (string, error) {
-	merged, err := gitx.MergeFile(ctx, repoRoot, stage[0], stage[1], stage[2],
+func resolveFile(ctx context.Context, repoRoot, path string, stage gitx.Stage, revision demux.RevisionProposal, options Options) (string, error) {
+	merged, err := gitx.MergeFile(ctx, repoRoot, stage.Blobs[0], stage.Blobs[1], stage.Blobs[2],
 		[3]string{"base", "on the branch", "this revision"})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%s: %w", path, err)
 	}
 	regions := gitx.ParseRegions(merged)
 	if len(regions) == 0 {

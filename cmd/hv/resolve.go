@@ -65,7 +65,7 @@ func resolveCmd(ctx context.Context, args []string) error {
 	}
 	if *dryRun {
 		printConflicts(report)
-		fmt.Fprintln(os.Stderr, "\ndry run: fx was not asked and nothing was committed")
+		fmt.Fprintln(os.Stderr, "\ndry run: no harness was asked and nothing was committed")
 		return nil
 	}
 

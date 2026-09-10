@@ -170,3 +170,41 @@ func TestChangeSummaryTagsTheRightFile(t *testing.T) {
 func gitCmd(repo string, args ...string) ([]byte, error) {
 	return exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
 }
+
+// A conflicted script that a resolver settles keeps its executable bit.
+func TestResolvedFileKeepsItsMode(t *testing.T) {
+	repo := repoWith(t, map[string]string{"run.sh": "#!/bin/sh\necho 1\n"})
+	run := func(args ...string) {
+		t.Helper()
+		if out, err := gitCmd(repo, args...); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("update-index", "--chmod=+x", "run.sh")
+	run("commit", "-qm", "executable")
+	run("checkout", "-q", "-b", "feature/x")
+	// WriteFile does not change an existing file's mode; the bit has to be
+	// set for real or commit -a would record the branch at 100644.
+	if err := os.Chmod(filepath.Join(repo, "run.sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "run.sh"), []byte("#!/bin/sh\necho branch\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run("commit", "-qam", "branch work")
+	run("checkout", "-q", "main")
+	if err := os.WriteFile(filepath.Join(repo, "run.sh"), []byte("#!/bin/sh\necho 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realPatch := gitOut(t, repo, "diff", "--no-color")
+	plan := packet(
+		[]demux.RevisionProposal{{ID: "u1", Intent: "bump", HunkIDs: []string{"h1"}, TargetStack: "feature/x"}},
+		[]demux.HunkRange{{ID: "h1", File: "run.sh", Patch: realPatch}})
+	resolver := &fakeResolver{reply: func(ConflictRequest) []string { return []string{"echo branch and 2"} }}
+	if _, err := Apply(context.Background(), repo, plan, Options{Resolver: resolver}); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if got := gitOut(t, repo, "ls-tree", "feature/x", "run.sh"); !strings.HasPrefix(got, "100755") {
+		t.Fatalf("run.sh = %s, want mode 100755 kept", got)
+	}
+}

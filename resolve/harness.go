@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/satoricorp/hv/apply"
@@ -65,19 +66,30 @@ type Rewrite struct {
 	Why  string `json:"why,omitempty"`
 }
 
+// Addition is a line the resolution introduces that came from neither side -
+// an import both halves now need, say. It has to be declared with a reason,
+// or a line from nowhere is indistinguishable from an agent slipping
+// something in.
+type Addition struct {
+	Line string `json:"line"`
+	Why  string `json:"why,omitempty"`
+}
+
 // Resolution is the agent's answer, in the shape hv can verify.
 type Resolution struct {
 	// Resolved is the replacement for the region, line by line.
 	Resolved []string `json:"resolved"`
 	// KeptOurs and KeptTheirs are the lines from each side the resolution
 	// preserves verbatim; Rewritten are lines it replaced; Dropped are lines
-	// it left out, each with a reason. Between them they must account for
-	// every line of both sides - that is the whole check.
-	KeptOurs   []string  `json:"kept_ours"`
-	KeptTheirs []string  `json:"kept_theirs"`
-	Rewritten  []Rewrite `json:"rewritten"`
-	Dropped    []string  `json:"dropped"`
-	Reasoning  string    `json:"reasoning"`
+	// it left out, each with a reason; Added are lines from neither side.
+	// Between them they must account for every line of both sides and every
+	// line of the resolution - that is the whole check.
+	KeptOurs   []string   `json:"kept_ours"`
+	KeptTheirs []string   `json:"kept_theirs"`
+	Rewritten  []Rewrite  `json:"rewritten"`
+	Dropped    []string   `json:"dropped"`
+	Added      []Addition `json:"added,omitempty"`
+	Reasoning  string     `json:"reasoning"`
 }
 
 // Harness runs any coding agent that can answer one question on stdout.
@@ -263,8 +275,10 @@ func Prompt(request Request) string {
 Keep both intents working if that is possible.
 
 Every line of both versions above must be accounted for exactly once: kept
-verbatim, rewritten into something else, or dropped with a reason. That
-accounting is checked, and a resolution that leaves a line out of it is
+verbatim, rewritten into something else, or dropped with a reason. Every line
+of your resolution must be one of the kept or rewritten lines, or declared as
+added with a reason. That accounting is checked both ways, and a resolution
+that leaves a line out of it, or contains a line it does not explain, is
 rejected.
 
 Reply with only a JSON object, no prose around it:
@@ -275,6 +289,7 @@ Reply with only a JSON object, no prose around it:
   "kept_theirs": ["lines from the second version that survive verbatim"],
   "rewritten": [{"from": "an input line", "to": "what it became", "why": "short reason"}],
   "dropped": ["any line you left out, each with a reason after ' -- '"],
+  "added": [{"line": "a line from neither version", "why": "short reason"}],
   "reasoning": "one sentence"
 }
 `)
@@ -330,49 +345,178 @@ func between(text, open, close string) string {
 
 // Verify checks a resolution against the region it claims to resolve.
 //
-// This is the guard that makes an agent's answer safe to commit: a line that
-// existed on either side must appear in the resolution, be claimed as kept, or
-// be listed as dropped with a reason. Anything else has gone missing quietly,
-// which is the one failure mode nobody would notice.
+// This is the guard that makes an agent's answer safe to commit, and it is
+// checked in both directions. Every line of both sides must be claimed
+// exactly once - kept, rewritten, or dropped with a reason - and every claim
+// must be true: a kept line has to be in the resolution, a rewrite's result
+// has to be in the resolution, and a claimed line has to have existed. Then
+// the resolution is read back: every line in it must be one of those kept or
+// rewritten or added lines, no more often than it was claimed, so nothing
+// invented and nothing duplicated gets through either. Blank lines and
+// leading or trailing whitespace are not counted.
 func Verify(request Request, resolution Resolution) []string {
 	problems := []string{}
-	resolved := strings.Join(resolution.Resolved, "\n")
-	accounted := func(line string) bool {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			return true
+	fail := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
+
+	keptOurs, keptTheirs := multiset(resolution.KeptOurs), multiset(resolution.KeptTheirs)
+	// A line both sides had may be listed under either; the copies read
+	// against the other side without being consumed.
+	sharedOurs, sharedTheirs := multiset(resolution.KeptOurs), multiset(resolution.KeptTheirs)
+	rewrittenFrom := counts{}
+	for _, rewrite := range resolution.Rewritten {
+		if strings.TrimSpace(rewrite.From) == "" || strings.TrimSpace(rewrite.To) == "" {
+			fail("a rewrite is missing its from or to line")
+			continue
 		}
-		if strings.Contains(resolved, trimmed) {
-			return true
-		}
-		for _, kept := range append(append([]string{}, resolution.KeptOurs...), resolution.KeptTheirs...) {
-			if strings.TrimSpace(kept) == trimmed {
-				return true
-			}
-		}
-		for _, dropped := range resolution.Dropped {
-			if strings.Contains(dropped, trimmed) {
-				return true
-			}
-		}
-		for _, rewrite := range resolution.Rewritten {
-			if strings.TrimSpace(rewrite.From) == trimmed {
-				return true
-			}
-		}
-		return false
+		rewrittenFrom.add(rewrite.From)
 	}
-	for _, line := range request.Ours {
-		if !accounted(line) {
-			problems = append(problems, fmt.Sprintf("%s: line not kept, dropped, or explained: %s", request.OursFrom, strings.TrimSpace(line)))
+	dropped := counts{}
+	for _, entry := range resolution.Dropped {
+		line, reason, ok := strings.Cut(entry, " -- ")
+		if !ok || strings.TrimSpace(reason) == "" {
+			fail("dropped without a reason: %s", strings.TrimSpace(entry))
+			continue
+		}
+		dropped.add(line)
+	}
+
+	// Every input line, claimed once - or, failing a claim, simply present
+	// in the resolution, which is what kept means.
+	resolved := multiset(resolution.Resolved)
+	account := func(from string, lines []string, own, other counts) {
+		for _, line := range lines {
+			key := strings.TrimSpace(line)
+			if key == "" {
+				continue
+			}
+			switch {
+			case own.take(key), rewrittenFrom.take(key), other.has(key):
+			case dropped.take(key):
+				if resolved.has(key) {
+					fail("dropped but still in the resolution: %s", key)
+				}
+			case resolved.has(key):
+			default:
+				fail("%s: line not kept, rewritten, or dropped: %s", from, key)
+			}
 		}
 	}
-	for _, line := range request.Theirs {
-		if !accounted(line) {
-			problems = append(problems, fmt.Sprintf("%s: line not kept, dropped, or explained: %s", request.TheirsFrom, strings.TrimSpace(line)))
+	account(request.OursFrom, request.Ours, keptOurs, sharedTheirs)
+	account(request.TheirsFrom, request.Theirs, keptTheirs, sharedOurs)
+
+	// Every claim, about a line that existed.
+	for _, leftover := range []struct {
+		name string
+		rest counts
+	}{{"kept_ours", keptOurs}, {"kept_theirs", keptTheirs}, {"rewritten", rewrittenFrom}, {"dropped", dropped}} {
+		for _, line := range leftover.rest.remaining() {
+			if leftover.name == "kept_ours" && sharedTheirs.has(line) || leftover.name == "kept_theirs" && sharedOurs.has(line) {
+				continue
+			}
+			if hasLine(request.Ours, line) || hasLine(request.Theirs, line) {
+				// Claimed more often than it appeared.
+				fail("%s claims %q more times than the sides had it", leftover.name, line)
+				continue
+			}
+			fail("%s claims a line neither side had: %s", leftover.name, line)
+		}
+	}
+
+	// Every claim, true of the resolution; and the resolution, nothing but
+	// input lines, rewrites, and declared additions - each no more often
+	// than the sides had it or the claims allow.
+	explained := counts{}
+	for _, line := range append(append([]string{}, request.Ours...), request.Theirs...) {
+		if strings.TrimSpace(line) != "" {
+			explained.add(line)
+		}
+	}
+	for _, kept := range append(append([]string{}, resolution.KeptOurs...), resolution.KeptTheirs...) {
+		if strings.TrimSpace(kept) == "" {
+			continue
+		}
+		if !resolved.has(kept) {
+			fail("claimed kept but not in the resolution: %s", strings.TrimSpace(kept))
+		}
+	}
+	for _, rewrite := range resolution.Rewritten {
+		if strings.TrimSpace(rewrite.To) == "" {
+			continue
+		}
+		if !resolved.has(rewrite.To) {
+			fail("rewritten to a line that is not in the resolution: %s", strings.TrimSpace(rewrite.To))
+		}
+		explained.add(rewrite.To)
+	}
+	for _, added := range resolution.Added {
+		if strings.TrimSpace(added.Line) == "" {
+			continue
+		}
+		if strings.TrimSpace(added.Why) == "" {
+			fail("added without a reason: %s", strings.TrimSpace(added.Line))
+		}
+		if !resolved.has(added.Line) {
+			fail("added a line that is not in the resolution: %s", strings.TrimSpace(added.Line))
+		}
+		explained.add(added.Line)
+	}
+	for _, line := range resolution.Resolved {
+		key := strings.TrimSpace(line)
+		if key == "" {
+			continue
+		}
+		if !explained.take(key) {
+			fail("line in the resolution that came from neither side and was not declared added, or a duplicate: %s", key)
 		}
 	}
 	return problems
+}
+
+// counts is a multiset of trimmed lines.
+type counts map[string]int
+
+func multiset(lines []string) counts {
+	out := counts{}
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			out.add(line)
+		}
+	}
+	return out
+}
+
+func (c counts) add(line string) { c[strings.TrimSpace(line)]++ }
+
+func (c counts) has(line string) bool { return c[strings.TrimSpace(line)] > 0 }
+
+// take consumes one occurrence, reporting whether there was one.
+func (c counts) take(line string) bool {
+	key := strings.TrimSpace(line)
+	if c[key] == 0 {
+		return false
+	}
+	c[key]--
+	return true
+}
+
+func (c counts) remaining() []string {
+	out := []string{}
+	for line, count := range c {
+		for ; count > 0; count-- {
+			out = append(out, line)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func hasLine(lines []string, want string) bool {
+	for _, line := range lines {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // RequestFor builds the question for one step of a conflict report.

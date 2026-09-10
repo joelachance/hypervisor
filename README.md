@@ -153,8 +153,11 @@ beta retry bug was asked: fix the retry bug in beta
 ```
 
 Naming the sessions is the part git cannot do. `-json` adds an `accounting`
-block that proves nothing was lost: every conflicted line belongs to a step,
-and `complete` is false if any does not.
+block that proves nothing was lost: the conflicted lines are counted from the
+marked-up text git produced, the steps are summed separately, and `complete`
+is false if the two disagree. A file git cannot show line by line - a binary
+both sides changed - gets a whole-file step and is listed as unaccounted,
+because nothing line-level can be said about it.
 
 ## Resolving with a coding agent
 
@@ -174,15 +177,20 @@ versions in full, and what each session was asked to do - **never the
 repository**, and it runs in a scratch directory so its edit tools have
 nothing to reach. It
 answers with the resolved lines plus an account of what it kept from each side.
-hv checks that account before anything is written: a line that existed on
-either side must survive, be claimed as kept, or be listed as dropped with a
-reason. A resolution that quietly loses a line is refused and no branch is
+hv checks that account both ways before anything is written. Every line of
+both sides must be accounted for exactly once - kept verbatim, rewritten into
+something else, or dropped with a reason - and every claim must be true: a
+line claimed kept has to be in the resolution, a rewrite's result has to be
+there, a claimed line has to have existed. Then the resolution is read back:
+every line in it must be one of those kept or rewritten lines, or declared as
+`added` with a reason, and no more often than the sides had it. A resolution
+that loses a line, invents one, or duplicates one is refused and no branch is
 created.
 
-Every line of both sides must be accounted for exactly once - kept verbatim,
-rewritten into something else, or dropped with a reason - and that accounting
-is checked before anything is written. A resolution that leaves a line out of
-it is refused and no branch is created.
+The merge lands on its branch only when that discards nothing - a new branch,
+or one whose tip is already inside the merge - and never on a branch another
+worktree has checked out. Binary files cannot be resolved this way; the merge
+stops and says which file.
 
 The result is a real merge commit - two parents, `ours` and `theirs` - on its
 own branch, with each region's reasoning in the message and `hv-session:`
