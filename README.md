@@ -259,7 +259,7 @@ A session exists because its log does.
 | Tool | Store | Edits visible | Repo resolved from |
 |---|---|---|---|
 | Claude Code | `~/.claude/projects/<slug>/<uuid>.jsonl` | Edit, Write, MultiEdit, NotebookEdit, and Bash writes | `cwd` on each record |
-| Codex | `~/.codex/sessions/<date>/rollout-*.jsonl` | shell commands only | `cwd` on `session_meta` |
+| Codex | `~/.codex/sessions/<date>/rollout-*.jsonl` | `apply_patch`, and shell writes | `cwd` on `session_meta` and each `turn_context` |
 | Cursor | `~/.cursor/projects/<slug>/agent-transcripts/**.jsonl` | none | project slug, verified against the filesystem |
 
 Each session is listed by **the title its own tool gave it** - Claude Code
@@ -278,12 +278,18 @@ touched file is not a working agent.
 
 Two findings from the real stores worth knowing:
 
-- **Codex has no edit tool.** Every file it writes goes through
-  `exec_command`. Claude Code does the same whenever it prefers Bash. So
-  `parse/shell.go` reads the commands themselves, recognizing only
-  unambiguous write forms and stripping heredoc bodies first. Those writes
-  carry no text, so only the temporal match tier can claim them - a shell
-  write can never produce a false exact match.
+- **Codex edits two ways.** `apply_patch` is its structured edit tool - a
+  `custom_tool_call` whose input is a patch in Codex's own dialect - and
+  `parse/apply_patch.go` reads it into per-file edits that carry the written
+  text, so the exact and fuzzy tiers can claim them like a Claude Edit. The
+  rest goes through `exec_command`, a shell, and Claude Code does the same
+  whenever it prefers Bash. So `parse/shell.go` reads the commands
+  themselves: it splits each line into shell words first, honouring quotes,
+  and only then reads the operators and command names, recognizing only
+  unambiguous write forms and stripping heredoc bodies. A `>` inside a
+  commit message or an awk program is data, and `pip install x` names no
+  file. Shell writes carry no text, so only the temporal match tier can claim
+  them - a shell write can never produce a false exact match.
 Both Claude Code and Codex record the conversation itself, so `p` shows what a
 session was asked and what it answered. Codex keeps it in `event_msg` records
 (`user_message` / `agent_message`), which also gives its otherwise untitled
