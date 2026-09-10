@@ -108,6 +108,24 @@ order. An existing branch is extended from its own tip rather than rewritten:
 hv adds commits, it never discards anyone else's. Session provenance is written
 into the commit as `hv-session:` trailers, so it survives outside hv.
 
+The diff is taken against HEAD, so an edit you had already staged is in the
+commit alongside the unstaged half of the same file; `-staged` plans the index
+alone.
+
+Not everything in a tree is a hunk. A deleted file, a mode change, a binary,
+an empty new file, a renamed file: demux groups hunks and has nothing to hold
+these, so hv keeps them back and commits them itself as one more commit after
+the revisions, on the branch the last revision went to. The plan lists it as
+`hv`, and the plan is checked against the diff before anything is committed: a
+file the revisions and that remainder do not cover between them is an error,
+never a quiet omission.
+
+A branch another worktree has checked out is never moved from here - that
+worktree would wake up with an index disagreeing with its HEAD. hv refuses
+before any ref moves and says which worktree to run it from. Refs move in name
+order, and if one refuses to move the ones that already did are journalled so
+`hv undo` can take them back.
+
 ### Conflicts
 
 Two sessions that touched the same lines are found with `git merge-tree
@@ -340,6 +358,7 @@ The layout beneath it is exactly what the tools produce
 | temporal tier | works; the fallback when text says nothing |
 | Cursor edit evidence | needs the SQLite store |
 | watcher mid-write records | a sweep landing mid-append can cut the last record |
+| submodule bumps | kept in the remainder and reported; whether `apply --cached` takes them is untested |
 
 All three tiers run. A hunk is attributed to the session whose written text is
 actually in it, falling back to recency only when the text says nothing - which

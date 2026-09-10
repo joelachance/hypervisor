@@ -27,16 +27,33 @@ func (Probe) DiffRevisionRange(ctx context.Context, repoRoot, leftRev, rightRev 
 	return out, nil
 }
 
+// diffFlags pin the diff to the shape apply relies on, whatever the
+// repository's config says: a/ and b/ prefixes (diff.noprefix and
+// diff.mnemonicPrefix would otherwise leave `git apply` unable to name the
+// file), no external or textconv drivers, binary bodies rather than "Binary
+// files differ", and renames shown as a delete and an add so each side can be
+// committed on its own.
+var diffFlags = []string{
+	"--no-color", "--no-ext-diff", "--no-textconv", "--binary", "--no-renames",
+	"--src-prefix=a/", "--dst-prefix=b/",
+}
+
 // WorkingDiff returns the unified diff hv plans over. Scoping it to files is
 // how a session selection narrows the plan to what those sessions touched.
+//
+// The diff is taken against HEAD, not the index: a commit is built from HEAD,
+// so anything sitting in the index but not in the diff would fall out of the
+// commit without a word. Staged mode is the index alone.
 //
 // Untracked files are included. `git diff` alone does not see them, and a
 // coding session's most characteristic act is creating a file - leaving them
 // out silently plans a fraction of the work, which is worse than failing.
 func WorkingDiff(ctx context.Context, repoRoot string, staged bool, files []string) (string, error) {
-	args := []string{"diff", "--no-color", "--no-ext-diff"}
+	args := append([]string{"diff"}, diffFlags...)
 	if staged {
 		args = append(args, "--cached")
+	} else {
+		args = append(args, "HEAD")
 	}
 	args = append(args, "--")
 	args = append(args, files...)
@@ -75,8 +92,8 @@ func untrackedDiff(ctx context.Context, repoRoot string, files []string) (string
 		}
 		// --no-index exits 1 whenever the files differ, which is always here,
 		// so its status says nothing and the output has to be read anyway.
-		diff := gitx.Output(ctx, repoRoot,
-			"diff", "--no-color", "--no-ext-diff", "--no-index", "--", os.DevNull, path)
+		args := append(append([]string{"diff"}, diffFlags...), "--no-index", "--", os.DevNull, path)
+		diff := gitx.Output(ctx, repoRoot, args...)
 		if strings.TrimSpace(diff) == "" {
 			continue
 		}

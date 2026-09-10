@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/satoricorp/demux"
+	"github.com/satoricorp/hv/plan"
 )
 
 // messageFor writes the commit message.
@@ -60,37 +61,75 @@ func sessionsOf(revision demux.RevisionProposal, options Options) []string {
 }
 
 // changeSummary describes the patch per file: how many lines moved, whether
-// the file is new, and which symbols the hunks sit in.
+// the file is new, deleted, binary, or changed mode, and which symbols the
+// hunks sit in.
 func changeSummary(revision demux.RevisionProposal, patch string) []string {
 	type stat struct {
 		added, removed int
 		created        bool
+		deleted        bool
+		binary         bool
+		oldMode        string
+		newMode        string
 	}
 	stats := map[string]*stat{}
 	order := []string{}
-	current := ""
+	// A section's header names the file after its mode lines, so what the
+	// header says is held until the path is known.
+	var pending *stat
+	oldPath, newPath, gitLine := "", "", ""
+	register := func() {
+		if pending == nil {
+			return
+		}
+		file := plan.SectionPath(oldPath, newPath, gitLine)
+		if file == "" {
+			return
+		}
+		if existing, ok := stats[file]; ok {
+			existing.added += pending.added
+			existing.removed += pending.removed
+			existing.created = existing.created || pending.created
+			existing.deleted = existing.deleted || pending.deleted
+			existing.binary = existing.binary || pending.binary
+			if pending.newMode != "" {
+				existing.oldMode, existing.newMode = pending.oldMode, pending.newMode
+			}
+			return
+		}
+		stats[file] = pending
+		order = append(order, file)
+	}
 	for _, line := range strings.Split(patch, "\n") {
 		switch {
-		case strings.HasPrefix(line, "+++ b/"):
-			current = strings.TrimPrefix(line, "+++ b/")
-			if _, ok := stats[current]; !ok {
-				stats[current] = &stat{}
-				order = append(order, current)
-			}
-		case strings.HasPrefix(line, "new file mode") && current != "":
-			stats[current].created = true
-		case current == "":
+		case strings.HasPrefix(line, "diff --git "):
+			register()
+			pending = &stat{}
+			oldPath, newPath, gitLine = "", "", line
+		case pending == nil:
 			continue
-		case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
-			continue
+		case strings.HasPrefix(line, "--- "):
+			oldPath = plan.HeaderPath(strings.TrimPrefix(line, "--- "), "a/")
+		case strings.HasPrefix(line, "+++ "):
+			newPath = plan.HeaderPath(strings.TrimPrefix(line, "+++ "), "b/")
+		case strings.HasPrefix(line, "new file mode"):
+			pending.created = true
+		case strings.HasPrefix(line, "deleted file mode"):
+			pending.deleted = true
+		case strings.HasPrefix(line, "old mode "):
+			pending.oldMode = strings.TrimPrefix(line, "old mode ")
+		case strings.HasPrefix(line, "new mode "):
+			pending.newMode = strings.TrimPrefix(line, "new mode ")
+		case strings.HasPrefix(line, "Binary files"), strings.HasPrefix(line, "GIT binary patch"):
+			pending.binary = true
 		case strings.HasPrefix(line, "+"):
-			stats[current].added++
+			pending.added++
 		case strings.HasPrefix(line, "-"):
-			stats[current].removed++
+			pending.removed++
 		}
 	}
-	// A new file's "---" line is /dev/null, which the loop above cannot see
-	// because it skips header lines; the mode line covers it.
+	register()
+
 	symbols := map[string][]string{}
 	for _, hunk := range revision.Hunks {
 		symbol := strings.TrimSpace(hunk.Symbol)
@@ -105,9 +144,26 @@ func changeSummary(revision demux.RevisionProposal, patch string) []string {
 	out := make([]string, 0, len(order))
 	for _, file := range order {
 		entry := stats[file]
-		line := fmt.Sprintf("  %s: +%d/-%d", file, entry.added, entry.removed)
-		if entry.created {
-			line += " (new file)"
+		var line string
+		switch {
+		case entry.deleted:
+			line = fmt.Sprintf("  %s: deleted", file)
+		case entry.binary && entry.created:
+			line = fmt.Sprintf("  %s: binary (new file)", file)
+		case entry.binary:
+			line = fmt.Sprintf("  %s: binary", file)
+		case entry.newMode != "" && entry.added == 0 && entry.removed == 0:
+			line = fmt.Sprintf("  %s: mode %s -> %s", file, entry.oldMode, entry.newMode)
+		case entry.created && entry.added == 0:
+			line = fmt.Sprintf("  %s: empty (new file)", file)
+		default:
+			line = fmt.Sprintf("  %s: +%d/-%d", file, entry.added, entry.removed)
+			if entry.created {
+				line += " (new file)"
+			}
+			if entry.newMode != "" {
+				line += fmt.Sprintf(", mode %s -> %s", entry.oldMode, entry.newMode)
+			}
 		}
 		if names := symbols[file]; len(names) > 0 {
 			line += " in " + strings.Join(names, ", ")

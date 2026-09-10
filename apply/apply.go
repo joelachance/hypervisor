@@ -15,12 +15,15 @@ package apply
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/satoricorp/demux"
 	"github.com/satoricorp/hv/internal/gitx"
 	"github.com/satoricorp/hv/journal"
+	"github.com/satoricorp/hv/plan"
 )
 
 // Resolver settles a conflict that arises while committing. It exists so
@@ -74,24 +77,32 @@ type Options struct {
 	// asked for, and what they reported. One list rather than three maps keyed
 	// by id, which could be half-populated and silently drop a paragraph.
 	Sessions []SessionInfo
+	// Remainder is what demux could not plan - deletions, mode changes,
+	// binaries, renames - committed after the revisions on the branch the
+	// last of them landed on, or on Branch when that is set.
+	Remainder plan.Remainder
 }
 
 // Apply commits every revision in a plan and returns what it did.
 //
 // Revisions routed to the same branch become successive commits on it, in plan
 // order. A branch whose base is another branch created in the same run starts
-// from that branch's new tip, so a stack stays a stack.
+// from that branch's new tip, so a stack stays a stack. What demux could not
+// plan - the remainder - goes last, on the branch the last revision landed on.
 func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, options Options) (journal.Entry, error) {
 	proposal := packet.Proposal
-	if len(proposal.Revisions) == 0 {
+	if len(proposal.Revisions) == 0 && options.Remainder.Empty() {
 		return journal.Entry{}, fmt.Errorf("plan has no revisions")
 	}
 	base, err := gitx.Run(ctx, repoRoot, "rev-parse", "HEAD")
 	if err != nil {
 		return journal.Entry{}, err
 	}
-	patches := patchIndex(proposal)
-
+	run := &run{
+		ctx: ctx, repoRoot: repoRoot, base: base, options: options,
+		patches: patchIndex(proposal),
+		tips:    map[string]string{}, before: map[string]string{}, renamed: map[string]string{},
+	}
 	entry := journal.Entry{
 		ID:         journal.NewID(),
 		AppliedAt:  time.Now().UnixMilli(),
@@ -103,48 +114,13 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 
 	// Ref updates are collected and written only after every commit exists, so
 	// a patch that fails to apply leaves no half-built branch behind.
-	tips := map[string]string{}
-	before := map[string]string{}
-	// Branches that had to be renamed because the name was taken by unrelated
-	// history; reported so nobody goes looking for commits under the old one.
-	renamed := map[string]string{}
-
+	last := ""
 	for _, revision := range proposal.Revisions {
-		branch := branchOf(revision, options)
-		parent, ok := tips[branch]
-		if !ok {
-			parent = startingPoint(ctx, repoRoot, revision, tips, base)
-			if existing, err := gitx.Run(ctx, repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
-				if gitx.Succeeded(ctx, repoRoot, "merge-base", "--is-ancestor", base, existing) {
-					// An existing branch is extended from its own tip rather
-					// than rewritten from HEAD: hv adds commits, it does not
-					// discard anyone else's.
-					before[branch] = existing
-					parent = existing
-				} else {
-					// The branch exists but grew from somewhere else - most
-					// often another worktree of this repository that routed to
-					// the same name from a different base. Its patches were
-					// computed against this base and will not apply to that
-					// tip, so the work goes on a branch of its own rather than
-					// failing or landing on top of unrelated commits.
-					if options.Branch != "" {
-						// An explicit target is not a suggestion. If its tip
-						// is unrelated to this base, moving it would discard
-						// whatever is there.
-						return entry, fmt.Errorf(
-							"branch %s is not descended from %s; commit from a worktree on that branch, or pick another",
-							branch, shortSHA(base))
-					}
-					branch = freeBranch(ctx, repoRoot, branch, base)
-					renamed[branchOf(revision, options)] = branch
-					if tip, ok := tips[branch]; ok {
-						parent = tip
-					}
-				}
-			}
+		branch, parent, err := run.place(branchOf(revision, options), startingPoint(ctx, repoRoot, revision, run.tips, base))
+		if err != nil {
+			return entry, err
 		}
-		patch := patchFor(revision, patches)
+		patch := patchFor(revision, run.patches)
 		if strings.TrimSpace(patch) == "" {
 			return entry, fmt.Errorf("revision %s has no patch text", revision.ID)
 		}
@@ -153,7 +129,8 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 		if err != nil {
 			return entry, fmt.Errorf("revision %s: %w", revision.ID, err)
 		}
-		tips[branch] = sha
+		run.tips[branch] = sha
+		last = branch
 		entry.Commits = append(entry.Commits, journal.Commit{
 			Revision: revision.ID,
 			Branch:   branch,
@@ -162,19 +139,49 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 			Files:    len(revision.Files),
 		})
 	}
+	if !options.Remainder.Empty() {
+		commit, err := run.commitRemainder(last)
+		if err != nil {
+			return entry, err
+		}
+		entry.Commits = append(entry.Commits, commit)
+	}
 
-	for from, to := range renamed {
+	for from, to := range run.renamed {
 		entry.Renamed = append(entry.Renamed, journal.Rename{From: from, To: to})
 	}
+	// A branch another worktree has checked out cannot be moved from here:
+	// that worktree's index and HEAD would disagree, and git would show its
+	// owner phantom changes. Refused before any ref moves, so nothing needs
+	// undoing.
+	if err := refuseCheckedOutElsewhere(ctx, repoRoot, run.tips); err != nil {
+		return entry, err
+	}
 	// A detached HEAD or an unborn branch has no name, and the error is the
-	// answer: no branch matches, so no index is refreshed.
+	// answer: no branch matches, so no index is refreshed. rev-parse spells
+	// a detached HEAD as the literal word, which is not a branch either.
 	current, _ := gitx.Run(ctx, repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
-	for branch, tip := range tips {
+	if current == "HEAD" {
+		current = ""
+	}
+	for _, branch := range sortedKeys(run.tips) {
+		tip := run.tips[branch]
 		if _, err := gitx.Run(ctx, repoRoot, "update-ref", "refs/heads/"+branch, tip); err != nil {
+			// Refs that already moved are journalled before the error goes
+			// out, so undo can take them back rather than losing track of
+			// commits that exist on real branches.
+			if len(entry.Branches) > 0 {
+				if recordErr := journal.Record(ctx, repoRoot, entry); recordErr != nil {
+					return entry, fmt.Errorf("branch %s: %w; and the %d branch(es) already moved could not be journalled: %v",
+						branch, err, len(entry.Branches), recordErr)
+				}
+				return entry, fmt.Errorf("branch %s: %w; the %d branch(es) already moved are journalled - hv undo takes them back",
+					branch, err, len(entry.Branches))
+			}
 			return entry, fmt.Errorf("branch %s: %w", branch, err)
 		}
 		entry.Branches = append(entry.Branches, journal.BranchChange{
-			Name: branch, Before: before[branch], After: tip,
+			Name: branch, Before: run.before[branch], After: tip,
 		})
 		// Committing to the branch you are standing on has to finish the job:
 		// the ref moved, so the index now disagrees with HEAD and git would
@@ -191,6 +198,153 @@ func Apply(ctx context.Context, repoRoot string, packet demux.DemuxPlanPacket, o
 		return entry, err
 	}
 	return entry, nil
+}
+
+// run is the state one Apply accumulates: the branch tips built so far, what
+// each extended branch was at before, and the names that had to change.
+type run struct {
+	ctx      context.Context
+	repoRoot string
+	base     string
+	options  Options
+	patches  map[string]string
+	tips     map[string]string
+	before   map[string]string
+	renamed  map[string]string
+}
+
+// place decides where a commit for branch goes: the tip built so far in this
+// run, the branch's own tip when it exists and descends from the base, or a
+// fresh name when the branch belongs to unrelated history. It returns the
+// branch actually used and the commit to build on.
+func (r *run) place(branch, fallback string) (string, string, error) {
+	if tip, ok := r.tips[branch]; ok {
+		return branch, tip, nil
+	}
+	existing, err := gitx.Run(r.ctx, r.repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	if err != nil {
+		return branch, fallback, nil
+	}
+	if gitx.Succeeded(r.ctx, r.repoRoot, "merge-base", "--is-ancestor", r.base, existing) {
+		// An existing branch is extended from its own tip rather than
+		// rewritten from HEAD: hv adds commits, it does not discard anyone
+		// else's.
+		r.before[branch] = existing
+		return branch, existing, nil
+	}
+	// The branch exists but grew from somewhere else - most often another
+	// worktree of this repository that routed to the same name from a
+	// different base. Its patches were computed against this base and will
+	// not apply to that tip, so the work goes on a branch of its own rather
+	// than failing or landing on top of unrelated commits.
+	if r.options.Branch != "" {
+		// An explicit target is not a suggestion. If its tip is unrelated to
+		// this base, moving it would discard whatever is there.
+		return "", "", fmt.Errorf(
+			"branch %s is not descended from %s; commit from a worktree on that branch, or pick another",
+			branch, shortSHA(r.base))
+	}
+	free := freeBranch(r.ctx, r.repoRoot, branch, r.base)
+	r.renamed[branch] = free
+	if tip, ok := r.tips[free]; ok {
+		return free, tip, nil
+	}
+	return free, fallback, nil
+}
+
+// commitRemainder commits what demux could not plan, after the revisions and
+// on the branch the last of them landed on - or the requested branch, or the
+// unrouted one when there were no revisions at all.
+func (r *run) commitRemainder(last string) (journal.Commit, error) {
+	branch := strings.TrimSpace(r.options.Branch)
+	if branch == "" {
+		branch = last
+	}
+	if branch == "" {
+		branch = branchOf(demux.RevisionProposal{}, r.options)
+	}
+	branch, parent, err := r.place(branch, r.base)
+	if err != nil {
+		return journal.Commit{}, err
+	}
+	revision := demux.RevisionProposal{
+		ID:     "hv",
+		Intent: r.options.Remainder.Summary(),
+		Files:  r.options.Remainder.Files(),
+	}
+	// No hunk links exist for a deletion or a mode change, so the remainder
+	// is credited the way an unlinked revision is: to the one session the
+	// plan was scoped to, and to nobody when there were several.
+	if len(r.options.Sessions) == 1 {
+		revision.SessionIDs = []string{r.options.Sessions[0].ID}
+	}
+	sha, _, err := commitRevision(r.ctx, r.repoRoot, parent, revision, r.options.Remainder.Patch, r.options)
+	if err != nil {
+		return journal.Commit{}, fmt.Errorf("remainder (%s): %w", revision.Intent, err)
+	}
+	r.tips[branch] = sha
+	return journal.Commit{
+		Revision: revision.ID,
+		Branch:   branch,
+		SHA:      sha,
+		Subject:  subjectFor(revision),
+		Files:    len(revision.Files),
+	}, nil
+}
+
+// refuseCheckedOutElsewhere fails when any branch about to move is checked
+// out in a worktree other than this one.
+func refuseCheckedOutElsewhere(ctx context.Context, repoRoot string, tips map[string]string) error {
+	elsewhere, err := branchesCheckedOutElsewhere(ctx, repoRoot)
+	if err != nil {
+		return err
+	}
+	for _, branch := range sortedKeys(tips) {
+		if path, ok := elsewhere[branch]; ok {
+			return fmt.Errorf("branch %s is checked out in %s; run hv there, or pick another branch with -branch", branch, path)
+		}
+	}
+	return nil
+}
+
+// branchesCheckedOutElsewhere maps each branch some other worktree of this
+// repository has checked out to that worktree's path.
+func branchesCheckedOutElsewhere(ctx context.Context, repoRoot string) (map[string]string, error) {
+	listing, err := gitx.RunRaw(ctx, repoRoot, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	here := samePath(repoRoot)
+	out := map[string]string{}
+	path := ""
+	for _, line := range strings.Split(listing, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			path = strings.TrimPrefix(line, "worktree ")
+		case strings.HasPrefix(line, "branch refs/heads/"):
+			if samePath(path) != here {
+				out[strings.TrimPrefix(line, "branch refs/heads/")] = path
+			}
+		}
+	}
+	return out, nil
+}
+
+// samePath is a path in the form two spellings of one directory share.
+func samePath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	return filepath.Clean(path)
+}
+
+func sortedKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // startingPoint is the commit a new branch begins from: the tip of the branch

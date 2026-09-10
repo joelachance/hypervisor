@@ -68,7 +68,7 @@ func (m model) updatePlan(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.screen = screenSessions
 		return m, nil
 	}
-	revisions := group.Result.Packet.Proposal.Revisions
+	rows := planRows(group)
 
 	switch key.String() {
 	case "q", "ctrl+c":
@@ -89,13 +89,13 @@ func (m model) updatePlan(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "tab", "right", "l":
 		m.plan.onDiff = !m.plan.onDiff
 	case "up", "k":
-		m.movePlan(-1, revisions)
+		m.movePlan(-1, rows)
 	case "down", "j":
-		m.movePlan(1, revisions)
+		m.movePlan(1, rows)
 	case "pgup":
-		m.movePlan(-m.diffHeight(), revisions)
+		m.movePlan(-m.diffHeight(), rows)
 	case "pgdown", " ":
-		m.movePlan(m.diffHeight(), revisions)
+		m.movePlan(m.diffHeight(), rows)
 	case "home", "g":
 		if m.plan.onDiff {
 			m.plan.offset = 0
@@ -130,7 +130,17 @@ func (m model) updatePlan(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) movePlan(delta int, revisions []demux.RevisionProposal) {
+// planRows is how many rows the plan list has: demux's revisions, plus one
+// for what demux could not plan when there is any.
+func planRows(group planGroup) int {
+	rows := len(group.Result.Packet.Proposal.Revisions)
+	if !group.Result.Remainder.Empty() {
+		rows++
+	}
+	return rows
+}
+
+func (m *model) movePlan(delta int, rows int) {
 	if m.plan.onDiff {
 		m.plan.offset += delta
 		if m.plan.offset < 0 {
@@ -145,8 +155,8 @@ func (m *model) movePlan(delta int, revisions []demux.RevisionProposal) {
 	if m.plan.revision < 0 {
 		m.plan.revision = 0
 	}
-	if m.plan.revision >= len(revisions) {
-		m.plan.revision = maxInt(len(revisions)-1, 0)
+	if m.plan.revision >= rows {
+		m.plan.revision = maxInt(rows-1, 0)
 	}
 	// A new revision starts at the top of its own diff, not where the last
 	// one was scrolled to.
@@ -186,6 +196,9 @@ func (m model) diffLines() []string {
 	if !ok {
 		return nil
 	}
+	if m.onRemainder(group) {
+		return strings.Split(strings.TrimRight(group.Result.Remainder.Patch, "\n"), "\n")
+	}
 	revision, ok := m.currentRevision()
 	if !ok {
 		return nil
@@ -211,6 +224,12 @@ func (m model) diffLines() []string {
 		}
 	}
 	return lines
+}
+
+// onRemainder reports whether the cursor is on the row after the revisions,
+// the one hv commits itself.
+func (m model) onRemainder(group planGroup) bool {
+	return !group.Result.Remainder.Empty() && m.plan.revision == len(group.Result.Packet.Proposal.Revisions)
 }
 
 func (m model) planningView() string {
@@ -252,7 +271,7 @@ func (m model) planView() string {
 		return m.planningView()
 	}
 	revisions := group.Result.Packet.Proposal.Revisions
-	listHeight := planListHeight(len(revisions), m.height)
+	listHeight := planListHeight(planRows(group), m.height)
 
 	rows := make([]string, 0, listHeight)
 	for index, revision := range revisions {
@@ -260,6 +279,18 @@ func (m model) planView() string {
 			break
 		}
 		rows = append(rows, m.planRow(group, revision, index))
+	}
+	if remainder := group.Result.Remainder; !remainder.Empty() && len(rows) < listHeight {
+		// The deletions and mode changes demux cannot plan, committed by hv
+		// after the revisions on the branch the last one went to. Shown as a
+		// row of its own so that it is reviewed like the rest.
+		route := ""
+		if len(revisions) > 0 {
+			route = revisions[len(revisions)-1].TargetStack
+		}
+		rows = append(rows, m.planRow(group, demux.RevisionProposal{
+			ID: "hv", Files: []string{remainder.Summary()}, TargetStack: route,
+		}, len(revisions)))
 	}
 	for len(rows) < listHeight {
 		rows = append(rows, "")
@@ -422,11 +453,7 @@ func planListHeight(revisions, height int) int {
 
 func (m model) diffHeight() int {
 	group, _ := m.currentGroup()
-	revisions := 0
-	if group.Result.Packet.Proposal.Revisions != nil {
-		revisions = len(group.Result.Packet.Proposal.Revisions)
-	}
-	height := m.height - 2 - planListHeight(revisions, m.height) - 1 - 1
+	height := m.height - 2 - planListHeight(planRows(group), m.height) - 1 - 1
 	if height < 1 {
 		return 1
 	}
