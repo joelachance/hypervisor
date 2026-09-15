@@ -1,0 +1,905 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use objc2::runtime::AnyObject;
+use objc2::{class, msg_send, sel};
+use objc2_foundation::{NSEdgeInsets, NSRect};
+use tauri::Emitter;
+use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager};
+use tauri_plugin_global_shortcut::ShortcutState;
+
+const MARGIN: f64 = 14.0;
+const TOGGLE_SHORTCUT: &str = "cmd+shift+space";
+
+// ---------------------------------------------------------------------------
+// Overlay geometry
+// ---------------------------------------------------------------------------
+
+/// Notch cutout in window-local CSS px: left/right x edges and depth from the
+/// window's top, margin already applied.
+#[derive(Clone, serde::Serialize)]
+struct Cutout {
+    left: f64,
+    right: f64,
+    depth: f64,
+}
+
+struct Geometry {
+    cutout: Option<Cutout>,
+}
+
+#[tauri::command]
+fn geometry(state: tauri::State<Geometry>) -> Option<Cutout> {
+    state.cutout.clone()
+}
+
+#[tauri::command]
+fn toggle(app: AppHandle) {
+    toggle_overlay(&app);
+}
+
+#[tauri::command]
+fn hide_overlay(app: AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = win.emit("overlay-hide", ());
+    let _ = win.hide();
+    if let Some(l) = *LAYOUT.lock().unwrap() {
+        apply_layout(&win, l, false);
+    }
+}
+
+/// The overlay's canonical frame, computed once at setup. Every show/hide/
+/// expand re-asserts position AND size from this, because macOS anchors a
+/// hidden window's resize to its bottom edge and lets the position drift.
+#[derive(Clone, Copy)]
+struct Layout {
+    x: f64,
+    y: f64,
+    width: f64,
+    half: f64,
+    full: f64,
+    /// NSWindow level, re-asserted on every show in case anything resets it.
+    level: isize,
+}
+
+static LAYOUT: std::sync::Mutex<Option<Layout>> = std::sync::Mutex::new(None);
+
+fn apply_layout(win: &tauri::WebviewWindow, l: Layout, full: bool) {
+    let _ = win.set_position(LogicalPosition::new(l.x, l.y));
+    let _ = win.set_size(LogicalSize::new(
+        l.width,
+        if full { l.full } else { l.half },
+    ));
+}
+
+/// Ask the page to mask itself to zero height. It calls `reveal_ready` once
+/// the mask has painted, and only then does the window become visible — so a
+/// stale unmasked frame can never flash on screen.
+fn request_show(win: &tauri::WebviewWindow) {
+    let _ = win.emit("overlay-show", ());
+}
+
+#[tauri::command]
+fn reveal_ready(app: AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let Some(l) = *LAYOUT.lock().unwrap() else {
+        return;
+    };
+    apply_layout(&win, l, false);
+    if let Ok(ns_win) = win.ns_window() {
+        let ns_win = ns_win as *mut AnyObject;
+        unsafe {
+            let _: () = msg_send![ns_win, setLevel: l.level];
+            // Shows without activating the app; keyboard focus stays put.
+            let _: () = msg_send![ns_win, orderFrontRegardless];
+        }
+    }
+}
+
+static LAST_TOGGLE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+const DOUBLE_TAP_MS: u128 = 500;
+
+/// Hotkey: single press toggles the half-screen overlay; a quick second tap
+/// (hotkey, then space again inside the double-tap window) extends it to full
+/// height. Any press while fullscreen hides it, and the next show is half.
+fn toggle_overlay(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let Some(layout) = *LAYOUT.lock().unwrap() else {
+        return;
+    };
+    let mut last = LAST_TOGGLE.lock().unwrap();
+    let double_tap = last.is_some_and(|t| t.elapsed().as_millis() < DOUBLE_TAP_MS);
+    *last = Some(std::time::Instant::now());
+    drop(last);
+
+    if !win.is_visible().unwrap_or(false) {
+        request_show(&win);
+        return;
+    }
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let current = win
+        .outer_size()
+        .map(|s| s.to_logical::<f64>(scale).height)
+        .unwrap_or(layout.half);
+    let at_full = current >= (layout.half + layout.full) / 2.0;
+    if double_tap && !at_full {
+        // Let the page pin its clip mask at the current bottom edge before
+        // the window grows, so the expansion reveals instead of snapping.
+        let _ = win.emit("overlay-expand", ());
+        let win = win.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            apply_layout(&win, layout, true);
+        });
+    } else {
+        let _ = win.emit("overlay-hide", ());
+        let _ = win.hide();
+        apply_layout(&win, layout, false);
+    }
+}
+
+/// (notch left x, notch right x, notch depth) in logical points from the
+/// primary screen's top-left. None on screens without a notch.
+unsafe fn detect_notch() -> Option<(f64, f64, f64)> {
+    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    let screen: *mut AnyObject = msg_send![screens, firstObject];
+    if screen.is_null() {
+        return None;
+    }
+    let responds: bool = msg_send![screen, respondsToSelector: sel!(safeAreaInsets)];
+    if !responds {
+        return None;
+    }
+    let insets: NSEdgeInsets = msg_send![screen, safeAreaInsets];
+    if insets.top <= 1.0 {
+        return None;
+    }
+    let frame: NSRect = msg_send![screen, frame];
+    let aux: bool = msg_send![screen, respondsToSelector: sel!(auxiliaryTopLeftArea)];
+    if aux {
+        let left: NSRect = msg_send![screen, auxiliaryTopLeftArea];
+        let right: NSRect = msg_send![screen, auxiliaryTopRightArea];
+        Some((
+            left.origin.x + left.size.width - frame.origin.x,
+            right.origin.x - frame.origin.x,
+            insets.top,
+        ))
+    } else {
+        // Notched screen but no per-side API: assume a 200pt centered notch.
+        let notch_w = 200.0;
+        Some((
+            (frame.size.width - notch_w) / 2.0,
+            (frame.size.width + notch_w) / 2.0,
+            insets.top,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tmux sessions
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Session {
+    name: String,
+    provider: String,
+    model: String,
+    label: String,
+    prompt: String,
+    created_at: u64,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    alive: bool,
+    #[serde(default)]
+    adds: u32,
+    #[serde(default)]
+    dels: u32,
+    #[serde(default)]
+    branch: String,
+    #[serde(default)]
+    repo: String,
+}
+
+/// Repo name a directory belongs to: the directory holding the shared .git,
+/// so sessions in worktrees group under their repo.
+fn repo_name(cwd: &str) -> String {
+    let fallback = || {
+        PathBuf::from(cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    match git(cwd, &["rev-parse", "--git-common-dir"]) {
+        Some(dir) if dir != ".git" && !dir.is_empty() => PathBuf::from(dir)
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(fallback),
+        Some(_) => fallback(),
+        None => fallback(),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct Peek {
+    session: Session,
+    blocks: Vec<String>,
+    /// True while the pane shows the CLI's working spinner.
+    thinking: bool,
+}
+
+fn sessions_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".hypervisor").join("sessions")
+}
+
+/// Single-quote a string for POSIX shells.
+fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+fn tmux(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("tmux")
+        .args(args)
+        .output()
+        .map_err(|e| format!("tmux: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+fn live_sessions() -> HashSet<String> {
+    tmux(&["list-sessions", "-F", "#S"])
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn git(cwd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn tilde(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && path.starts_with(&home) {
+        format!("~{}", &path[home.len()..])
+    } else {
+        path.to_string()
+    }
+}
+
+/// The default working directory for new sessions and the status bar,
+/// settable from the /cd panel.
+static DEFAULT_CWD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn default_cwd() -> String {
+    if let Some(c) = DEFAULT_CWD.lock().unwrap().clone() {
+        return c;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let repo = format!("{home}/git/hv");
+    if PathBuf::from(&repo).is_dir() {
+        repo
+    } else {
+        home
+    }
+}
+
+#[tauri::command]
+fn set_cwd(path: String) -> Result<(), String> {
+    if !PathBuf::from(&path).is_dir() {
+        return Err("not a directory".into());
+    }
+    *DEFAULT_CWD.lock().unwrap() = Some(path);
+    Ok(())
+}
+
+fn diffstat(cwd: &str) -> (u32, u32) {
+    let Some(out) = git(cwd, &["diff", "--numstat", "HEAD"]) else {
+        return (0, 0);
+    };
+    let mut adds = 0u32;
+    let mut dels = 0u32;
+    for line in out.lines() {
+        let mut cols = line.split_whitespace();
+        adds += cols.next().and_then(|c| c.parse::<u32>().ok()).unwrap_or(0);
+        dels += cols.next().and_then(|c| c.parse::<u32>().ok()).unwrap_or(0);
+    }
+    (adds, dels)
+}
+
+#[derive(serde::Serialize)]
+struct StatusInfo {
+    cwd: String,
+    branch: String,
+    target: String,
+    worktree: Option<String>,
+    cpu: u32,
+}
+
+#[tauri::command]
+fn status_info(cwd: Option<String>) -> StatusInfo {
+    let cwd = cwd.filter(|c| !c.is_empty()).unwrap_or_else(default_cwd);
+    let branch = git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "-".into());
+    let git_dir = git(&cwd, &["rev-parse", "--absolute-git-dir"]);
+    let common = git(&cwd, &["rev-parse", "--git-common-dir"]);
+    let worktree = match (&git_dir, &common) {
+        (Some(g), Some(c)) if g != c && !c.is_empty() => PathBuf::from(&cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned()),
+        _ => None,
+    };
+    let cpu = Command::new("sh")
+        .arg("-c")
+        .arg("ps -A -o %cpu= | awk -v n=$(sysctl -n hw.ncpu) '{s+=$1} END {printf \"%d\", s/n}'")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    StatusInfo {
+        cwd: tilde(&cwd),
+        branch,
+        target: "main".into(),
+        worktree,
+        cpu,
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DirEntry {
+    path: String,
+    display: String,
+    kind: String, // "current" | "worktree" | ""
+    files: u32,
+    modified: u64,
+}
+
+#[tauri::command]
+fn list_dirs() -> Vec<DirEntry> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let current = default_cwd();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    let push = |path: String, kind: &str, out: &mut Vec<DirEntry>, seen: &mut HashSet<String>| {
+        if !seen.insert(path.clone()) {
+            return;
+        }
+        let Ok(meta) = fs::metadata(&path) else { return };
+        let files = fs::read_dir(&path).map(|rd| rd.count() as u32).unwrap_or(0);
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push(DirEntry {
+            display: tilde(&path),
+            path,
+            kind: kind.into(),
+            files,
+            modified,
+        });
+    };
+
+    push(current.clone(), "current", &mut out, &mut seen);
+    // Worktrees of the current repo.
+    if let Some(list) = git(&current, &["worktree", "list", "--porcelain"]) {
+        for line in list.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                let kind = if p == current { "current" } else { "worktree" };
+                push(p.to_string(), kind, &mut out, &mut seen);
+            }
+        }
+    }
+    // One level under ~/git.
+    if let Ok(rd) = fs::read_dir(format!("{home}/git")) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                push(p.to_string_lossy().into_owned(), "", &mut out, &mut seen);
+            }
+        }
+    }
+    // Session directories.
+    for s in list_sessions() {
+        if !s.cwd.is_empty() {
+            push(s.cwd, "", &mut out, &mut seen);
+        }
+    }
+    out
+}
+
+#[tauri::command]
+fn start_session(
+    provider: String,
+    model: String,
+    label: String,
+    prompt: String,
+) -> Result<Session, String> {
+    if prompt.trim().is_empty() {
+        return Err("prompt is empty".into());
+    }
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let name = format!("hv-{created}");
+
+    let agent_cmd = match provider.as_str() {
+        "anthropic" => format!("claude --model {} {}", shq(&model), shq(&prompt)),
+        "openai" => format!("codex --model {} {}", shq(&model), shq(&prompt)),
+        _ => format!("opencode --model {} --prompt {}", shq(&model), shq(&prompt)),
+    };
+    // The tmux server may have been spawned with a bare environment; carry
+    // this app's PATH (nvm, homebrew, …) into the session explicitly.
+    let path = std::env::var("PATH").unwrap_or_default();
+    let cmd = format!("export PATH={}; exec {agent_cmd}", shq(&path));
+    let cwd = default_cwd();
+
+    tmux(&["new-session", "-d", "-s", &name, "-c", &cwd, &cmd])?;
+
+    let repo = repo_name(&cwd);
+    let session = Session {
+        name: name.clone(),
+        provider,
+        model,
+        label,
+        prompt,
+        created_at: created,
+        cwd,
+        alive: true,
+        adds: 0,
+        dels: 0,
+        branch: String::new(),
+        repo,
+    };
+    let dir = sessions_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::write(
+        dir.join(format!("{name}.json")),
+        serde_json::to_vec_pretty(&session).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(session)
+}
+
+#[tauri::command]
+fn list_sessions() -> Vec<Session> {
+    let live = live_sessions();
+    let mut sessions: Vec<Session> = fs::read_dir(sessions_dir())
+        .map(|rd| {
+            rd.filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension()? != "json" {
+                    return None;
+                }
+                let mut s: Session = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+                s.alive = live.contains(&s.name);
+                if s.cwd.is_empty() {
+                    s.cwd = default_cwd();
+                }
+                if s.alive {
+                    let (adds, dels) = diffstat(&s.cwd);
+                    s.adds = adds;
+                    s.dels = dels;
+                }
+                s.branch = git(&s.cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+                s.repo = repo_name(&s.cwd);
+                Some(s)
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sessions
+}
+
+#[tauri::command]
+fn peek_session(name: String) -> Result<Peek, String> {
+    if !valid_name(&name) {
+        return Err("invalid session name".into());
+    }
+    let raw = fs::read(sessions_dir().join(format!("{name}.json"))).map_err(|e| e.to_string())?;
+    let mut session: Session = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    session.alive = live_sessions().contains(&name);
+    let (blocks, thinking) = if session.alive {
+        let text = tmux(&["capture-pane", "-p", "-t", &name, "-S", "-400"]).unwrap_or_default();
+        (parse_blocks(&text), is_thinking(&text))
+    } else {
+        (Vec::new(), false)
+    };
+    Ok(Peek {
+        session,
+        blocks,
+        thinking,
+    })
+}
+
+#[tauri::command]
+fn send_prompt(name: String, text: String) -> Result<(), String> {
+    if !valid_name(&name) {
+        return Err("invalid session name".into());
+    }
+    // A newline inside the literal text would submit the TUI input early.
+    let text = text.replace(['\n', '\r'], " ").trim().to_string();
+    if text.is_empty() {
+        return Err("empty prompt".into());
+    }
+    if !live_sessions().contains(&name) {
+        return Err("session is not running".into());
+    }
+    tmux(&["send-keys", "-t", &name, "-l", "--", &text])?;
+    // Let the TUI ingest the literal text before the submit keypress.
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    tmux(&["send-keys", "-t", &name, "Enter"]).map(|_| ())
+}
+
+#[tauri::command]
+fn kill_session(name: String) -> Result<(), String> {
+    if !valid_name(&name) {
+        return Err("invalid session name".into());
+    }
+    tmux(&["kill-session", "-t", &name]).map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// GitHub identity
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct GithubUser {
+    login: String,
+    name: String,
+    avatar_url: String,
+}
+
+fn auth_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".hypervisor").join("auth.json")
+}
+
+/// The signed-in user, if any. Identity is app-level: a file we wrote at
+/// sign-in, so signing out forgets it without touching gh's credentials.
+#[tauri::command]
+fn auth_user() -> Option<GithubUser> {
+    let raw = fs::read(auth_path()).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// Sign in by borrowing the gh CLI's identity: `gh api user` answers as the
+/// authenticated account. A missing or signed-out gh is a readable error the
+/// sign-in modal shows verbatim.
+#[tauri::command]
+fn sign_in() -> Result<GithubUser, String> {
+    let out = Command::new("gh")
+        .args(["api", "user"])
+        .output()
+        .map_err(|_| "GitHub CLI not found — brew install gh, then gh auth login".to_string())?;
+    if !out.status.success() {
+        return Err("gh is signed out — run `gh auth login` in a terminal, then retry".into());
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("gh api user: {e}"))?;
+    let field = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let user = GithubUser {
+        login: field("login"),
+        name: field("name"),
+        avatar_url: field("avatar_url"),
+    };
+    if user.login.is_empty() {
+        return Err("gh answered without a user".into());
+    }
+    let path = auth_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_vec(&user).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(user)
+}
+
+#[tauri::command]
+fn sign_out() -> Result<(), String> {
+    match fs::remove_file(auth_path()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// A live pane is thinking while the CLI shows its working spinner, and the
+/// spinner line is the only one that carries the interrupt hint ("✻ Brewing…
+/// (esc to interrupt)"). The done line drops the hint, so a finished exchange
+/// reads as idle. Only the tail matters: an old hint scrolled up the pane is
+/// history, not state.
+fn is_thinking(text: &str) -> bool {
+    text.lines()
+        .rev()
+        .take(30)
+        .any(|l| l.to_ascii_lowercase().contains("esc to interrupt"))
+}
+
+/// Slice a captured pane into per-exchange blocks (a "> …" prompt line plus
+/// the response that follows it) and keep the last three.
+fn parse_blocks(text: &str) -> Vec<String> {
+    let mut lines: Vec<&str> = text.lines().collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    // Drop the TUI's input box if it's the trailing element of the pane.
+    if let Some(idx) = lines.iter().rposition(|l| l.trim_start().starts_with('╭')) {
+        if lines.len() - idx <= 6 {
+            lines.truncate(idx);
+        }
+    }
+    let cleaned: Vec<&str> = lines
+        .into_iter()
+        .filter(|l| {
+            let t = l.trim();
+            if t.is_empty() {
+                return true;
+            }
+            // Horizontal-rule separators between the transcript and input box.
+            if t.chars().all(|c| matches!(c, '─' | '━' | '═')) {
+                return false;
+            }
+            !(t.contains("? for shortcuts")
+                || t.contains("esc to interrupt")
+                || t.contains("shift+tab to cycle")
+                || t.contains("-- INSERT --")
+                || t.contains("-- NORMAL --")
+                || t.starts_with("● "))
+        })
+        .collect();
+
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for l in cleaned {
+        let t = l.trim_start();
+        if t.starts_with("> ") || t.starts_with("❯ ") || t.starts_with("› ") {
+            if !cur.is_empty() {
+                blocks.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(l);
+    }
+    if !cur.is_empty() {
+        blocks.push(cur);
+    }
+
+    let mut out: Vec<String> = blocks
+        .into_iter()
+        .map(|b| {
+            // An unsegmented pane comes through as one giant block; cap it.
+            let tail: Vec<&str> = b.iter().rev().take(40).rev().copied().collect();
+            tail.join("\n").trim_matches('\n').to_string()
+        })
+        .filter(|b| {
+            // Drop empty blocks and the TUI's bare input prompt.
+            let t = b.trim();
+            !t.is_empty() && t != "❯" && t != ">" && t != "›"
+        })
+        .collect();
+    if out.len() > 3 {
+        out = out.split_off(out.len() - 3);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_thinking, parse_blocks};
+
+    // Verbatim capture of a real `claude` pane from the smoke test.
+    const PANE: &str = "\
+ ▐▛███▛█   Claude Code v2.1.250
+▝▜██████▀  Sonnet 5 · Claude Max
+  ▝▝ ▝▝    ~/git/hv
+  Updated to latest. Got 4 features, 19 bugfixes, and 10 other changes.
+❯ Respond with exactly the text HV_TMUX_OK and nothing else, then wait for
+  further instructions.
+⏺ HV_TMUX_OK
+✻ Brewed for 1s · done 8:32 PM
+                                                              ● high · /effort
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents         /rc
+";
+
+    #[test]
+    fn parses_claude_pane_into_exchanges() {
+        let blocks = parse_blocks(PANE);
+        let last = blocks.last().expect("no blocks parsed");
+        assert!(last.contains("HV_TMUX_OK"), "response missing: {last:?}");
+        assert!(last.starts_with('❯'), "block should start at the prompt");
+        for b in &blocks {
+            assert!(!b.contains("-- INSERT --"), "status line leaked: {b:?}");
+            assert!(!b.contains("────"), "separator leaked: {b:?}");
+        }
+        // The bare trailing input prompt must not become its own block.
+        assert!(blocks.iter().all(|b| b.trim() != "❯"));
+    }
+
+    #[test]
+    fn finished_pane_is_not_thinking() {
+        // PANE ends on the done line ("✻ Brewed for 1s · done"), no hint.
+        assert!(!is_thinking(PANE));
+    }
+
+    #[test]
+    fn spinner_pane_is_thinking() {
+        let pane = PANE.replace(
+            "✻ Brewed for 1s · done 8:32 PM",
+            "✻ Brewing… (esc to interrupt)",
+        );
+        assert!(is_thinking(&pane));
+    }
+
+    #[test]
+    fn scrolled_off_hint_is_history_not_state() {
+        let mut pane = String::from("✻ Brewing… (esc to interrupt)\n");
+        pane.push_str(&"⏺ output line\n".repeat(40));
+        assert!(!is_thinking(&pane));
+    }
+
+    #[test]
+    fn unsegmented_output_returns_tail() {
+        let text = (0..100).map(|i| format!("line {i}\n")).collect::<String>();
+        let blocks = parse_blocks(&text);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains("line 99"));
+        assert!(!blocks[0].contains("line 10\n"), "should cap to a tail");
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_shortcuts([TOGGLE_SHORTCUT])
+                .expect("invalid shortcut")
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        toggle_overlay(app);
+                    }
+                })
+                .build(),
+        )
+        .invoke_handler(tauri::generate_handler![
+            geometry,
+            toggle,
+            hide_overlay,
+            reveal_ready,
+            start_session,
+            list_sessions,
+            peek_session,
+            send_prompt,
+            kill_session,
+            status_info,
+            list_dirs,
+            set_cwd,
+            auth_user,
+            sign_in,
+            sign_out
+        ])
+        .setup(|app| {
+            // Overlay, not an app: no Dock icon, no Cmd-Tab entry.
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            let win = app.get_webview_window("main").expect("main window missing");
+            let monitor = win
+                .primary_monitor()?
+                .or(win.current_monitor()?)
+                .expect("no monitor");
+            let scale = monitor.scale_factor();
+            let screen = monitor.size().to_logical::<f64>(scale);
+
+            let ns_win = win.ns_window()? as *mut AnyObject;
+            unsafe {
+                // canJoinAllSpaces | fullScreenAuxiliary: follow the user to
+                // every Space, including over fullscreen apps.
+                let _: () = msg_send![ns_win, setCollectionBehavior: 257usize];
+            }
+
+            let notch = unsafe { detect_notch() };
+            let (layout, cutout) = if let Some((nl, nr, depth)) = notch {
+                unsafe {
+                    // Above the menu bar's window level, so the overlay can
+                    // occupy the notch strip at the very top of the screen.
+                    let _: () = msg_send![ns_win, setLevel: 25isize];
+                }
+                (
+                    Layout {
+                        x: MARGIN,
+                        y: MARGIN,
+                        width: screen.width - MARGIN * 2.0,
+                        half: screen.height / 2.0 - MARGIN * 2.0,
+                        full: screen.height - MARGIN * 2.0,
+                        level: 25,
+                    },
+                    Some(Cutout {
+                        left: nl - MARGIN * 2.0,
+                        right: nr, // (nr + MARGIN) - window x
+                        depth,     // (depth + MARGIN) - window y
+                    }),
+                )
+            } else {
+                // No notch: sit below the menu bar as a plain rounded panel.
+                unsafe {
+                    let _: () = msg_send![ns_win, setLevel: 5isize];
+                }
+                let area = monitor.work_area();
+                let pos = area.position.to_logical::<f64>(scale);
+                let size = area.size.to_logical::<f64>(scale);
+                let y = pos.y + MARGIN;
+                (
+                    Layout {
+                        x: pos.x + MARGIN,
+                        y,
+                        width: size.width - MARGIN * 2.0,
+                        half: screen.height / 2.0 - y - MARGIN,
+                        full: screen.height - y - MARGIN,
+                        level: 5,
+                    },
+                    None,
+                )
+            };
+            *LAYOUT.lock().unwrap() = Some(layout);
+            app.manage(Geometry { cutout });
+
+            // Menu bar item: same H icon, toggle + quit.
+            let toggle_item = tauri::menu::MenuItemBuilder::with_id("toggle", "Show/Hide Overlay")
+                .accelerator("Cmd+Shift+Space")
+                .build(app)?;
+            let quit_item = tauri::menu::MenuItemBuilder::with_id("quit", "Quit Hypervisor").build(app)?;
+            let menu = tauri::menu::MenuBuilder::new(app)
+                .items(&[&toggle_item, &quit_item])
+                .build()?;
+            tauri::tray::TrayIconBuilder::with_id("hv-tray")
+                .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "toggle" => toggle_overlay(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
+
+            // Stay hidden; the page calls reveal_ready once it has painted
+            // its zero-height mask, and the window first appears then.
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

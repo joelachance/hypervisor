@@ -1,0 +1,1171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>HYPERVISOR</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    @font-face {
+      font-family: "Xer0";
+      src: url("fonts/Xer0-Regular.otf") format("opentype");
+    }
+
+    :root {
+      --bg: #100f0e;
+      --panel: #171615;
+      --panel-active: #24221f;
+      --statusbar: #1b1a19;
+      --line: rgba(248, 244, 244, 0.09);
+      --line-strong: rgba(248, 244, 244, 0.16);
+      --text: #f8f4f4;
+      --text-dim: #c9c5c5;
+      --muted: #7a7676;
+      --faint: #605d5d;
+      --prose: #a5a1a1;
+      --adds: #9dc2b1;
+      --dels: #dd5f52;
+      --blue: #4d8dff;
+      --magenta: #a82586;
+      --mono: "Berkeley Mono", "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+      --sans: "Archivo", sans-serif;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      height: 100%;
+      background: transparent;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+      cursor: default;
+      font-family: var(--sans);
+      color: var(--text);
+    }
+
+    #stage {
+      position: fixed;
+      inset: 0;
+      clip-path: inset(0 0 0 0);
+      transition: clip-path 300ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+    #stage.masked { clip-path: inset(0 0 100% 0); transition: none; }
+
+    #frame { position: absolute; inset: 0; }
+    #shell { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+    #chrome {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ---- top bar ---- */
+    #topbar {
+      flex: none;
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      padding: 22px 30px 6px;
+    }
+    #logo {
+      font-family: "Xer0", var(--sans);
+      font-size: 15px;
+      letter-spacing: 0.2em;
+      color: #4a4746;
+      flex: none;
+    }
+    #ticker {
+      width: 34%;
+      max-width: 420px;
+      overflow: hidden;
+      -webkit-mask-image: linear-gradient(to right, transparent 0, #000 26px, #000 calc(100% - 26px), transparent 100%);
+      mask-image: linear-gradient(to right, transparent 0, #000 26px, #000 calc(100% - 26px), transparent 100%);
+    }
+    #ticker-track {
+      display: flex;
+      width: max-content;
+      animation: titlemarquee 60s linear infinite;
+    }
+    @keyframes titlemarquee { from { transform: translateX(0); } to { transform: translateX(-25%); } }
+    .tick {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding-right: 64px;
+      white-space: nowrap;
+      font-family: var(--mono);
+    }
+    .tick .title { font-size: 12px; color: #eae7e7; }
+    .tick .adds { font-size: 10.5px; color: var(--adds); }
+    .tick .dels { font-size: 10.5px; color: var(--dels); }
+    .tick .dot-sep { font-size: 10.5px; color: #4a4746; }
+    .tick .summary { font-family: var(--sans); font-size: 11px; color: #8d8a89; }
+
+    #matrix {
+      display: grid;
+      grid-template-columns: repeat(24, 3px);
+      grid-auto-rows: 3px;
+      gap: 4px;
+      flex: none;
+    }
+    #matrix span { width: 3px; height: 3px; border-radius: 50%; display: block; }
+    @keyframes mtxdot { 0%, 100% { opacity: 0.16; } 45% { opacity: 1; } }
+
+    #avatar-wrap { position: relative; flex: none; }
+    #avatar {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: #2b2927;
+      box-shadow: inset 0 0 0 1px rgba(248, 244, 244, 0.22);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      letter-spacing: 0.05em;
+      cursor: pointer;
+      overflow: hidden;
+    }
+    #avatar:hover { box-shadow: inset 0 0 0 1px rgba(248, 244, 244, 0.4); }
+    #avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    #avatar-menu {
+      position: absolute;
+      top: 37px;
+      right: 0;
+      display: none;
+      min-width: 190px;
+      padding: 5px;
+      background: var(--panel);
+      border: 1px solid var(--line-strong);
+      border-radius: 9px;
+      box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45);
+      z-index: 70;
+      font-family: var(--mono);
+    }
+    .am-user { padding: 7px 10px 5px; font-size: 9.5px; letter-spacing: 0.06em; color: var(--muted); white-space: nowrap; }
+    .am-user b { color: var(--text-dim); font-weight: 400; }
+    .am-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 6px; font-size: 11px; color: var(--text-dim); cursor: pointer; white-space: nowrap; }
+    .am-row:hover { background: var(--panel-active); color: var(--text); }
+
+    /* ---- sign-in lock ---- */
+    #lock {
+      position: absolute;
+      inset: 0;
+      z-index: 60;
+      display: none;
+      place-items: center;
+      background: var(--bg);
+    }
+    #lock.on { display: grid; }
+    #lock-card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 13px;
+    }
+    #lock-logo { font-family: "Xer0", var(--sans); font-size: 14px; letter-spacing: 0.2em; color: var(--text-dim); }
+    #lock-sub { font-family: var(--mono); font-size: 10px; letter-spacing: 0.16em; color: var(--muted); }
+    #lock-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      margin-top: 8px;
+      width: 300px;
+      padding: 12px 0;
+      border: 0;
+      border-radius: 0;
+      background: #fff;
+      color: #10100f;
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #lock-btn:hover { background: #ece9e9; }
+    #lock-err { min-height: 14px; max-width: 340px; font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--dels); text-align: center; }
+
+    .icon-tile {
+      width: 15px;
+      height: 15px;
+      border-radius: 4px;
+      display: grid;
+      place-items: center;
+      flex: none;
+      font-size: 9px;
+      line-height: 1;
+      color: #fff;
+    }
+    .icon-anthropic { background: #d97757; }
+    .icon-openai { background: #10100f; box-shadow: inset 0 0 0 1px rgba(248, 244, 244, 0.22); }
+    .icon-other { background: #21254d; }
+
+    /* ---- transcript ---- */
+    #transcript {
+      width: 61%;
+      margin: 0 auto;
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      gap: 13px;
+      overflow: hidden;
+      padding-bottom: 6px;
+    }
+    .u-bubble {
+      align-self: flex-end;
+      max-width: 74%;
+      padding: 9px 13px;
+      border-radius: 12px;
+      background: rgba(248, 244, 244, 0.075);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      line-height: 1.55;
+      color: #f2eeee;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    .tool-row {
+      display: flex;
+      align-items: baseline;
+      gap: 9px;
+      padding-left: 2px;
+      font-family: var(--mono);
+      font-size: 10.5px;
+    }
+    .tool-row .caret { color: var(--magenta); }
+    .tool-row .tool { color: #7d7979; }
+    .tool-row .args { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .a-prose {
+      max-width: 86%;
+      font-family: var(--sans);
+      font-size: 12.5px;
+      line-height: 1.6;
+      color: var(--prose);
+      text-wrap: pretty;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    .t-empty {
+      color: var(--faint);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      align-self: center;
+      padding-bottom: 40px;
+    }
+
+    /* ---- composer: floating glass card ---- */
+    #composer-card {
+      position: absolute;
+      left: 50%;
+      bottom: 50px;
+      transform: translateX(-50%);
+      width: 61%;
+      border-radius: 18px;
+      background: rgba(30, 28, 27, 0.82);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      box-shadow: inset 0 0 0 1px rgba(248, 244, 244, 0.17), 0 10px 40px rgba(0, 0, 0, 0.38);
+      padding: 14px 16px 12px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 13px;
+    }
+    #composer {
+      width: 100%;
+      background: transparent;
+      border: none;
+      outline: none;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      letter-spacing: 0.01em;
+      color: var(--text);
+      caret-color: var(--magenta);
+      cursor: text;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    #composer::placeholder { color: #6b6867; }
+    #composer-tools { display: flex; align-items: center; gap: 10px; }
+    .chip {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      cursor: pointer;
+      color: #9b9797;
+      padding: 5px 9px 5px 7px;
+      border-radius: 8px;
+      background: rgba(8, 7, 7, 0.55);
+      font-family: var(--mono);
+      font-size: 10.5px;
+      letter-spacing: 0.03em;
+    }
+    .chip:hover { color: #eae7e7; background: rgba(8, 7, 7, 0.8); }
+    #send-btn {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: #f8f4f4;
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 14px;
+      line-height: 1;
+      color: var(--bg);
+      flex: none;
+    }
+    #send-btn:hover { background: #ffffff; box-shadow: 0 0 0 4px rgba(248, 244, 244, 0.12); }
+
+    /* ---- bottom panel ---- */
+    #panel {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 30px;
+      background: var(--panel);
+      border-top: 1px solid var(--line-strong);
+      box-shadow: 0 -18px 40px rgba(4, 16, 43, 0.32);
+      display: none;
+      flex-direction: column;
+      max-height: 70%;
+    }
+    #panel.open { display: flex; }
+    #panel-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      height: 38px;
+      flex: none;
+      padding: 0 20px 0 18px;
+      border-bottom: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 12.5px;
+    }
+    #panel-head .sigil { color: #7d7979; }
+    #panel-head .query { color: var(--text); letter-spacing: 0.005em; }
+    .vimcaret { width: 6px; height: 14px; background: #eae7e7; display: block; animation: vimcaret 1.2s steps(1, end) infinite; }
+    @keyframes vimcaret { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+    #panel-head .count { margin-left: auto; font-size: 10px; letter-spacing: 0.14em; color: var(--faint); }
+
+    #panel-body { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+
+    .group-label {
+      display: flex;
+      align-items: center;
+      height: 24px;
+      flex: none;
+      padding: 0 20px 0 18px;
+      font-family: var(--mono);
+      font-size: 9.5px;
+      letter-spacing: 0.18em;
+      color: var(--faint);
+    }
+    .p-row {
+      flex: none;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 20px 0 18px;
+      cursor: pointer;
+      font-family: var(--mono);
+    }
+    .p-row.sel { background: var(--panel-active); box-shadow: inset 2px 0 0 #eae7e7; }
+    .p-row:hover:not(.sel) { background: rgba(248, 244, 244, 0.025); }
+
+    #panel-foot {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      height: 28px;
+      flex: none;
+      padding: 0 20px 0 18px;
+      border-top: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.14em;
+      color: var(--faint);
+    }
+    #panel-foot b { color: #bab6b6; font-weight: 400; }
+
+    /* session rows */
+    .s-row { height: 34px; }
+    .s-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; max-width: 660px; }
+    .s-title { font-size: 11.5px; line-height: 1; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sel .s-title { color: var(--text); }
+    .s-meta { display: flex; align-items: center; gap: 9px; font-size: 9.5px; line-height: 1; color: var(--muted); white-space: nowrap; }
+    .s-meta .sep { color: #4a4746; }
+    .s-meta .wt { color: var(--blue); }
+    .s-meta .when { color: var(--faint); }
+
+    /* command rows */
+    .c-row { height: 27px; display: grid; grid-template-columns: 148px 1fr 92px; gap: 16px; align-items: center; }
+    .c-cmd { font-size: 11.5px; color: var(--text-dim); }
+    .sel .c-cmd { color: var(--text); }
+    .c-desc { font-size: 10.5px; color: var(--muted); }
+    .c-key { font-size: 10px; color: var(--faint); text-align: right; }
+    .sel .c-key { color: #bab6b6; }
+    .c-row.stub .c-cmd, .c-row.stub .c-desc { opacity: 0.45; }
+
+    /* directory rows */
+    .d-row { height: 29px; display: grid; grid-template-columns: 1fr 104px 168px; gap: 16px; align-items: center; }
+    .d-path { font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+    .d-path b { font-weight: 400; color: #eae7e7; }
+    .sel .d-path { color: #9b9797; }
+    .sel .d-path b { color: var(--text); }
+    .d-kind { font-size: 10px; letter-spacing: 0.14em; color: #8d8a89; }
+    .d-meta { font-size: 10px; color: var(--muted); text-align: right; }
+
+    /* health rows */
+    .h-row { height: 29px; display: grid; grid-template-columns: 170px 1fr; gap: 16px; align-items: center; }
+    .h-label { font-size: 10px; letter-spacing: 0.14em; color: var(--faint); }
+    .h-value { font-size: 11.5px; color: var(--text-dim); }
+
+    /* ---- status bar ---- */
+    #statusbar {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      height: 30px;
+      padding: 0 20px 0 26px;
+      background: var(--statusbar);
+      border-top: 1px solid rgba(248, 244, 244, 0.13);
+      font-family: var(--mono);
+      font-size: 10.5px;
+      letter-spacing: 0.04em;
+      color: #9b9797;
+    }
+    #sb-cwd { display: flex; align-items: center; gap: 7px; color: #eae7e7; cursor: pointer; }
+    #sb-cwd:hover { filter: brightness(1.25); }
+    #sb-wt {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      align-self: stretch;
+      padding: 0 11px;
+      color: var(--blue);
+      background: rgba(47, 107, 245, 0.16);
+      box-shadow: inset 1px 0 0 rgba(77, 141, 255, 0.3), inset -1px 0 0 rgba(77, 141, 255, 0.3);
+    }
+    #sb-branch { display: flex; align-items: center; gap: 6px; color: #bab6b6; }
+    #sb-branch .b { color: #eae7e7; }
+    #sb-branch .arrow { color: var(--faint); }
+    #sb-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+    #sb-cpu { color: #7d7979; }
+    .sb-div { width: 1px; height: 13px; background: rgba(248, 244, 244, 0.12); }
+    .keyhint { display: flex; align-items: center; gap: 5px; font-size: 10px; letter-spacing: 0.14em; color: #7d7979; cursor: pointer; }
+    .keyhint b { color: #eae7e7; font-weight: 400; }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-thumb { background: rgba(248, 244, 244, 0.12); border-radius: 3px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+  </style>
+</head>
+<body>
+  <div id="stage" class="masked">
+    <div id="frame">
+    <svg id="shell" xmlns="http://www.w3.org/2000/svg">
+      <path id="hull" fill="rgba(16,15,14,0.985)" />
+    </svg>
+
+    <div id="chrome">
+      <div id="topbar" data-tauri-drag-region>
+        <span id="logo" data-tauri-drag-region>HYPERVISOR</span>
+        <div id="ticker"><div id="ticker-track"></div></div>
+        <div style="flex: 1;" data-tauri-drag-region></div>
+        <div id="matrix"></div>
+        <div id="avatar-wrap">
+          <div id="avatar"></div>
+          <div id="avatar-menu"></div>
+        </div>
+      </div>
+
+      <div id="transcript"><div class="t-empty">no session focused — ⌘L</div></div>
+      <div style="flex: none; height: 158px;"></div>
+    </div>
+
+    <div id="composer-card">
+      <input id="composer" placeholder="Ask, steer, or hand off to a subagent…" spellcheck="false" />
+      <div id="composer-tools">
+        <span class="chip" id="chip-model">
+          <span id="chip-model-icon"></span>
+          <span id="chip-model-text">sonnet</span>
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#605d5d" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+        </span>
+        <span class="chip" id="chip-cwd" style="padding: 5px 10px 5px 8px;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#7d7979" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+          <span id="chip-cwd-text">~</span>
+        </span>
+        <div style="flex: 1;"></div>
+        <span id="send-btn">↑</span>
+      </div>
+    </div>
+
+    <div id="panel">
+      <div id="panel-head"></div>
+      <div id="panel-body"></div>
+      <div id="panel-foot"></div>
+    </div>
+
+    <div id="statusbar">
+      <span id="sb-cwd" title="change directory">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#7d7979" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+        <span id="sb-cwd-text">~</span>
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#605d5d" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+      </span>
+      <span id="sb-wt"><span id="sb-wt-text"></span></span>
+      <span id="sb-branch"><span class="b" id="sb-branch-text">-</span><span class="arrow">→</span><span id="sb-target-text">main</span></span>
+      <div id="sb-right">
+        <span id="sb-cpu-wrap" style="display: flex; align-items: center; gap: 7px; color: #7d7979;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg>
+          <span id="sb-cpu">0% cpu</span>
+        </span>
+        <span class="sb-div"></span>
+        <span class="keyhint" data-open="commands"><b>/</b><span>COMMANDS</span></span>
+        <span class="keyhint" data-open="sessions"><b>⌘L</b><span>SESSIONS</span></span>
+        <span class="keyhint" data-open="health"><b>⌘K</b><span>HEALTH</span></span>
+      </div>
+    </div>
+
+    <div id="lock">
+      <div id="lock-card">
+        <div id="lock-logo">HYPERVISOR</div>
+        <div id="lock-sub">SIGN IN TO CONTINUE</div>
+        <button id="lock-btn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="#10100f" xmlns="http://www.w3.org/2000/svg"><path d="M12 0C5.37 0 0 5.373 0 12c0 5.303 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.09-.745.082-.73.082-.73 1.205.085 1.838 1.238 1.838 1.238 1.07 1.834 2.807 1.304 3.492.997.108-.775.418-1.305.762-1.605-2.665-.305-5.467-1.334-5.467-5.93 0-1.31.468-2.382 1.235-3.22-.123-.304-.535-1.524.117-3.176 0 0 1.008-.322 3.3 1.23.957-.266 1.983-.4 3.003-.404 1.02.005 2.047.138 3.006.404 2.29-1.552 3.297-1.23 3.297-1.23.653 1.653.24 2.873.118 3.176.77.838 1.233 1.91 1.233 3.22 0 4.61-2.807 5.624-5.48 5.92.43.372.814 1.103.814 2.223 0 1.606-.015 2.898-.015 3.293 0 .32.216.694.825.576C20.565 21.796 24 17.3 24 12c0-6.627-5.373-12-12-12z"/></svg>
+          Sign in with GitHub
+        </button>
+        <div id="lock-err"></div>
+      </div>
+    </div>
+    </div>
+  </div>
+
+  <script>
+    const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
+    const $ = (id) => document.getElementById(id);
+    function esc(s) {
+      return String(s).replace(/[&<>"]/g, (c) =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    }
+
+    let cutout = null;
+    let sessions = [];
+    let focused = null;      // session name
+    let panel = null;        // null | {mode, sel, query, items}
+
+    const MODELS = [
+      { provider: "anthropic", model: "sonnet", label: "CLAUDE SONNET", display: "claude-sonnet" },
+      { provider: "anthropic", model: "opus", label: "CLAUDE OPUS", display: "claude-opus" },
+      { provider: "openai", model: "gpt-5-codex", label: "GPT-5 CODEX", display: "gpt-5-codex" },
+      { provider: "opencode", model: "google/gemini-2.5-pro", label: "GEMINI 2.5 PRO", display: "gemini-2.5-pro" },
+    ];
+    let modelIdx = 0;
+    function renderModelChip() {
+      const m = MODELS[modelIdx];
+      $("chip-model-icon").innerHTML = iconTile(m.provider);
+      $("chip-model-text").textContent = m.display;
+    }
+
+    // ---------------- hull ----------------
+    function draw() {
+      const W = window.innerWidth, H = window.innerHeight;
+      const R = 30, rc = 12;
+      $("shell").setAttribute("viewBox", `0 0 ${W} ${H}`);
+      let d;
+      if (cutout && cutout.left > R + rc && cutout.right < W - R - rc) {
+        const cl = cutout.left, cr = cutout.right, cd = cutout.depth;
+        d = [
+          `M ${R} 0 H ${cl - rc}`,
+          `A ${rc} ${rc} 0 0 1 ${cl} ${rc}`,
+          `V ${cd - rc}`,
+          `A ${rc} ${rc} 0 0 0 ${cl + rc} ${cd}`,
+          `H ${cr - rc}`,
+          `A ${rc} ${rc} 0 0 0 ${cr} ${cd - rc}`,
+          `V ${rc}`,
+          `A ${rc} ${rc} 0 0 1 ${cr + rc} 0`,
+          `H ${W - R} A ${R} ${R} 0 0 1 ${W} ${R}`,
+          `V ${H - R} A ${R} ${R} 0 0 1 ${W - R} ${H}`,
+          `H ${R} A ${R} ${R} 0 0 1 0 ${H - R}`,
+          `V ${R} A ${R} ${R} 0 0 1 ${R} 0 Z`,
+        ].join(" ");
+      } else {
+        d = `M ${R} 0 H ${W - R} A ${R} ${R} 0 0 1 ${W} ${R} V ${H - R} A ${R} ${R} 0 0 1 ${W - R} ${H} H ${R} A ${R} ${R} 0 0 1 0 ${H - R} V ${R} A ${R} ${R} 0 0 1 ${R} 0 Z`;
+      }
+      $("hull").setAttribute("d", d);
+      // Clip the whole frame to the hull, so the status bar and panels take
+      // the rounded corners instead of overflowing them.
+      $("frame").style.clipPath = `path("${d}")`;
+      $("topbar").style.paddingTop = (cutout ? Math.max(20, cutout.depth - 18) : 20) + "px";
+    }
+
+    // ---------------- show/hide animation ----------------
+    const stage = () => $("stage");
+    function maskStage() { stage().classList.add("masked"); }
+    async function showFlow() {
+      const s = stage();
+      s.classList.add("masked");
+      void s.offsetWidth;
+      try { await invoke("reveal_ready"); } catch (e) { return; }
+      requestAnimationFrame(() => requestAnimationFrame(() => s.classList.remove("masked")));
+    }
+    let pendingExpand = false;
+    function beginExpand() {
+      const s = stage();
+      s.style.transition = "none";
+      s.style.clipPath = `inset(0 0 calc(100% - ${window.innerHeight}px) 0)`;
+      pendingExpand = true;
+    }
+    window.addEventListener("resize", () => {
+      draw();
+      if (pendingExpand) {
+        pendingExpand = false;
+        const s = stage();
+        void s.offsetWidth;
+        s.style.transition = "";
+        s.style.clipPath = "";
+      }
+    });
+
+    // ---------------- top bar ----------------
+    // Claude starburst: rays from near-center, drawn inline so it stays
+    // sharp at any tile size.
+    const CLAUDE_MARK = (() => {
+      const rays = [];
+      for (let i = 0; i < 9; i++) {
+        const a = ((i * 40 - 90) * Math.PI) / 180;
+        const r = i % 2 ? 8.4 : 10;
+        rays.push(`<line x1="${(12 + Math.cos(a) * 2.2).toFixed(2)}" y1="${(12 + Math.sin(a) * 2.2).toFixed(2)}" x2="${(12 + Math.cos(a) * r).toFixed(2)}" y2="${(12 + Math.sin(a) * r).toFixed(2)}"/>`);
+      }
+      return `<svg viewBox="0 0 24 24" width="11" height="11"><g stroke="#fff" stroke-width="2.5" stroke-linecap="round">${rays.join("")}</g></svg>`;
+    })();
+
+    function iconTile(provider) {
+      if (provider === "anthropic") return `<span class="icon-tile icon-anthropic">${CLAUDE_MARK}</span>`;
+      if (provider === "openai") return '<span class="icon-tile icon-openai" style="font-size: 11px;">◎</span>';
+      return '<span class="icon-tile icon-other" style="font-size: 10px;">▲</span>';
+    }
+
+    // The matrix is an instrument, not decoration. Motion means the focused
+    // session is thinking right now; color is the verdict on its change — the
+    // unit tests and gx review — once those are wired. With no verdict it
+    // sits still and grey.
+    const matrixState = { thinking: false, verdict: null }; // verdict: null | "pass" | "fail"
+
+    function matrixPalette() {
+      if (matrixState.verdict === "pass") return [[0x26, 0xf0, 0x98], [0x26, 0xf0, 0x98]];
+      if (matrixState.verdict === "fail") return [[0xdd, 0x5f, 0x52], [0xdd, 0x5f, 0x52]];
+      return [[0x6a, 0x66, 0x66], [0x6a, 0x66, 0x66]];
+    }
+
+    function buildMatrix() {
+      let html = "";
+      for (let i = 0; i < 3 * 24; i++) {
+        const dur = (1.1 + Math.random() * 1.3).toFixed(2);
+        const delay = (Math.random() * 2.2).toFixed(2);
+        html += `<span data-dur="${dur}" data-delay="${delay}"></span>`;
+      }
+      $("matrix").innerHTML = html;
+      renderMatrix();
+    }
+
+    function renderMatrix() {
+      const [from, to] = matrixPalette();
+      const dots = $("matrix").children;
+      for (let i = 0; i < dots.length; i++) {
+        const t = (i % 24) / 23;
+        const c = from.map((f, ci) => Math.round(f + (to[ci] - f) * t));
+        const d = dots[i];
+        d.style.background = `rgb(${c.join(",")})`;
+        if (matrixState.thinking) {
+          d.style.animation = `mtxdot ${d.dataset.dur}s ease-in-out ${d.dataset.delay}s infinite`;
+          d.style.opacity = "";
+        } else {
+          d.style.animation = "none";
+          d.style.opacity = "0.22";
+        }
+      }
+      $("matrix").title = (matrixState.thinking ? "thinking" : "idle")
+        + " · " + (matrixState.verdict ? `checks ${matrixState.verdict}` : "tests & review not wired");
+    }
+
+    function setMatrix(patch) {
+      const next = { ...matrixState, ...patch };
+      if (next.thinking === matrixState.thinking && next.verdict === matrixState.verdict) return;
+      Object.assign(matrixState, next);
+      renderMatrix();
+    }
+
+    let tickerKey = "";
+    function renderTicker(s, summary) {
+      const key = s ? `${s.name}|${s.adds}|${s.dels}|${summary}` : "";
+      if (key === tickerKey) return;
+      tickerKey = key;
+      if (!s) { $("ticker-track").innerHTML = ""; return; }
+      const item = `<span class="tick">${iconTile(s.provider)}
+        <span class="title">${esc(shortTitle(s))}</span>
+        <span class="adds">+${s.adds}</span><span class="dels">−${s.dels}</span>
+        ${summary ? `<span class="dot-sep">·</span><span class="summary">${esc(summary)}</span>` : ""}
+      </span>`;
+      $("ticker-track").innerHTML = item.repeat(4);
+    }
+
+    function shortTitle(s) {
+      const t = s.prompt.replace(/\s+/g, " ").trim();
+      return t.length > 44 ? t.slice(0, 44) + "…" : t;
+    }
+
+    // ---------------- transcript ----------------
+    function parseBlock(block) {
+      const lines = block.split("\n");
+      const parts = [];
+      let i = 0;
+      if (lines[0] && /^[❯>›] /.test(lines[0].trimStart())) {
+        let text = lines[0].trimStart().replace(/^[❯>›] /, "");
+        i = 1;
+        while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !lines[i].trimStart().startsWith("⏺") && !lines[i].trimStart().startsWith("⎿")) {
+          text += " " + lines[i].trim();
+          i++;
+        }
+        parts.push({ kind: "user", text });
+      }
+      let prose = [];
+      const flush = () => {
+        if (prose.length) { parts.push({ kind: "prose", text: prose.join(" ") }); prose = []; }
+      };
+      for (; i < lines.length; i++) {
+        const t = lines[i].trim();
+        if (!t || t.startsWith("⎿") || t.startsWith("✻")) continue;
+        const tool = t.match(/^⏺ ([A-Z][\w]*)\((.*)$/);
+        if (tool) {
+          flush();
+          parts.push({ kind: "tool", tool: tool[1].toLowerCase(), args: tool[2].replace(/\)\s*$/, "") });
+        } else {
+          prose.push(t.replace(/^⏺ /, ""));
+        }
+      }
+      flush();
+      return parts;
+    }
+
+    let transcriptKey = "";
+    function renderTranscript(peek) {
+      const el = $("transcript");
+      if (!peek || !peek.blocks.length) {
+        const msg = !focused ? "no session focused — ⌘L"
+          : (peek && !peek.session.alive ? "session ended" : "waiting for output…");
+        el.innerHTML = `<div class="t-empty">${msg}</div>`;
+        transcriptKey = "";
+        return;
+      }
+      const key = peek.session.name + "|" + peek.blocks.join("\x00");
+      if (key === transcriptKey) return;
+      transcriptKey = key;
+      const html = peek.blocks.flatMap(parseBlock).map((p) => {
+        if (p.kind === "user") return `<div class="u-bubble">${esc(p.text)}</div>`;
+        if (p.kind === "tool") return `<div class="tool-row"><span class="caret">▸</span><span class="tool">${esc(p.tool)}</span><span class="args">${esc(p.args)}</span></div>`;
+        return `<div class="a-prose">${esc(p.text)}</div>`;
+      }).join("");
+      el.innerHTML = html || `<div class="t-empty">waiting for output…</div>`;
+      // ticker summary: last prose
+      const s = sessions.find((x) => x.name === focused);
+      const lastProse = peek.blocks.flatMap(parseBlock).filter((p) => p.kind === "prose").pop();
+      if (s) renderTicker(s, lastProse ? lastProse.text.slice(0, 110) : "");
+    }
+
+    // ---------------- panel system ----------------
+    const COMMANDS = [
+      { group: "GO", cmd: "/sessions", desc: "browse and resume past sessions", key: "⌘L", run: () => openPanel("sessions") },
+      { group: "GO", cmd: "/health", desc: "tokens, context, tests, review", key: "⌘K", run: () => openPanel("health") },
+      { group: "GO", cmd: "/cd", desc: "fuzzy find a working directory", key: "", run: () => openPanel("dir") },
+      { group: "GO", cmd: "/search", desc: "ask across sessions and files", key: "⌘P", stub: true },
+      { group: "SESSION", cmd: "/model", desc: "switch the model for this session", key: "", stub: true },
+      { group: "SESSION", cmd: "/agents", desc: "inspect and steer subagents", key: "", stub: true },
+      { group: "SESSION", cmd: "/compact", desc: "summarize and reclaim context", key: "", stub: true },
+      { group: "SESSION", cmd: "/clear", desc: "discard context, keep the worktree", key: "", stub: true },
+      { group: "CODE", cmd: "/branch", desc: "switch or create a branch", key: "", stub: true },
+      { group: "CODE", cmd: "/worktree", desc: "open a session in a new worktree", key: "", stub: true },
+      { group: "CODE", cmd: "/diff", desc: "review the working diff", key: "⌘D", stub: true },
+      { group: "CODE", cmd: "/tests", desc: "run the suite in this worktree", key: "", stub: true },
+      { group: "CODE", cmd: "/review", desc: "run review over the working diff", key: "", stub: true },
+    ];
+
+    async function openPanel(mode) {
+      panel = { mode, sel: 0, query: "", items: [] };
+      if (mode === "dir") {
+        try { panel.items = await invoke("list_dirs"); } catch (e) { panel.items = []; }
+      }
+      renderPanel();
+    }
+    function closePanel() {
+      panel = null;
+      $("panel").classList.remove("open");
+    }
+
+    function fuzzy(query, text) {
+      // returns matched char indexes or null
+      if (!query) return [];
+      const q = query.toLowerCase(), t = text.toLowerCase();
+      const idx = [];
+      let ti = 0;
+      for (const ch of q) {
+        const found = t.indexOf(ch, ti);
+        if (found === -1) return null;
+        idx.push(found);
+        ti = found + 1;
+      }
+      return idx;
+    }
+
+    function relTime(secs) {
+      const d = Math.floor(Date.now() / 1000) - secs;
+      if (d < 90) return "now";
+      if (d < 3600) return Math.floor(d / 60) + "m ago";
+      if (d < 86400) return new Date(secs * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      return new Date(secs * 1000).toLocaleDateString([], { month: "short", day: "numeric" }).toLowerCase();
+    }
+
+    function panelRows() {
+      if (!panel) return [];
+      if (panel.mode === "sessions") {
+        return sessions.filter((s) => s.alive)
+          .filter((s) => !panel.query || (s.prompt + s.label).toLowerCase().includes(panel.query.toLowerCase()));
+      }
+      if (panel.mode === "commands") {
+        return COMMANDS.filter((c) => !panel.query || c.cmd.includes(panel.query.toLowerCase()));
+      }
+      if (panel.mode === "dir") {
+        return panel.items
+          .map((d) => ({ ...d, match: fuzzy(panel.query, d.display) }))
+          .filter((d) => d.match !== null);
+      }
+      return [];
+    }
+
+    function renderPanel() {
+      if (!panel) return;
+      const rows = panelRows();
+      panel.sel = Math.max(0, Math.min(panel.sel, rows.length - 1));
+      const head = $("panel-head"), body = $("panel-body"), foot = $("panel-foot");
+      const sigil = { sessions: ">", commands: "/", dir: "", health: ">" }[panel.mode] || ">";
+      const label = { sessions: "", commands: "", dir: "", health: "health" }[panel.mode] || "";
+      const count = panel.mode === "commands" ? `${rows.length} COMMANDS`
+        : panel.mode === "dir" ? `${rows.length} OF ${panel.items.length}`
+        : panel.mode === "sessions" ? `${rows.length} SESSIONS` : "";
+      head.innerHTML = `
+        <span class="sigil">${esc(sigil)}</span>
+        <span class="query">${esc(label ? label : panel.query)}${label && panel.query ? " " + esc(panel.query) : ""}</span>
+        <span class="vimcaret"></span>
+        <span class="count">${esc(count)}</span>`;
+
+      let html = "";
+      if (panel.mode === "health") {
+        const alive = sessions.filter((s) => s.alive);
+        const adds = alive.reduce((n, s) => n + s.adds, 0);
+        const dels = alive.reduce((n, s) => n + s.dels, 0);
+        const stat = (label, value) =>
+          `<div class="p-row h-row"><span class="h-label">${label}</span><span class="h-value">${value}</span></div>`;
+        html =
+          stat("SESSIONS", `${alive.length} running · ${sessions.length - alive.length} ended`) +
+          stat("WORKING DIFF", `<span style="color: var(--adds);">+${adds}</span> <span style="color: var(--dels);">−${dels}</span>`) +
+          stat("CPU", `${$("sb-cpu").textContent}`) +
+          stat("TOKENS / CONTEXT", `<span style="color: var(--faint);">needs the headless driver — next phase</span>`) +
+          stat("TESTS / REVIEW", `<span style="color: var(--faint);">not wired yet</span>`);
+      } else if (panel.mode === "sessions") {
+        const groups = new Map();
+        rows.forEach((s, i) => {
+          const g = s.repo || (s.cwd || "").split("/").pop() || "sessions";
+          if (!groups.has(g)) groups.set(g, []);
+          groups.get(g).push([s, i]);
+        });
+        for (const [g, list] of groups) {
+          html += `<div class="group-label" style="font-size: 10.5px; letter-spacing: 0.04em; gap: 9px; display: flex; align-items: center;">
+            <span style="color: var(--prose);">${esc(g)}</span>
+            <span style="width: 1px; height: 9px; background: rgba(248,244,244,0.14); display: block;"></span>
+            <span>${list.length} session${list.length > 1 ? "s" : ""}</span>
+          </div>`;
+          for (const [s, i] of list) {
+            html += `<div class="p-row s-row ${i === panel.sel ? "sel" : ""}" data-i="${i}">
+              ${iconTile(s.provider)}
+              <span class="s-main">
+                <span class="s-title">${esc(shortTitle(s))}</span>
+                <span class="s-meta">
+                  <span style="color: var(--adds);">+${s.adds}</span>
+                  <span style="color: var(--dels);">−${s.dels}</span>
+                  <span class="sep">·</span>
+                  ${s.branch ? `<span>${esc(s.branch)}</span><span class="sep">·</span>` : ""}
+                  <span class="when">${s.alive ? relTime(s.created_at) : "ended"}</span>
+                </span>
+              </span>
+            </div>`;
+          }
+        }
+      } else if (panel.mode === "commands") {
+        let lastGroup = "";
+        rows.forEach((c, i) => {
+          if (c.group !== lastGroup) {
+            html += `<div class="group-label">${esc(c.group)}</div>`;
+            lastGroup = c.group;
+          }
+          html += `<div class="p-row c-row ${c.stub ? "stub" : ""} ${i === panel.sel ? "sel" : ""}" data-i="${i}">
+            <span class="c-cmd">${esc(c.cmd)}</span>
+            <span class="c-desc">${esc(c.desc)}</span>
+            <span class="c-key">${esc(c.key)}</span>
+          </div>`;
+        });
+      } else if (panel.mode === "dir") {
+        rows.forEach((d, i) => {
+          const chars = [...d.display].map((ch, ci) =>
+            d.match.includes(ci) ? `<b>${esc(ch)}</b>` : esc(ch)).join("");
+          html += `<div class="p-row d-row ${i === panel.sel ? "sel" : ""}" data-i="${i}">
+            <span class="d-path">${chars}</span>
+            <span class="d-kind">${d.kind === "current" ? "CURRENT" : d.kind === "worktree" ? "WORKTREE" : ""}</span>
+            <span class="d-meta">${d.files} files · ${relTime(d.modified)}</span>
+          </div>`;
+        });
+      }
+      body.innerHTML = html;
+      body.querySelectorAll(".p-row").forEach((el) => {
+        el.addEventListener("click", () => { panel.sel = Number(el.dataset.i); activateRow(); });
+      });
+      const sel = body.querySelector(".p-row.sel");
+      if (sel) sel.scrollIntoView({ block: "nearest" });
+
+      const action = { sessions: "SELECT", commands: "RUN", dir: "SET DIRECTORY", health: "DISMISS" }[panel.mode] || "DISMISS";
+      foot.innerHTML = `
+        <span><b>J/K</b> NAVIGATE</span>
+        <span><b>⏎</b> ${action}</span>
+        <span><b>ESC</b> DISMISS</span>`;
+      $("panel").classList.add("open");
+    }
+
+    async function activateRow() {
+      if (!panel) return;
+      const rows = panelRows();
+      const row = rows[panel.sel];
+      if (!row) return;
+      if (panel.mode === "sessions") {
+        focused = row.name;
+        closePanel();
+        refreshDetail();
+      } else if (panel.mode === "commands") {
+        if (row.run) { row.run(); } else { /* stub */ }
+      } else if (panel.mode === "dir") {
+        try { await invoke("set_cwd", { path: row.path }); } catch (e) {}
+        closePanel();
+        refreshStatus();
+      } else {
+        closePanel();
+      }
+    }
+
+    // ---------------- github identity ----------------
+    // The app is locked until someone signs in: the lock overlay greys the
+    // whole frame out and the only live control is the GitHub button. The
+    // avatar mirrors the account and drops down to sign in/out.
+    let user = null;
+    let avatarMenuOpen = false;
+
+    function renderAuth() {
+      const av = $("avatar");
+      if (user && user.avatar_url) {
+        av.innerHTML = `<img src="${esc(user.avatar_url)}" alt="${esc(user.login)}" />`;
+      } else {
+        av.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7a7676" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+      }
+      $("lock").classList.toggle("on", !user);
+      if (!user) { avatarMenuOpen = false; closePanel(); }
+      renderAvatarMenu();
+    }
+
+    function renderAvatarMenu() {
+      const m = $("avatar-menu");
+      if (!avatarMenuOpen) { m.style.display = "none"; return; }
+      m.style.display = "block";
+      m.innerHTML = user
+        ? `<div class="am-user">signed in as <b>${esc(user.login)}</b></div>
+           <div class="am-row" data-act="signout">Sign out</div>`
+        : `<div class="am-row" data-act="signin">Sign in with GitHub</div>`;
+      m.querySelectorAll(".am-row").forEach((el) => {
+        el.addEventListener("click", (e) => {
+          e.stopPropagation();
+          avatarMenuOpen = false;
+          renderAvatarMenu();
+          if (el.dataset.act === "signout") signOut(); else signIn();
+        });
+      });
+    }
+
+    async function refreshAuth() {
+      try { user = await invoke("auth_user"); } catch (e) { user = null; }
+      renderAuth();
+    }
+
+    async function signIn() {
+      $("lock-err").textContent = "";
+      try {
+        user = await invoke("sign_in");
+      } catch (e) {
+        $("lock-err").textContent = String(e);
+        return;
+      }
+      renderAuth();
+    }
+
+    async function signOut() {
+      try { await invoke("sign_out"); } catch (e) {}
+      user = null;
+      renderAuth();
+    }
+
+    // ---------------- data refresh ----------------
+    async function refreshSessions() {
+      try { sessions = await invoke("list_sessions"); } catch (e) { return; }
+      if (!focused) {
+        const firstAlive = sessions.find((s) => s.alive);
+        if (firstAlive) { focused = firstAlive.name; refreshDetail(); }
+      }
+      if (panel && panel.mode === "sessions") renderPanel();
+    }
+
+    async function refreshDetail() {
+      if (!focused) { setMatrix({ thinking: false }); renderTranscript(null); return; }
+      let peek;
+      try { peek = await invoke("peek_session", { name: focused }); } catch (e) { return; }
+      setMatrix({ thinking: !!(peek.session.alive && peek.thinking) });
+      renderTranscript(peek);
+    }
+
+    async function refreshStatus() {
+      const s = sessions.find((x) => x.name === focused);
+      let info;
+      try { info = await invoke("status_info", { cwd: s ? s.cwd : null }); } catch (e) { return; }
+      $("sb-cwd-text").textContent = info.cwd;
+      $("chip-cwd-text").textContent = info.cwd;
+      $("sb-branch-text").textContent = info.branch;
+      $("sb-target-text").textContent = info.target;
+      $("sb-cpu").textContent = info.cpu + "% cpu";
+      const wt = $("sb-wt");
+      if (info.worktree) {
+        $("sb-wt-text").textContent = "wt/" + info.worktree.slice(0, 12);
+        wt.style.display = "flex";
+      } else {
+        wt.style.display = "none";
+      }
+    }
+
+    // ---------------- composer ----------------
+    async function submitComposer() {
+      const input = $("composer");
+      const text = input.value.trim();
+      if (!text) return;
+      const s = sessions.find((x) => x.name === focused && x.alive);
+      input.value = "";
+      try {
+        if (s) {
+          await invoke("send_prompt", { name: s.name, text });
+        } else {
+          const m = MODELS[modelIdx];
+          const created = await invoke("start_session", {
+            provider: m.provider, model: m.model, label: m.label, prompt: text,
+          });
+          focused = created.name;
+        }
+        setTimeout(refreshDetail, 700);
+        setTimeout(refreshSessions, 700);
+      } catch (e) {
+        input.value = text;
+      }
+    }
+
+    // ---------------- keyboard ----------------
+    window.addEventListener("keydown", (e) => {
+      try { handleKey(e); } catch (err) { panel = null; $("panel").classList.remove("open"); }
+    });
+    function handleKey(e) {
+      // Locked: nothing works but hiding the overlay.
+      if (!user) {
+        if (e.key === "Escape") window.__TAURI__?.core.invoke("hide_overlay");
+        return;
+      }
+      const inInput = document.activeElement === $("composer");
+      if (e.metaKey && e.key.toLowerCase() === "l") { e.preventDefault(); openPanel("sessions"); return; }
+      if (e.metaKey && e.key.toLowerCase() === "k") { e.preventDefault(); openPanel("health"); return; }
+
+      if (panel) {
+        if (e.key === "Escape") { closePanel(); return; }
+        if (e.key === "Enter") { activateRow(); return; }
+        if (e.key === "ArrowDown" || (e.key === "j" && panel.mode !== "dir" && !panel.queryFocus)) { panel.sel++; renderPanel(); return; }
+        if (e.key === "ArrowUp" || (e.key === "k" && panel.mode !== "dir" && !panel.queryFocus)) { panel.sel = Math.max(0, panel.sel - 1); renderPanel(); return; }
+        if (e.key === "Backspace") { panel.query = panel.query.slice(0, -1); panel.sel = 0; renderPanel(); return; }
+        if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) {
+          panel.query += e.key;
+          panel.sel = 0;
+          renderPanel();
+          return;
+        }
+        return;
+      }
+
+      if (inInput) {
+        if (e.key === "Enter") submitComposer();
+        if (e.key === "Escape") $("composer").blur();
+        return;
+      }
+      if (e.key === "/") { e.preventDefault(); openPanel("commands"); return; }
+      if (e.key === "Escape") { window.__TAURI__?.core.invoke("hide_overlay"); }
+    }
+
+    // ---------------- boot ----------------
+    async function boot() {
+      buildMatrix();
+      try { cutout = await invoke("geometry"); } catch (e) { cutout = null; }
+      draw();
+      await refreshAuth();
+      $("lock-btn").addEventListener("click", signIn);
+      $("avatar").addEventListener("click", (e) => {
+        e.stopPropagation();
+        avatarMenuOpen = !avatarMenuOpen;
+        renderAvatarMenu();
+      });
+      document.addEventListener("click", () => {
+        if (avatarMenuOpen) { avatarMenuOpen = false; renderAvatarMenu(); }
+      });
+      $("sb-cwd").addEventListener("click", () => openPanel("dir"));
+      $("chip-cwd").addEventListener("click", () => openPanel("dir"));
+      $("chip-model").addEventListener("click", () => { modelIdx = (modelIdx + 1) % MODELS.length; renderModelChip(); });
+      $("send-btn").addEventListener("click", submitComposer);
+      renderModelChip();
+      document.querySelectorAll(".keyhint").forEach((el) => {
+        el.addEventListener("click", () => openPanel(el.dataset.open === "commands" ? "commands" : el.dataset.open));
+      });
+      try {
+        const listen = window.__TAURI__.event.listen;
+        listen("overlay-show", showFlow);
+        listen("overlay-hide", maskStage);
+        listen("overlay-expand", beginExpand);
+      } catch (e) {}
+      await refreshSessions();
+      refreshDetail();
+      refreshStatus();
+      setInterval(refreshSessions, 5000);
+      setInterval(refreshDetail, 3000);
+      setInterval(refreshStatus, 5000);
+      showFlow();
+    }
+    boot();
+  </script>
+</body>
+</html>
