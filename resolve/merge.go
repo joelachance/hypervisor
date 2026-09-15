@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/satoricorp/hv/apply"
 	"github.com/satoricorp/hv/conflict"
 	"github.com/satoricorp/hv/internal/gitx"
 	"github.com/satoricorp/hv/journal"
@@ -66,11 +67,15 @@ func Merge(ctx context.Context, repo string, report conflict.Report, runner Runn
 			replacements = append(replacements, resolution.Resolved)
 			fixed.Resolutions = append(fixed.Resolutions, resolution)
 		}
+		if fileConflict.Binary || (len(fileConflict.Regions) == 0 && gitx.HasMarkers(fileConflict.Merged)) {
+			// Nothing a harness can be asked about: there are no lines.
+			return outcome, fmt.Errorf("%s: %s; a harness cannot resolve it", fileConflict.Path, fileConflict.Problem)
+		}
 		merged, err := gitx.ReplaceRegions(fileConflict.Merged, replacements)
 		if err != nil {
 			return outcome, fmt.Errorf("%s: %w", fileConflict.Path, err)
 		}
-		if strings.Contains(merged, "<<<<<<<") {
+		if gitx.HasMarkers(merged) {
 			return outcome, fmt.Errorf("%s still has conflict markers after resolution", fileConflict.Path)
 		}
 		blob, err := gitx.HashObject(ctx, repo, merged)
@@ -107,7 +112,16 @@ func Merge(ctx context.Context, repo string, report conflict.Report, runner Runn
 	}
 	outcome.Commit = commit
 
+	// The merge lands on the branch only when doing so discards nothing:
+	// a new branch, or one whose tip is already inside the merge. Anything
+	// else would be a force-push in disguise.
 	before, _ := gitx.Run(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	if before != "" && !gitx.Succeeded(ctx, repo, "merge-base", "--is-ancestor", before, commit) {
+		return outcome, fmt.Errorf("branch %s has commits this merge does not include; pick another with -branch", branch)
+	}
+	if err := apply.RefuseCheckedOutElsewhere(ctx, repo, map[string]string{branch: commit}); err != nil {
+		return outcome, err
+	}
 	if _, err := gitx.Run(ctx, repo, "update-ref", "refs/heads/"+branch, commit); err != nil {
 		return outcome, err
 	}

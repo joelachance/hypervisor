@@ -571,9 +571,14 @@ func chooseSessions(watcher *watch.Watcher, root, ids string, since time.Duratio
 func printPlan(result hvplan.Result, sessions []session.Session) {
 	proposal := result.Packet.Proposal
 	short := session.Abbreviate(sessions, 8)
-	fmt.Printf("plan %s  state=%s  hunks=%d  revisions=%d  sessions=%d  attributed=%.0f%%\n",
-		proposal.ID, result.Packet.State, len(proposal.Hunks), len(proposal.Revisions),
-		len(sessions), result.Attributed.Coverage*100)
+	if proposal.ID == "" {
+		// Nothing had a hunk for demux to group; the remainder is the plan.
+		fmt.Printf("plan hv-only  no hunks for demux to group  sessions=%d\n", len(sessions))
+	} else {
+		fmt.Printf("plan %s  state=%s  hunks=%d  revisions=%d  sessions=%d  attributed=%.0f%%\n",
+			proposal.ID, result.Packet.State, len(proposal.Hunks), len(proposal.Revisions),
+			len(sessions), result.Attributed.Coverage*100)
+	}
 	for _, revision := range proposal.Revisions {
 		fmt.Printf("\n%-4s %-40s -> %s\n", revision.ID, revision.Intent, routeOf(revision))
 		for _, file := range revision.Files {
@@ -591,6 +596,19 @@ func printPlan(result hvplan.Result, sessions []session.Session) {
 				names = append(names, sessionName(id, short, sessions))
 			}
 			fmt.Printf("       from %s\n", strings.Join(names, ", "))
+		}
+	}
+	if remainder := result.Remainder; !remainder.Empty() {
+		// What demux could not plan lands after the revisions, on the branch
+		// the last one went to. It is listed the same way so nobody has to
+		// discover it in git log.
+		route := "(unrouted)"
+		if len(proposal.Revisions) > 0 {
+			route = routeOf(proposal.Revisions[len(proposal.Revisions)-1])
+		}
+		fmt.Printf("\n%-4s %-40s -> %s\n", "hv", remainder.Summary(), route)
+		for _, change := range remainder.Changes {
+			fmt.Printf("       %s (%s)\n", change.Path, change.Kind)
 		}
 	}
 	for _, warning := range proposal.FeasibilityWarnings {

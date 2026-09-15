@@ -153,12 +153,14 @@ func TestMergeCommitsWithTwoParents(t *testing.T) {
 	}
 
 	runner := &fakeRunner{reply: func(request Request) Resolution {
-		return Resolution{
-			Resolved:   []string{"func One() int { return 111 + 222 }"},
-			KeptOurs:   request.Ours,
-			KeptTheirs: request.Theirs,
-			Reasoning:  "both changes are additive, so combine them",
+		// Both lines became one; the honest account is two rewrites, not
+		// two claims of keeping lines that are no longer there.
+		combined := "func One() int { return 111 + 222 }"
+		resolution := Resolution{Resolved: []string{combined}, Reasoning: "both changes are additive, so combine them"}
+		for _, line := range append(append([]string{}, request.Ours...), request.Theirs...) {
+			resolution.Rewritten = append(resolution.Rewritten, Rewrite{From: line, To: combined, Why: "combined"})
 		}
+		return resolution
 	}}
 
 	outcome, err := Merge(context.Background(), repo, report, runner, "hv/merge-test")

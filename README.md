@@ -108,6 +108,24 @@ order. An existing branch is extended from its own tip rather than rewritten:
 hv adds commits, it never discards anyone else's. Session provenance is written
 into the commit as `hv-session:` trailers, so it survives outside hv.
 
+The diff is taken against HEAD, so an edit you had already staged is in the
+commit alongside the unstaged half of the same file; `-staged` plans the index
+alone.
+
+Not everything in a tree is a hunk. A deleted file, a mode change, a binary,
+an empty new file, a renamed file: demux groups hunks and has nothing to hold
+these, so hv keeps them back and commits them itself as one more commit after
+the revisions, on the branch the last revision went to. The plan lists it as
+`hv`, and the plan is checked against the diff before anything is committed: a
+file the revisions and that remainder do not cover between them is an error,
+never a quiet omission.
+
+A branch another worktree has checked out is never moved from here - that
+worktree would wake up with an index disagreeing with its HEAD. hv refuses
+before any ref moves and says which worktree to run it from. Refs move in name
+order, and if one refuses to move the ones that already did are journalled so
+`hv undo` can take them back.
+
 ### Conflicts
 
 Two sessions that touched the same lines are found with `git merge-tree
@@ -135,8 +153,11 @@ beta retry bug was asked: fix the retry bug in beta
 ```
 
 Naming the sessions is the part git cannot do. `-json` adds an `accounting`
-block that proves nothing was lost: every conflicted line belongs to a step,
-and `complete` is false if any does not.
+block that proves nothing was lost: the conflicted lines are counted from the
+marked-up text git produced, the steps are summed separately, and `complete`
+is false if the two disagree. A file git cannot show line by line - a binary
+both sides changed - gets a whole-file step and is listed as unaccounted,
+because nothing line-level can be said about it.
 
 ## Resolving with a coding agent
 
@@ -156,15 +177,20 @@ versions in full, and what each session was asked to do - **never the
 repository**, and it runs in a scratch directory so its edit tools have
 nothing to reach. It
 answers with the resolved lines plus an account of what it kept from each side.
-hv checks that account before anything is written: a line that existed on
-either side must survive, be claimed as kept, or be listed as dropped with a
-reason. A resolution that quietly loses a line is refused and no branch is
+hv checks that account both ways before anything is written. Every line of
+both sides must be accounted for exactly once - kept verbatim, rewritten into
+something else, or dropped with a reason - and every claim must be true: a
+line claimed kept has to be in the resolution, a rewrite's result has to be
+there, a claimed line has to have existed. Then the resolution is read back:
+every line in it must be one of those kept or rewritten lines, or declared as
+`added` with a reason, and no more often than the sides had it. A resolution
+that loses a line, invents one, or duplicates one is refused and no branch is
 created.
 
-Every line of both sides must be accounted for exactly once - kept verbatim,
-rewritten into something else, or dropped with a reason - and that accounting
-is checked before anything is written. A resolution that leaves a line out of
-it is refused and no branch is created.
+The merge lands on its branch only when that discards nothing - a new branch,
+or one whose tip is already inside the merge - and never on a branch another
+worktree has checked out. Binary files cannot be resolved this way; the merge
+stops and says which file.
 
 The result is a real merge commit - two parents, `ours` and `theirs` - on its
 own branch, with each region's reasoning in the message and `hv-session:`
@@ -241,7 +267,7 @@ A session exists because its log does.
 | Tool | Store | Edits visible | Repo resolved from |
 |---|---|---|---|
 | Claude Code | `~/.claude/projects/<slug>/<uuid>.jsonl` | Edit, Write, MultiEdit, NotebookEdit, and Bash writes | `cwd` on each record |
-| Codex | `~/.codex/sessions/<date>/rollout-*.jsonl` | shell commands only | `cwd` on `session_meta` |
+| Codex | `~/.codex/sessions/<date>/rollout-*.jsonl` | `apply_patch`, and shell writes | `cwd` on `session_meta` and each `turn_context` |
 | Cursor | `~/.cursor/projects/<slug>/agent-transcripts/**.jsonl` | none | project slug, verified against the filesystem |
 
 Each session is listed by **the title its own tool gave it** - Claude Code
@@ -260,12 +286,18 @@ touched file is not a working agent.
 
 Two findings from the real stores worth knowing:
 
-- **Codex has no edit tool.** Every file it writes goes through
-  `exec_command`. Claude Code does the same whenever it prefers Bash. So
-  `parse/shell.go` reads the commands themselves, recognizing only
-  unambiguous write forms and stripping heredoc bodies first. Those writes
-  carry no text, so only the temporal match tier can claim them - a shell
-  write can never produce a false exact match.
+- **Codex edits two ways.** `apply_patch` is its structured edit tool - a
+  `custom_tool_call` whose input is a patch in Codex's own dialect - and
+  `parse/apply_patch.go` reads it into per-file edits that carry the written
+  text, so the exact and fuzzy tiers can claim them like a Claude Edit. The
+  rest goes through `exec_command`, a shell, and Claude Code does the same
+  whenever it prefers Bash. So `parse/shell.go` reads the commands
+  themselves: it splits each line into shell words first, honouring quotes,
+  and only then reads the operators and command names, recognizing only
+  unambiguous write forms and stripping heredoc bodies. A `>` inside a
+  commit message or an awk program is data, and `pip install x` names no
+  file. Shell writes carry no text, so only the temporal match tier can claim
+  them - a shell write can never produce a false exact match.
 Both Claude Code and Codex record the conversation itself, so `p` shows what a
 session was asked and what it answered. Codex keeps it in `event_msg` records
 (`user_message` / `agent_message`), which also gives its otherwise untitled
@@ -340,6 +372,7 @@ The layout beneath it is exactly what the tools produce
 | temporal tier | works; the fallback when text says nothing |
 | Cursor edit evidence | needs the SQLite store |
 | watcher mid-write records | a sweep landing mid-append can cut the last record |
+| submodule bumps | kept in the remainder and reported; whether `apply --cached` takes them is untested |
 
 All three tiers run. A hunk is attributed to the session whose written text is
 actually in it, falling back to recency only when the text says nothing - which

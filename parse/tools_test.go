@@ -2,6 +2,7 @@ package parse
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/satoricorp/demux/capture"
@@ -182,5 +183,113 @@ func TestOnlyCursorDeclaresItselfUntimed(t *testing.T) {
 	}
 	if !IsUntimed(NewCursor()) {
 		t.Error("Cursor transcripts carry no timestamps and must declare it")
+	}
+}
+
+// Quoted text is data. A `>` in a commit message, an awk program, or a
+// JavaScript arrow used to be read as a redirect, and the name of a package
+// manager's subcommand as the command itself.
+func TestShellWritesIgnoresQuotedAndUnrelatedForms(t *testing.T) {
+	cases := map[string][]string{
+		`git commit -m "parse: a -> b"`:                nil,
+		`git commit -m "mv foo to bar"`:                nil,
+		`git commit -m "feat: install hooks on start"`: nil,
+		`pip install requests numpy`:                   nil,
+		`npm install --save-dev typescript ts-node`:    nil,
+		`awk '$3 > 100' f`:                             nil,
+		`grep -rn "a > b" .`:                           nil,
+		`node -e "rows.map(r => r.fullName)"`:          nil,
+		`test "$a" \> "$b"`:                            nil,
+		`echo hi >out.txt`:                             {"out.txt"},
+		`echo hi > "my file.txt"`:                      {"my file.txt"},
+		`echo hi 2>err.log`:                            {"err.log"},
+		`cmd &>all.log`:                                {"all.log"},
+		`cmd >&2`:                                      nil,
+		`cmd 2>&1 | tee -a run.log`:                    {"run.log"},
+		`cmd > >(logger)`:                              nil,
+		`FOO=1 sudo -n tee /etc/x`:                     {"/etc/x"},
+		`sed -i.bak 's/a/b/' f.go`:                     {"f.go"},
+		`sed --in-place -e 's/a/b/' f.go g.go`:         {"f.go", "g.go"},
+		`sed -i 's/a/b/' f.go && go test ./...`:        {"f.go"},
+		`sed 's/a/b/' f.go > g.go`:                     {"g.go"},
+		`sed -n '1p' f.go`:                             nil,
+		`cp -r src dest`:                               {"dest"},
+		`cp a b -t dir`:                                nil,
+		`install -d /tmp/x`:                            nil,
+		`touch a.go b.go # and > nothing`:              {"a.go", "b.go"},
+		`ls # echo > comment.txt`:                      nil,
+		`cat > x.txt <<EOF`:                            {"x.txt"},
+		`echo a > $OUT`:                                nil,
+		`echo a > "$OUT"`:                              nil,
+		`for f in a b; do echo $f >> out; done`:        {"out"},
+		"echo one > a.txt \\\n  && echo two > b.txt":   {"a.txt", "b.txt"},
+	}
+	for command, want := range cases {
+		got := ShellWrites(command)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("ShellWrites(%q) = %v, want %v", command, got, want)
+		}
+	}
+}
+
+// A << inside quotes is not a heredoc, and a here-string is not one either;
+// both used to swallow every following line.
+func TestStripHeredocsHonoursQuotesAndHereStrings(t *testing.T) {
+	got := StripHeredocs("grep '<<' f\ntouch after.go\ncat <<< \"$x\" > y.txt\ntouch last.go\ncat <<-EOF > z.txt\n\tbody > decoy\n\tEOF\ntouch end.go")
+	writes := ShellWrites(got)
+	want := "after.go,y.txt,last.go,z.txt,end.go"
+	if strings.Join(writes, ",") != want {
+		t.Fatalf("writes = %v, want %s", writes, want)
+	}
+}
+
+func TestApplyPatchEditsReadsEveryFileForm(t *testing.T) {
+	input := "*** Begin Patch\n*** Update File: src/lib.rs\n*** Move to: src/lib2.rs\n@@ fn main\n pub mod a;\n-pub mod old;\n+pub mod new;\n+pub mod newer;\n*** Add File: src/fresh.rs\n+line one\n+line two\n*** Delete File: src/gone.rs\n*** End Patch\n"
+	edits := ApplyPatchEdits(input)
+	want := []PatchEdit{
+		{Path: "src/lib.rs", Deleted: true},
+		{Path: "src/lib2.rs", OldText: "pub mod old;", NewText: "pub mod new;\npub mod newer;"},
+		{Path: "src/fresh.rs", NewText: "line one\nline two"},
+		{Path: "src/gone.rs", Deleted: true},
+	}
+	if len(edits) != len(want) {
+		t.Fatalf("edits = %+v, want %d", edits, len(want))
+	}
+	for index := range want {
+		if edits[index] != want[index] {
+			t.Errorf("edit %d = %+v, want %+v", index, edits[index], want[index])
+		}
+	}
+	if got := ApplyPatchEdits("*** Begin Patch\n*** End Patch"); len(got) != 0 {
+		t.Fatalf("empty patch produced %+v", got)
+	}
+}
+
+// apply_patch is Codex's structured edit tool. Its edits carry text, so the
+// exact and fuzzy tiers can claim them, and relative paths resolve against
+// the directory the turn declared.
+func TestCodexApplyPatchBecomesEditsWithText(t *testing.T) {
+	parser := &Codex{}
+	path := "/logs/rollout-x-019ff782-de0d-7601-b731-ba4607072031.jsonl"
+	turn := []byte(`{"type":"turn_context","timestamp":"2026-08-21T10:00:00Z","payload":{"cwd":"/repo","model":"gpt-5.4"}}`)
+	events, err := parser.ParseLine(path, turn)
+	if err != nil || len(events) != 1 || CWD(events[0]) != "/repo" || events[0].Model != "gpt-5.4" {
+		t.Fatalf("turn_context = %+v, %v; want cwd and model", events, err)
+	}
+	call := []byte(`{"type":"response_item","timestamp":"2026-08-21T10:00:01Z","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/a.go\n@@\n-old\n+new line\n*** Add File: /abs/b.go\n+package b\n*** End Patch"}}`)
+	events, err = parser.ParseLine(path, call)
+	if err != nil || len(events) != 2 {
+		t.Fatalf("apply_patch = %+v, %v; want two edits", events, err)
+	}
+	if events[0].Kind != capture.KindEdit || events[0].FilePath != "/repo/src/a.go" || events[0].NewText != "new line" || events[0].OldText != "old" {
+		t.Errorf("first edit = %+v", events[0])
+	}
+	if events[1].FilePath != "/abs/b.go" || events[1].NewText != "package b" {
+		t.Errorf("second edit = %+v", events[1])
+	}
+	// A message record's id is not a session id.
+	msg := []byte(`{"type":"response_item","timestamp":"2026-08-21T10:00:02Z","payload":{"type":"message","id":"msg_1"}}`)
+	if events, _ := (&Codex{}).ParseLine("/logs/plain.jsonl", msg); len(events) != 0 {
+		t.Fatalf("message id registered a session: %+v", events)
 	}
 }

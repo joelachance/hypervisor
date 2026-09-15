@@ -10,6 +10,7 @@ package merge
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/satoricorp/demux"
@@ -77,15 +78,20 @@ func CommitPlanned(ctx context.Context, request Request, planned hvplan.Result) 
 	// who wants the work committed where they are standing rather than parked
 	// on a name they will have to go find.
 	if strings.EqualFold(branch, "HEAD") {
-		if current, err := hvplan.CurrentBranch(ctx, request.RepoRoot); err == nil {
-			branch = current
+		current, err := hvplan.CurrentBranch(ctx, request.RepoRoot)
+		// rev-parse spells a detached HEAD as the literal word, and a branch
+		// by that name would be created in its honour.
+		if err != nil || current == "HEAD" {
+			return Result{Plan: planned}, fmt.Errorf("HEAD is not on a branch; name one with -branch")
 		}
+		branch = current
 	}
 	entry, err := apply.Apply(ctx, request.RepoRoot, planned.Packet, apply.Options{
 		Sessions:         SessionInfo(request.Sessions),
 		RevisionSessions: Attribution(planned),
 		Branch:           branch,
 		Resolver:         request.Resolver,
+		Remainder:        planned.Remainder,
 	})
 	if err != nil {
 		return Result{Plan: planned, Entry: entry}, err

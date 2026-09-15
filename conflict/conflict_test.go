@@ -167,3 +167,52 @@ func lastChoose(t *testing.T, report Report) Step {
 	t.Fatalf("no choose step in %+v", report.Steps)
 	return Step{}
 }
+
+// A binary file both sides changed cannot be shown line by line. The report
+// says so: a whole-file step, and an accounting that admits it is not
+// complete rather than one that always says it is.
+func TestBinaryConflictIsAWholeFileStep(t *testing.T) {
+	dir := repo(t)
+	write(t, dir, "logo.bin", "base\x00bytes")
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-qm", "binary")
+	branchWith(t, dir, "session-a", "logo.bin", "ours\x00bytes")
+	branchWith(t, dir, "session-b", "logo.bin", "theirs\x00bytes")
+
+	report, err := Analyze(context.Background(), dir, Side{Ref: "session-a"}, Side{Ref: "session-b"})
+	if err != nil {
+		t.Fatalf("Analyze() error = %v", err)
+	}
+	if len(report.Conflicts) != 1 || !report.Conflicts[0].Binary {
+		t.Fatalf("conflicts = %+v, want logo.bin marked binary", report.Conflicts)
+	}
+	step := lastChoose(t, report)
+	if step.Path != "logo.bin" || !strings.Contains(step.Reason, "taken whole") {
+		t.Fatalf("step = %+v, want a whole-file decision", step)
+	}
+	if report.Accounting.Complete || len(report.Accounting.Unaccounted) != 1 {
+		t.Fatalf("accounting = %+v, want the file admitted as unaccounted", report.Accounting)
+	}
+}
+
+// The conflicted-line figure is read from the marked-up text, and the steps
+// are checked against it - so it can disagree.
+func TestAccountingCountsFromTheText(t *testing.T) {
+	dir := repo(t)
+	branchWith(t, dir, "session-a", "app.go", "package app\n\nfunc One() int { return 100 }\n\nfunc Two() int { return 2 }\n")
+	branchWith(t, dir, "session-b", "app.go", "package app\n\nfunc One() int { return 200 }\n\nfunc Two() int { return 2 }\n")
+	report, err := Analyze(context.Background(), dir, Side{Ref: "session-a"}, Side{Ref: "session-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Accounting.ConflictedLines != 2 || report.Accounting.StepsCoverLines != 2 || !report.Accounting.Complete {
+		t.Fatalf("accounting = %+v, want 2 lines counted and covered", report.Accounting)
+	}
+	// Steps that claim less than the text holds are caught.
+	report.Conflicts[0].Regions = nil
+	report.Conflicts[0].Problem = "regions lost"
+	_, accounting := steps(report)
+	if accounting.Complete {
+		t.Fatalf("accounting = %+v, want incomplete once the regions are gone", accounting)
+	}
+}

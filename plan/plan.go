@@ -48,7 +48,11 @@ type Request struct {
 type Result struct {
 	Packet     demux.DemuxPlanPacket
 	Attributed match.Result
-	Diff       string
+	// Diff is the whole working diff, remainder included.
+	Diff string
+	// Remainder is what demux could not plan and hv commits itself:
+	// deletions, mode changes, binaries, renames.
+	Remainder Remainder
 }
 
 // Run plans the working tree, attributing hunks to the selected sessions.
@@ -69,6 +73,13 @@ func Run(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	// demux gets only what its parser can hold; the rest is hv's to commit.
+	planned, remainder := Split(diff)
+	if strings.TrimSpace(planned) == "" {
+		// Nothing but deletions and the like: no hunks to group, so no
+		// planner round. The remainder is the whole plan.
+		return Result{Diff: diff, Remainder: remainder}, nil
+	}
 
 	planner := demux.NewPlanner(request.Stacks...)
 	planner.Probe = Probe{}
@@ -79,13 +90,19 @@ func Run(ctx context.Context, request Request) (Result, error) {
 	}
 
 	// First pass: learn the hunk catalog. Its IDs are what the matcher links.
-	catalog, err := planner.ProposeFromDiff(ctx, diff, options)
+	catalog, err := planner.ProposeFromDiff(ctx, planned, options)
 	if err != nil {
 		return Result{}, err
 	}
+	// Every changed file must be in the catalog or the remainder before
+	// anything else happens. A plan that quietly covers part of the tree is
+	// the failure this whole package exists to prevent.
+	if missing := Uncovered(diff, hunkFiles(catalog.Hunks), remainder); len(missing) > 0 {
+		return Result{}, coverageError(missing)
+	}
 	if len(request.Events) == 0 {
 		packet, err := finish(ctx, planner, catalog, request.Repair)
-		return Result{Packet: packet, Diff: diff}, err
+		return Result{Packet: packet, Diff: diff, Remainder: remainder}, err
 	}
 
 	attributed := request.Matcher.Link(catalog.Hunks, eventsFor(request.Sessions, request.Events))
@@ -95,7 +112,7 @@ func Run(ctx context.Context, request Request) (Result, error) {
 	options.Capture = attributed.Capture()
 	options.ProvenanceStatus = attributed.Status()
 	options.SessionIDs = fallbackSessionIDs(request.Sessions)
-	proposal, err := planner.ProposeFromDiff(ctx, diff, options)
+	proposal, err := planner.ProposeFromDiff(ctx, planned, options)
 	if err != nil {
 		return Result{}, err
 	}
@@ -103,7 +120,21 @@ func Run(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Packet: packet, Attributed: attributed, Diff: diff}, nil
+	return Result{Packet: packet, Attributed: attributed, Diff: diff, Remainder: remainder}, nil
+}
+
+// hunkFiles is the distinct files a hunk catalog covers.
+func hunkFiles(hunks []demux.HunkRange) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, hunk := range hunks {
+		if _, ok := seen[hunk.File]; ok {
+			continue
+		}
+		seen[hunk.File] = struct{}{}
+		out = append(out, hunk.File)
+	}
+	return out
 }
 
 // finish reviews a proposal, optionally converging it with demux's

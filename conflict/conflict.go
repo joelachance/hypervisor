@@ -16,6 +16,7 @@ package conflict
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -46,6 +47,10 @@ type FileConflict struct {
 	Regions    []Region `json:"regions"`
 	// Merged is the file with conflict markers, exactly as git produced it.
 	Merged string `json:"merged,omitempty"`
+	// Binary marks a file git cannot show line by line. Problem says why a
+	// file has no regions to decide about, when it has none.
+	Binary  bool   `json:"binary,omitempty"`
+	Problem string `json:"problem,omitempty"`
 }
 
 // Step is one decision to make. Steps are ordered and exhaustive: applying
@@ -198,11 +203,21 @@ func analyzeFile(ctx context.Context, repo, path string, stage [3]string) (FileC
 	}
 	merged, err := gitx.MergeFile(ctx, repo, stage[0], stage[1], stage[2],
 		[3]string{"base", "ours", "theirs"})
+	if errors.Is(err, gitx.ErrBinary) {
+		// A whole-file decision: git can say the sides differ and nothing
+		// more, so no line-level accounting is possible here.
+		fileConflict.Binary = true
+		fileConflict.Problem = "binary file; the two versions cannot be shown line by line"
+		return fileConflict, nil
+	}
 	if err != nil {
 		return fileConflict, err
 	}
 	fileConflict.Merged = merged
 	fileConflict.Regions = gitx.ParseRegions(merged)
+	if len(fileConflict.Regions) == 0 {
+		fileConflict.Problem = "git reports a conflict but the contents merge; a mode, type, or rename disagreement"
+	}
 	return fileConflict, nil
 }
 
@@ -221,9 +236,27 @@ func steps(report Report) ([]Step, Accounting) {
 		number++
 	}
 	for _, fileConflict := range report.Conflicts {
+		// The figure the steps are checked against comes from the marked-up
+		// text itself, not from the regions the steps are built from - a
+		// count derived from the same loop would prove nothing.
+		accounting.ConflictedLines += gitx.ConflictedLines(fileConflict.Merged)
+		if len(fileConflict.Regions) == 0 {
+			// Nothing to decide line by line, which is itself the finding:
+			// the file needs a whole-file decision, and the accounting says
+			// so rather than pretending the file is covered.
+			out = append(out, Step{
+				N: number, Action: ActionChoose, Path: fileConflict.Path,
+				Reason: fmt.Sprintf("%s and %s both changed this file, and it has to be taken whole: %s",
+					sideName(report.Ours), sideName(report.Theirs), fileConflict.Problem),
+				OursFrom: sideName(report.Ours), TheirsFrom: sideName(report.Theirs),
+			})
+			accounting.Unaccounted = append(accounting.Unaccounted,
+				fmt.Sprintf("%s: %s", fileConflict.Path, fileConflict.Problem))
+			number++
+			continue
+		}
 		for _, region := range fileConflict.Regions {
 			lines := len(region.Ours) + len(region.Theirs)
-			accounting.ConflictedLines += lines
 			action, reason := ActionChoose, fmt.Sprintf(
 				"%s and %s changed the same %d lines differently; both versions are given in full",
 				sideName(report.Ours), sideName(report.Theirs), maxInt(len(region.Ours), len(region.Theirs)))
