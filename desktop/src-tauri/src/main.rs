@@ -99,8 +99,12 @@ fn reveal_ready(app: AppHandle) {
         let ns_win = ns_win as *mut AnyObject;
         unsafe {
             let _: () = msg_send![ns_win, setLevel: l.level];
-            // Shows without activating the app; keyboard focus stays put.
-            let _: () = msg_send![ns_win, orderFrontRegardless];
+            // Become key so the composer can be typed into immediately (the
+            // page focuses it on overlay-show). Activate the app so an
+            // accessory-policy window can take keyboard focus.
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+            let _: () = msg_send![ns_win, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         }
     }
 }
@@ -200,8 +204,20 @@ struct Session {
     created_at: u64,
     #[serde(default)]
     cwd: String,
+    /// "stream" = headless Claude Code stream-json driver; "tui" = pane scrape.
+    #[serde(default)]
+    driver: String,
+    /// Claude Code session id, for --resume across turns (stream driver).
+    #[serde(default)]
+    session_id: String,
     #[serde(default)]
     alive: bool,
+    /// A turn is currently executing (its tmux pane is live).
+    #[serde(default)]
+    running: bool,
+    /// Agent exited but the tmux pane is retained (remain-on-exit).
+    #[serde(default)]
+    done: bool,
     #[serde(default)]
     adds: u32,
     #[serde(default)]
@@ -232,12 +248,242 @@ fn repo_name(cwd: &str) -> String {
     }
 }
 
+/// One rendered transcript item. kind: "user" | "assistant" | "tool".
+#[derive(serde::Serialize, Clone)]
+struct Ev {
+    kind: String,
+    text: String,
+}
+
 #[derive(serde::Serialize)]
 struct Peek {
     session: Session,
-    blocks: Vec<String>,
-    /// True while the pane shows the CLI's working spinner.
-    thinking: bool,
+    events: Vec<Ev>,
+}
+
+fn stream_path(name: &str) -> PathBuf {
+    sessions_dir().join(format!("{name}.jsonl"))
+}
+
+/// Append our own user-prompt event to the stream log. Claude's stream-json
+/// does not echo the human prompt, so we record it ourselves to keep the
+/// transcript (and turn ordering) complete.
+fn append_user_prompt(name: &str, text: &str) {
+    let line = serde_json::json!({ "type": "user_prompt", "text": text }).to_string();
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(stream_path(name))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// The resumable session id from a stream log, per provider. Claude puts it
+/// in the init event's `session_id`; Codex in the `thread.started` event's
+/// `thread_id`.
+fn read_session_id(name: &str, provider: &str) -> Option<String> {
+    let text = fs::read_to_string(stream_path(name)).ok()?;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ty = v.get("type").and_then(|t| t.as_str());
+        if provider == "openai" {
+            if ty == Some("thread.started") {
+                if let Some(id) = v.get("thread_id").and_then(|s| s.as_str()) {
+                    return Some(id.to_string());
+                }
+            }
+        } else if ty == Some("system")
+            && v.get("subtype").and_then(|s| s.as_str()) == Some("init")
+        {
+            if let Some(id) = v.get("session_id").and_then(|s| s.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A short human label for a tool call from its input JSON.
+fn tool_summary(name: &str, input: &serde_json::Value) -> String {
+    let pick = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| {
+            input
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+    };
+    let detail = pick(&[
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+        "prompt",
+    ])
+    .unwrap_or_default();
+    let detail = detail.replace('\n', " ");
+    let detail = if detail.chars().count() > 72 {
+        format!("{}…", detail.chars().take(72).collect::<String>())
+    } else {
+        detail
+    };
+    let tool = name.to_lowercase();
+    if detail.is_empty() {
+        tool
+    } else {
+        format!("{tool}  {detail}")
+    }
+}
+
+/// Parse a Claude stream-json log into transcript events.
+fn parse_stream(text: &str) -> Vec<Ev> {
+    let mut events = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("user_prompt") => {
+                if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                    events.push(Ev { kind: "user".into(), text: t.to_string() });
+                }
+            }
+            Some("assistant") => {
+                let content = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array());
+                for item in content.into_iter().flatten() {
+                    match item.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                                if !t.trim().is_empty() {
+                                    events.push(Ev { kind: "assistant".into(), text: t.to_string() });
+                                }
+                            }
+                        }
+                        Some("tool_use") => {
+                            let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                            let empty = serde_json::json!({});
+                            let input = item.get("input").unwrap_or(&empty);
+                            events.push(Ev { kind: "tool".into(), text: tool_summary(name, input) });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {} // tool_result, system, result, rate_limit — not rendered
+        }
+    }
+    // Keep the last few exchanges: cap to the trailing 24 events.
+    if events.len() > 500 {
+        events = events.split_off(events.len() - 500);
+    }
+    events
+}
+
+/// Trim a value to a single line and cap its length for a tool label.
+fn short(detail: &str) -> String {
+    let detail = detail.replace('\n', " ");
+    let detail = detail.trim();
+    if detail.chars().count() > 72 {
+        format!("{}…", detail.chars().take(72).collect::<String>())
+    } else {
+        detail.to_string()
+    }
+}
+
+/// Parse a Codex `exec --json` log into transcript events.
+fn parse_codex_stream(text: &str) -> Vec<Ev> {
+    let mut events = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("user_prompt") => {
+                if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                    events.push(Ev { kind: "user".into(), text: t.to_string() });
+                }
+            }
+            Some("item.completed") => {
+                let Some(item) = v.get("item") else { continue };
+                match item.get("type").and_then(|t| t.as_str()) {
+                    Some("agent_message") => {
+                        if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                            if !t.trim().is_empty() {
+                                events.push(Ev { kind: "assistant".into(), text: t.to_string() });
+                            }
+                        }
+                    }
+                    Some("command_execution") => {
+                        // Strip the "/bin/zsh -lc '…'" shell wrapper if present.
+                        let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        let inner = cmd
+                            .split_once("-lc ")
+                            .map(|(_, r)| r.trim().trim_matches('\''))
+                            .unwrap_or(cmd);
+                        events.push(Ev { kind: "tool".into(), text: format!("bash  {}", short(inner)) });
+                    }
+                    Some("file_change") => {
+                        let path = item
+                            .get("path")
+                            .or_else(|| item.get("file_path"))
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("");
+                        events.push(Ev { kind: "tool".into(), text: format!("edit  {}", short(path)) });
+                    }
+                    // Skip Codex's noisy warning items and internal reasoning.
+                    Some("error") | Some("reasoning") | None => {}
+                    Some(other) => {
+                        events.push(Ev { kind: "tool".into(), text: other.replace('_', " ") });
+                    }
+                }
+            }
+            _ => {} // thread.started, turn.*, usage — not rendered
+        }
+    }
+    if events.len() > 500 {
+        events = events.split_off(events.len() - 500);
+    }
+    events
+}
+
+/// Parse a stream log into events, dispatching on provider.
+fn parse_stream_for(text: &str, provider: &str) -> Vec<Ev> {
+    if provider == "openai" {
+        parse_codex_stream(text)
+    } else {
+        parse_stream(text)
+    }
+}
+
+/// Convert scraped pane blocks (tui driver) into the same event shape.
+fn blocks_to_events(blocks: &[String]) -> Vec<Ev> {
+    let mut events = Vec::new();
+    for block in blocks {
+        for line in block.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Some(rest) = prompt_text(line) {
+                events.push(Ev { kind: "user".into(), text: rest.to_string() });
+            } else if let Some(rest) = t.strip_prefix("⏺ ") {
+                events.push(Ev { kind: "assistant".into(), text: rest.to_string() });
+            } else {
+                events.push(Ev { kind: "assistant".into(), text: t.to_string() });
+            }
+        }
+    }
+    events
 }
 
 fn sessions_dir() -> PathBuf {
@@ -250,8 +496,16 @@ fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Dedicated tmux server socket, so every hypervisor process — across
+/// rebuilds and regardless of inherited env — shares one server and sees the
+/// same sessions. Without this, a new app instance can bind a different
+/// default socket and find none of the running sessions.
+const TMUX_SOCKET: &str = "hypervisor";
+
 fn tmux(args: &[&str]) -> Result<String, String> {
     let out = Command::new("tmux")
+        .arg("-L")
+        .arg(TMUX_SOCKET)
         .args(args)
         .output()
         .map_err(|e| format!("tmux: {e}"))?;
@@ -262,9 +516,24 @@ fn tmux(args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn live_sessions() -> HashSet<String> {
-    tmux(&["list-sessions", "-F", "#S"])
-        .map(|s| s.lines().map(str::to_string).collect())
+/// session name -> pane_dead for every tmux session. The format puts the
+/// single-char pane_dead flag first so parsing needs no delimiter (a literal
+/// tab in the -F string does not survive to the output on this tmux).
+fn pane_states() -> std::collections::HashMap<String, bool> {
+    tmux(&["list-panes", "-a", "-F", "#{pane_dead}#{session_name}"])
+        .map(|out| {
+            out.lines()
+                .filter_map(|l| {
+                    let mut chars = l.chars();
+                    let dead = chars.next()? == '1';
+                    let name = chars.as_str();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some((name.to_string(), dead))
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -319,6 +588,74 @@ fn set_cwd(path: String) -> Result<(), String> {
     }
     *DEFAULT_CWD.lock().unwrap() = Some(path);
     Ok(())
+}
+
+fn slug_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/'))
+}
+
+/// Create a git worktree off the current repo on a new branch, and switch the
+/// default working directory to it so the next session opens there.
+#[tauri::command]
+fn create_worktree(name: String) -> Result<String, String> {
+    let name = name.trim().to_string();
+    if !slug_ok(&name) {
+        return Err("use letters, digits, - _ /".into());
+    }
+    let cwd = default_cwd();
+    let common = git(&cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .ok_or("not a git repo")?;
+    let repo_root = PathBuf::from(&common)
+        .parent()
+        .ok_or("no repo root")?
+        .to_path_buf();
+    let parent = repo_root.parent().ok_or("no parent dir")?;
+    let leaf = name.rsplit('/').next().unwrap_or(&name);
+    let wt_path = parent.join(format!("{}-{}", repo_name(&cwd), leaf));
+    let wt_str = wt_path.to_string_lossy().into_owned();
+    if wt_path.exists() {
+        return Err("worktree path already exists".into());
+    }
+    git(
+        &repo_root.to_string_lossy(),
+        &["worktree", "add", &wt_str, "-b", &name],
+    )
+    .ok_or("git worktree add failed")?;
+    *DEFAULT_CWD.lock().unwrap() = Some(wt_str.clone());
+    Ok(wt_str)
+}
+
+/// Create (or switch to) a branch in the current working directory.
+#[tauri::command]
+fn switch_branch(name: String) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if !slug_ok(&name) {
+        return Err("use letters, digits, - _ /".into());
+    }
+    let cwd = default_cwd();
+    // -B creates or resets-to; use switch -c, fall back to switch.
+    if git(&cwd, &["switch", "-c", &name]).is_some() {
+        return Ok(());
+    }
+    git(&cwd, &["switch", &name])
+        .map(|_| ())
+        .ok_or_else(|| "could not switch branch".into())
+}
+
+/// The working diff of the current directory, capped for display.
+#[tauri::command]
+fn working_diff() -> String {
+    let cwd = default_cwd();
+    let out = git(&cwd, &["diff", "--stat", "HEAD"]).unwrap_or_default();
+    let full = git(&cwd, &["diff", "HEAD"]).unwrap_or_default();
+    let body: String = full.lines().take(400).collect::<Vec<_>>().join("\n");
+    if out.trim().is_empty() && body.trim().is_empty() {
+        "no working changes".into()
+    } else {
+        format!("{out}\n\n{body}")
+    }
 }
 
 fn diffstat(cwd: &str) -> (u32, u32) {
@@ -437,6 +774,307 @@ fn list_dirs() -> Vec<DirEntry> {
     out
 }
 
+#[derive(serde::Serialize)]
+struct SearchHit {
+    name: String,
+    provider: String,
+    label: String,
+    prompt: String,
+    created_at: u64,
+    messages: u32,
+    snippet: String,
+}
+
+#[derive(serde::Serialize)]
+struct FileHit {
+    repo: String,
+    path: String,   // repo-relative
+    full: String,   // absolute, for opening
+    line: u32,
+    snippet: String,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryHit {
+    title: String,
+    full: String,
+    snippet: String,
+}
+
+#[derive(serde::Serialize)]
+struct SearchResult {
+    sessions: Vec<SearchHit>,
+    files: Vec<FileHit>,
+    memory: Vec<MemoryHit>,
+}
+
+/// Git repos one level under ~/git, as (name, absolute path).
+fn all_repos() -> Vec<(String, String)> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(format!("{home}/git")) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() && p.join(".git").exists() {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                out.push((name, p.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// git grep (tracked files, all terms must appear) across one repo, skipping
+/// data/generated files and minified blobs so results stay readable source.
+fn grep_repo(repo: &str, name: &str, terms: &[&str], cap: usize) -> Vec<FileHit> {
+    let mut args: Vec<&str> = vec!["grep", "-n", "-i", "-I", "--all-match"];
+    for t in terms {
+        args.push("-e");
+        args.push(t);
+    }
+    // Pathspec exclusions: data, lockfiles, minified, maps, and snapshots.
+    args.push("--");
+    args.push(".");
+    for excl in [
+        ":(exclude)*.jsonl",
+        ":(exclude)*.lock",
+        ":(exclude)*-lock.json",
+        ":(exclude)package-lock.json",
+        ":(exclude)*.min.js",
+        ":(exclude)*.min.css",
+        ":(exclude)*.map",
+        ":(exclude)*.snap",
+        ":(exclude)**/fixtures/**",
+        ":(exclude)**/testdata/**",
+        ":(exclude)**/*.json", // data blobs; keeps config .json rare miss over noise
+    ] {
+        args.push(excl);
+    }
+    let Some(out) = git(repo, &args) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, ':');
+            let path = parts.next()?.to_string();
+            let line: u32 = parts.next()?.parse().ok()?;
+            let content = parts.next()?.trim();
+            // Skip minified/data lines: a readable source line isn't 300+ chars.
+            if content.chars().count() > 300 {
+                return None;
+            }
+            Some(FileHit {
+                repo: name.to_string(),
+                full: format!("{repo}/{path}"),
+                path,
+                line,
+                snippet: short(content),
+            })
+        })
+        .take(cap)
+        .collect()
+}
+
+/// Search the user's memory markdown (~/.claude/projects/*/memory/*.md).
+fn grep_memory(terms: &[&str], cap: usize) -> Vec<MemoryHit> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = Vec::new();
+    let Ok(projects) = fs::read_dir(format!("{home}/.claude/projects")) else {
+        return out;
+    };
+    for proj in projects.flatten() {
+        let mem = proj.path().join("memory");
+        let Ok(files) = fs::read_dir(&mem) else { continue };
+        for f in files.flatten() {
+            let p = f.path();
+            if p.extension().map(|e| e != "md").unwrap_or(true) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&p) else { continue };
+            let low = text.to_lowercase();
+            if !terms.iter().all(|t| low.contains(t)) {
+                continue;
+            }
+            let snippet = text
+                .lines()
+                .find(|l| {
+                    let ll = l.to_lowercase();
+                    terms.iter().any(|t| ll.contains(t)) && !l.trim().is_empty()
+                })
+                .unwrap_or("")
+                .trim_start_matches(['#', ' ']);
+            out.push(MemoryHit {
+                title: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                full: p.to_string_lossy().into_owned(),
+                snippet: short(snippet),
+            });
+            if out.len() >= cap {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Synthesize a natural-language answer to a query from the user's sessions,
+/// repos, and memory. Runs one headless `claude -p` turn and returns its prose
+/// — ephemeral: it is NOT saved as a hypervisor session.
+#[tauri::command]
+fn search_answer(query: String) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("empty query".into());
+    }
+    let found = search_all(q.to_string());
+
+    // Assemble grounding context from the retrieval hits.
+    let mut ctx = String::new();
+    if !found.sessions.is_empty() {
+        ctx.push_str("## Past sessions\n");
+        for s in found.sessions.iter().take(8) {
+            ctx.push_str(&format!("- {} ({}): {}\n", s.label, s.prompt, s.snippet));
+        }
+    }
+    if !found.files.is_empty() {
+        ctx.push_str("\n## Code (repo · path:line)\n");
+        for f in found.files.iter().take(14) {
+            ctx.push_str(&format!("- {} · {}:{}  {}\n", f.repo, f.path, f.line, f.snippet));
+        }
+    }
+    if !found.memory.is_empty() {
+        ctx.push_str("\n## Memory notes\n");
+        for m in found.memory.iter().take(6) {
+            ctx.push_str(&format!("- {}: {}\n", m.title, m.snippet));
+        }
+    }
+    if ctx.is_empty() {
+        ctx.push_str("(no direct matches found in sessions, repos, or memory)\n");
+    }
+
+    let prompt = format!(
+        "You are answering a question about the user's own work across their projects, past agent sessions, and notes. \
+Using the retrieved context below, answer in clear, concise natural language — a few short paragraphs or tight bullet points, not a data dump. \
+Cite specifics (repo names, files) where useful. If the context is thin, say what you can and note what's missing.\n\n\
+Question: {q}\n\n\
+Retrieved context:\n{ctx}"
+    );
+
+    let cwd = default_cwd();
+    let out = Command::new("claude")
+        .args([
+            "-p",
+            &prompt,
+            "--model",
+            "sonnet",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| format!("claude: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let answer: String = parse_stream(&text)
+        .into_iter()
+        .filter(|e| e.kind == "assistant")
+        .map(|e| e.text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if answer.trim().is_empty() {
+        Err("no answer returned".into())
+    } else {
+        Ok(answer)
+    }
+}
+
+/// Read a window of a file around `line` (0 = whole file), for viewing a hit.
+#[tauri::command]
+fn read_context(path: String, line: u32) -> Result<String, String> {
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let lines: Vec<&str> = text.lines().collect();
+    if line == 0 || lines.len() <= 80 {
+        return Ok(lines.into_iter().take(400).collect::<Vec<_>>().join("\n"));
+    }
+    let l = line as usize;
+    let start = l.saturating_sub(20);
+    let end = (l + 20).min(lines.len());
+    let body = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{:>5}  {}", start + i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(body)
+}
+
+/// Unified retrieval across session transcripts, repo file contents, and the
+/// user's memory. Pure retrieval — it never starts a session.
+#[tauri::command]
+fn search_all(query: String) -> SearchResult {
+    let q = query.trim().to_lowercase();
+    let terms: Vec<&str> = q.split_whitespace().collect();
+    if terms.is_empty() {
+        return SearchResult { sessions: Vec::new(), files: Vec::new(), memory: Vec::new() };
+    }
+
+    let mut sessions: Vec<SearchHit> = fs::read_dir(sessions_dir())
+        .map(|rd| {
+            rd.filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension()? != "json" {
+                    return None;
+                }
+                let s: Session = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+                let events = if s.driver == "stream" {
+                    let text = fs::read_to_string(stream_path(&s.name)).unwrap_or_default();
+                    parse_stream_for(&text, &s.provider)
+                } else {
+                    Vec::new()
+                };
+                let hay_lines: Vec<String> = std::iter::once(s.prompt.clone())
+                    .chain(events.iter().map(|e| e.text.clone()))
+                    .collect();
+                let hay = hay_lines.join("\n").to_lowercase();
+                if !terms.iter().all(|t| hay.contains(t)) {
+                    return None;
+                }
+                let snippet = hay_lines
+                    .iter()
+                    .find(|l| {
+                        let low = l.to_lowercase();
+                        terms.iter().any(|t| low.contains(t))
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| s.prompt.clone());
+                Some(SearchHit {
+                    name: s.name,
+                    provider: s.provider,
+                    label: s.label,
+                    prompt: s.prompt,
+                    created_at: s.created_at,
+                    messages: events.len() as u32,
+                    snippet: short(&snippet),
+                })
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let mut files = Vec::new();
+    for (name, repo) in all_repos() {
+        if files.len() >= 12 {
+            break;
+        }
+        files.extend(grep_repo(&repo, &name, &terms, 4));
+    }
+    files.truncate(12);
+
+    let memory = grep_memory(&terms, 6);
+
+    SearchResult { sessions, files, memory }
+}
+
 #[tauri::command]
 fn start_session(
     provider: String,
@@ -452,19 +1090,44 @@ fn start_session(
         .unwrap()
         .as_secs();
     let name = format!("hv-{created}");
+    let cwd = default_cwd();
+    // Anthropic and OpenAI run through headless structured drivers (exact
+    // transcript + native subagents); other providers keep the TUI path.
+    let driver = if provider == "anthropic" || provider == "openai" {
+        "stream"
+    } else {
+        "tui"
+    };
+    let jsonl = stream_path(&name);
+    let jsonl_s = jsonl.to_string_lossy();
 
     let agent_cmd = match provider.as_str() {
-        "anthropic" => format!("claude --model {} {}", shq(&model), shq(&prompt)),
-        "openai" => format!("codex --model {} {}", shq(&model), shq(&prompt)),
+        "anthropic" => format!(
+            "claude -p {} --model {} --output-format stream-json --verbose >> {} 2>&1",
+            shq(&prompt),
+            shq(&model),
+            shq(&jsonl_s)
+        ),
+        "openai" => format!(
+            "codex exec --json --dangerously-bypass-approvals-and-sandbox -m {} {} >> {} 2>&1",
+            shq(&model),
+            shq(&prompt),
+            shq(&jsonl_s)
+        ),
         _ => format!("opencode --model {} --prompt {}", shq(&model), shq(&prompt)),
     };
     // The tmux server may have been spawned with a bare environment; carry
     // this app's PATH (nvm, homebrew, …) into the session explicitly.
     let path = std::env::var("PATH").unwrap_or_default();
     let cmd = format!("export PATH={}; exec {agent_cmd}", shq(&path));
-    let cwd = default_cwd();
 
+    if driver == "stream" {
+        append_user_prompt(&name, &prompt);
+    }
     tmux(&["new-session", "-d", "-s", &name, "-c", &cwd, &cmd])?;
+    // Keep the pane readable after the agent exits, so sessions that finish
+    // in the background don't vanish with their transcript.
+    let _ = tmux(&["set-option", "-t", &name, "remain-on-exit", "on"]);
 
     let repo = repo_name(&cwd);
     let session = Session {
@@ -475,7 +1138,11 @@ fn start_session(
         prompt,
         created_at: created,
         cwd,
+        driver: driver.into(),
+        session_id: String::new(),
         alive: true,
+        running: true,
+        done: false,
         adds: 0,
         dels: 0,
         branch: String::new(),
@@ -493,7 +1160,7 @@ fn start_session(
 
 #[tauri::command]
 fn list_sessions() -> Vec<Session> {
-    let live = live_sessions();
+    let states = pane_states();
     let mut sessions: Vec<Session> = fs::read_dir(sessions_dir())
         .map(|rd| {
             rd.filter_map(|entry| {
@@ -502,7 +1169,23 @@ fn list_sessions() -> Vec<Session> {
                     return None;
                 }
                 let mut s: Session = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-                s.alive = live.contains(&s.name);
+                let pane_alive = states.get(&s.name).copied() == Some(false);
+                let pane_dead = states.get(&s.name).copied() == Some(true);
+                if s.driver == "stream" {
+                    // A stream session is a resumable conversation: alive as
+                    // long as its log exists, running only while a turn's pane
+                    // is live, and it never "finishes".
+                    s.running = pane_alive;
+                    s.alive = stream_path(&s.name).exists();
+                    s.done = false;
+                    if s.session_id.is_empty() {
+                        s.session_id = read_session_id(&s.name, &s.provider).unwrap_or_default();
+                    }
+                } else {
+                    s.running = pane_alive;
+                    s.alive = pane_alive;
+                    s.done = pane_dead;
+                }
                 if s.cwd.is_empty() {
                     s.cwd = default_cwd();
                 }
@@ -529,18 +1212,31 @@ fn peek_session(name: String) -> Result<Peek, String> {
     }
     let raw = fs::read(sessions_dir().join(format!("{name}.json"))).map_err(|e| e.to_string())?;
     let mut session: Session = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    session.alive = live_sessions().contains(&name);
-    let (blocks, thinking) = if session.alive {
-        let text = tmux(&["capture-pane", "-p", "-t", &name, "-S", "-400"]).unwrap_or_default();
-        (parse_blocks(&text), is_thinking(&text))
+    let pane = pane_states().get(&name).copied();
+    let pane_alive = pane == Some(false);
+
+    let events = if session.driver == "stream" {
+        session.running = pane_alive;
+        session.alive = stream_path(&name).exists();
+        session.done = false;
+        if session.session_id.is_empty() {
+            session.session_id = read_session_id(&name, &session.provider).unwrap_or_default();
+        }
+        let text = fs::read_to_string(stream_path(&name)).unwrap_or_default();
+        parse_stream_for(&text, &session.provider)
     } else {
-        (Vec::new(), false)
+        session.running = pane_alive;
+        session.alive = pane_alive;
+        session.done = pane == Some(true);
+        let blocks = if pane.is_some() {
+            let text = tmux(&["capture-pane", "-p", "-t", &name, "-S", "-400"]).unwrap_or_default();
+            parse_blocks(&text)
+        } else {
+            Vec::new()
+        };
+        blocks_to_events(&blocks)
     };
-    Ok(Peek {
-        session,
-        blocks,
-        thinking,
-    })
+    Ok(Peek { session, events })
 }
 
 #[tauri::command]
@@ -548,16 +1244,55 @@ fn send_prompt(name: String, text: String) -> Result<(), String> {
     if !valid_name(&name) {
         return Err("invalid session name".into());
     }
-    // A newline inside the literal text would submit the TUI input early.
     let text = text.replace(['\n', '\r'], " ").trim().to_string();
     if text.is_empty() {
         return Err("empty prompt".into());
     }
-    if !live_sessions().contains(&name) {
-        return Err("session is not running".into());
+
+    let raw = fs::read(sessions_dir().join(format!("{name}.json"))).map_err(|e| e.to_string())?;
+    let session: Session = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+
+    if session.driver == "stream" {
+        // A stream turn runs to completion and exits; only one at a time.
+        if pane_states().get(&name).copied() == Some(false) {
+            return Err("a turn is still running".into());
+        }
+        let session_id = read_session_id(&name, &session.provider).ok_or("session not ready yet")?;
+        let jsonl = stream_path(&name);
+        let jsonl_s = jsonl.to_string_lossy();
+        let agent = if session.provider == "openai" {
+            format!(
+                "codex exec resume {} {} --json --dangerously-bypass-approvals-and-sandbox >> {} 2>&1",
+                shq(&session_id),
+                shq(&text),
+                shq(&jsonl_s)
+            )
+        } else {
+            format!(
+                "claude -p {} --resume {} --model {} --output-format stream-json --verbose >> {} 2>&1",
+                shq(&text),
+                shq(&session_id),
+                shq(&session.model),
+                shq(&jsonl_s)
+            )
+        };
+        let path = std::env::var("PATH").unwrap_or_default();
+        let cmd = format!("export PATH={}; exec {agent}", shq(&path));
+        append_user_prompt(&name, &text);
+        // Reuse the session name: clear the retired (dead) pane first.
+        let _ = tmux(&["kill-session", "-t", &name]);
+        tmux(&["new-session", "-d", "-s", &name, "-c", &session.cwd, &cmd])?;
+        let _ = tmux(&["set-option", "-t", &name, "remain-on-exit", "on"]);
+        return Ok(());
+    }
+
+    // TUI driver: type into the live pane.
+    match pane_states().get(&name).copied() {
+        Some(false) => {}
+        Some(true) => return Err("session has finished".into()),
+        None => return Err("session is not running".into()),
     }
     tmux(&["send-keys", "-t", &name, "-l", "--", &text])?;
-    // Let the TUI ingest the literal text before the submit keypress.
     std::thread::sleep(std::time::Duration::from_millis(120));
     tmux(&["send-keys", "-t", &name, "Enter"]).map(|_| ())
 }
@@ -570,140 +1305,107 @@ fn kill_session(name: String) -> Result<(), String> {
     tmux(&["kill-session", "-t", &name]).map(|_| ())
 }
 
-// ---------------------------------------------------------------------------
-// GitHub identity
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct GithubUser {
-    login: String,
-    name: String,
-    avatar_url: String,
-}
-
-fn auth_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".hypervisor").join("auth.json")
-}
-
-/// The signed-in user, if any. Identity is app-level: a file we wrote at
-/// sign-in, so signing out forgets it without touching gh's credentials.
-#[tauri::command]
-fn auth_user() -> Option<GithubUser> {
-    let raw = fs::read(auth_path()).ok()?;
-    serde_json::from_slice(&raw).ok()
-}
-
-/// Sign in by borrowing the gh CLI's identity: `gh api user` answers as the
-/// authenticated account. A missing or signed-out gh is a readable error the
-/// sign-in modal shows verbatim.
-#[tauri::command]
-fn sign_in() -> Result<GithubUser, String> {
-    let out = Command::new("gh")
-        .args(["api", "user"])
-        .output()
-        .map_err(|_| "GitHub CLI not found — brew install gh, then gh auth login".to_string())?;
-    if !out.status.success() {
-        return Err("gh is signed out — run `gh auth login` in a terminal, then retry".into());
+/// True for a line that is Claude/agent TUI chrome, not transcript content:
+/// the startup banner (block/braille art, version and model lines), the
+/// spinner/status line, the input hints, and rule separators.
+fn is_chrome(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false; // blank lines are handled by segmentation, not dropped here
     }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("gh api user: {e}"))?;
-    let field = |k: &str| v[k].as_str().unwrap_or_default().to_string();
-    let user = GithubUser {
-        login: field("login"),
-        name: field("name"),
-        avatar_url: field("avatar_url"),
-    };
-    if user.login.is_empty() {
-        return Err("gh answered without a user".into());
+    // Bare input prompt (the empty box), no text after the marker.
+    if matches!(t, "❯" | ">" | "›") {
+        return true;
     }
-    let path = auth_path();
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // Rule separators around the input box.
+    if t.chars().all(|c| matches!(c, '─' | '━' | '═' | '-')) && t.chars().count() > 3 {
+        return true;
     }
-    let json = serde_json::to_vec(&user).map_err(|e| e.to_string())?;
-    fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(user)
+    // Startup banner art (block-drawing / braille glyphs). The version, model
+    // and cwd lines each carry these glyphs, so this clears the whole banner.
+    if t.chars()
+        .any(|c| matches!(c, '\u{2580}'..='\u{259F}' | '\u{2800}'..='\u{28FF}'))
+    {
+        return true;
+    }
+    let markers = [
+        "Claude Code v",
+        "· Claude",
+        "Claude Max",
+        "Claude Pro",
+        "Updated to latest",
+        "code.claude.com",
+        "? for shortcuts",
+        "esc to interrupt",
+        "shift+tab to cycle",
+        "-- INSERT --",
+        "-- NORMAL --",
+        "auto mode on",
+        "for agents",
+    ];
+    if markers.iter().any(|m| t.contains(m)) {
+        return true;
+    }
+    // Spinner / status line: "✻ Cooked for 3s · done 10:52 PM".
+    t.starts_with('✻') || t.starts_with("● ")
 }
 
-#[tauri::command]
-fn sign_out() -> Result<(), String> {
-    match fs::remove_file(auth_path()) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// A live pane is thinking while the CLI shows its working spinner, and the
-/// spinner line is the only one that carries the interrupt hint ("✻ Brewing…
-/// (esc to interrupt)"). The done line drops the hint, so a finished exchange
-/// reads as idle. Only the tail matters: an old hint scrolled up the pane is
-/// history, not state.
-fn is_thinking(text: &str) -> bool {
-    text.lines()
-        .rev()
-        .take(30)
-        .any(|l| l.to_ascii_lowercase().contains("esc to interrupt"))
-}
-
-/// Slice a captured pane into per-exchange blocks (a "> …" prompt line plus
-/// the response that follows it) and keep the last three.
-fn parse_blocks(text: &str) -> Vec<String> {
-    let mut lines: Vec<&str> = text.lines().collect();
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
-    }
-    // Drop the TUI's input box if it's the trailing element of the pane.
-    if let Some(idx) = lines.iter().rposition(|l| l.trim_start().starts_with('╭')) {
-        if lines.len() - idx <= 6 {
-            lines.truncate(idx);
+/// Is this a user-prompt line ("> …", "❯ …", "› …")? Requires text after the
+/// marker so a bare trailing input prompt is not treated as one.
+fn prompt_text(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    for marker in ["> ", "❯ ", "› "] {
+        if let Some(rest) = t.strip_prefix(marker) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(rest);
+            }
         }
     }
-    let cleaned: Vec<&str> = lines
-        .into_iter()
-        .filter(|l| {
-            let t = l.trim();
-            if t.is_empty() {
-                return true;
-            }
-            // Horizontal-rule separators between the transcript and input box.
-            if t.chars().all(|c| matches!(c, '─' | '━' | '═')) {
-                return false;
-            }
-            !(t.contains("? for shortcuts")
-                || t.contains("esc to interrupt")
-                || t.contains("shift+tab to cycle")
-                || t.contains("-- INSERT --")
-                || t.contains("-- NORMAL --")
-                || t.starts_with("● "))
-        })
+    None
+}
+
+/// Slice a captured pane into per-exchange blocks (a user prompt line plus the
+/// response that follows it) and keep the last three. Everything before the
+/// first prompt (the startup banner) is discarded.
+fn parse_blocks(text: &str) -> Vec<String> {
+    let cleaned: Vec<&str> = text
+        .lines()
+        .filter(|l| !is_chrome(l))
         .collect();
 
     let mut blocks: Vec<Vec<&str>> = Vec::new();
     let mut cur: Vec<&str> = Vec::new();
-    for l in cleaned {
-        let t = l.trim_start();
-        if t.starts_with("> ") || t.starts_with("❯ ") || t.starts_with("› ") {
-            if !cur.is_empty() {
-                blocks.push(std::mem::take(&mut cur));
-            }
+    for &l in &cleaned {
+        let is_prompt = prompt_text(l).is_some();
+        if is_prompt && !cur.is_empty() {
+            blocks.push(std::mem::take(&mut cur));
         }
-        cur.push(l);
+        // Only start collecting once we've seen the first real prompt, so the
+        // banner and any pre-prompt noise never become a block.
+        if is_prompt || !cur.is_empty() || !blocks.is_empty() {
+            cur.push(l);
+        }
     }
     if !cur.is_empty() {
         blocks.push(cur);
+    }
+    // No prompt was ever seen (non-claude CLI, or output-only): fall back to
+    // the tail of the cleaned lines so the transcript isn't blank.
+    if blocks.is_empty() {
+        let non_empty: Vec<&str> = cleaned.iter().copied().filter(|l| !l.trim().is_empty()).collect();
+        if !non_empty.is_empty() {
+            blocks.push(non_empty);
+        }
     }
 
     let mut out: Vec<String> = blocks
         .into_iter()
         .map(|b| {
-            // An unsegmented pane comes through as one giant block; cap it.
             let tail: Vec<&str> = b.iter().rev().take(40).rev().copied().collect();
-            tail.join("\n").trim_matches('\n').to_string()
+            tail.join("\n").trim_matches(|c| c == '\n' || c == ' ').to_string()
         })
         .filter(|b| {
-            // Drop empty blocks and the TUI's bare input prompt.
             let t = b.trim();
             !t.is_empty() && t != "❯" && t != ">" && t != "›"
         })
@@ -716,7 +1418,7 @@ fn parse_blocks(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_thinking, parse_blocks};
+    use super::{git, parse_blocks};
 
     // Verbatim capture of a real `claude` pane from the smoke test.
     const PANE: &str = "\
@@ -749,26 +1451,48 @@ mod tests {
         assert!(blocks.iter().all(|b| b.trim() != "❯"));
     }
 
+    // The exact pane the app captured live (banner + spinner + trailing prompt).
+    const LIVE_PANE: &str = "\
+ ▐▛███▛█   Claude Code v2.1.252
+▝▜██████▀  Sonnet 5 · Claude Max
+  ▝▝ ▝▝    ~/git/hv
+❯ Reply with exactly HV_LIVE_OK
+⏺ HV_LIVE_OK
+✻ Cooked for 3s · done 10:52 PM
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents         /rc
+";
+
     #[test]
-    fn finished_pane_is_not_thinking() {
-        // PANE ends on the done line ("✻ Brewed for 1s · done"), no hint.
-        assert!(!is_thinking(PANE));
+    fn strips_all_claude_chrome() {
+        let blocks = parse_blocks(LIVE_PANE);
+        assert_eq!(blocks.len(), 1, "should be exactly one exchange: {blocks:?}");
+        let b = &blocks[0];
+        // Only the prompt and the response survive.
+        assert_eq!(b, "❯ Reply with exactly HV_LIVE_OK\n⏺ HV_LIVE_OK");
+        // No banner, model line, cwd echo, spinner, or box art anywhere.
+        for needle in ["Claude Code", "Claude Max", "Sonnet", "git/hv", "✻", "Cooked", "▐", "▜", "──", "INSERT"] {
+            assert!(!b.contains(needle), "chrome leaked ({needle}): {b:?}");
+        }
     }
 
     #[test]
-    fn spinner_pane_is_thinking() {
-        let pane = PANE.replace(
-            "✻ Brewed for 1s · done 8:32 PM",
-            "✻ Brewing… (esc to interrupt)",
-        );
-        assert!(is_thinking(&pane));
-    }
-
-    #[test]
-    fn scrolled_off_hint_is_history_not_state() {
-        let mut pane = String::from("✻ Brewing… (esc to interrupt)\n");
-        pane.push_str(&"⏺ output line\n".repeat(40));
-        assert!(!is_thinking(&pane));
+    fn pane_state_line_parses_flag_first() {
+        // Format is "#{pane_dead}#{session_name}": leading 0/1 then the name.
+        let parse = |l: &str| -> Option<(String, bool)> {
+            let mut chars = l.chars();
+            let dead = chars.next()? == '1';
+            let name = chars.as_str();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), dead))
+        };
+        assert_eq!(parse("0hv-1788321122"), Some(("hv-1788321122".into(), false)));
+        assert_eq!(parse("1hv-42"), Some(("hv-42".into(), true)));
+        assert_eq!(parse(""), None);
     }
 
     #[test]
@@ -779,11 +1503,126 @@ mod tests {
         assert!(blocks[0].contains("line 99"));
         assert!(!blocks[0].contains("line 10\n"), "should cap to a tail");
     }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    // Exercises the real /branch, /worktree, /diff command functions against a
+    // throwaway repo. One test (not several) because they share the global
+    // DEFAULT_CWD, which parallel tests would race.
+    #[test]
+    fn code_commands_drive_real_git() {
+        let base = std::env::temp_dir().join(format!("hvtest-{}", std::process::id()));
+        let repo = base.join("myrepo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-qm", "init"]);
+
+        *super::DEFAULT_CWD.lock().unwrap() = Some(repo.to_string_lossy().into_owned());
+
+        // /diff — clean, then dirty.
+        assert_eq!(super::working_diff().trim(), "no working changes");
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        assert!(super::working_diff().contains("two"), "diff should show the change");
+
+        // /branch — creates and switches.
+        super::switch_branch("feature-x".into()).expect("switch_branch");
+        let cur = git(&repo.to_string_lossy(), &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert_eq!(cur, "feature-x");
+
+        // Commit the change so worktree add starts clean.
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-qm", "two"]);
+
+        // /worktree — creates a worktree on a new branch and switches cwd to it.
+        let wt = super::create_worktree("wt1".into()).expect("create_worktree");
+        assert!(std::path::Path::new(&wt).is_dir(), "worktree dir exists");
+        assert!(wt.ends_with("myrepo-wt1"), "worktree named <repo>-<name>: {wt}");
+        let wt_branch = git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert_eq!(wt_branch, "wt1");
+        assert_eq!(*super::DEFAULT_CWD.lock().unwrap(), Some(wt.clone()));
+
+        // Bad names are rejected.
+        assert!(super::switch_branch("bad name!".into()).is_err());
+        assert!(super::create_worktree("".into()).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+        *super::DEFAULT_CWD.lock().unwrap() = None;
+    }
+
+    // Seeds a throwaway stream session with a unique token and checks search.
+    #[test]
+    fn search_finds_session_by_content() {
+        let dir = super::sessions_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = format!("hv-searchtest-{}", std::process::id());
+        let token = "ZQXWORDUNIQUE";
+        let json = format!(
+            r#"{{"name":"{name}","provider":"anthropic","model":"sonnet","label":"CLAUDE SONNET","prompt":"debugging the {token} snapshot","created_at":1,"cwd":"/tmp","driver":"stream","session_id":"x","alive":true,"running":false,"done":false,"adds":0,"dels":0,"branch":"","repo":"hv"}}"#
+        );
+        std::fs::write(dir.join(format!("{name}.json")), json).unwrap();
+        let jsonl = format!(
+            "{{\"type\":\"user_prompt\",\"text\":\"debugging the {token} snapshot\"}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"the {token} flush lands after memory\"}}]}}}}\n"
+        );
+        std::fs::write(super::stream_path(&name), jsonl).unwrap();
+
+        let hit = super::search_all(token.into());
+        let mine = hit.sessions.iter().find(|s| s.name == name);
+        assert!(mine.is_some(), "seeded session should be found");
+        let mine = mine.unwrap();
+        assert_eq!(mine.messages, 2, "prompt + assistant reply");
+        assert!(mine.snippet.to_lowercase().contains(&token.to_lowercase()));
+
+        // A term nowhere in the session yields no match for it.
+        let none = super::search_all("nonexistent_kjhgfdsa".into());
+        assert!(none.sessions.iter().all(|s| s.name != name));
+
+        let _ = std::fs::remove_file(dir.join(format!("{name}.json")));
+        let _ = std::fs::remove_file(super::stream_path(&name));
+    }
 }
 
 // ---------------------------------------------------------------------------
 
+/// A GUI app launched from Finder/Spotlight inherits only a minimal PATH
+/// (/usr/bin:/bin), so tmux, claude, codex and git would not resolve. Pull the
+/// real PATH from a login shell and adopt it, unless we clearly already have a
+/// full one (e.g. launched from a terminal / `tauri dev`).
+fn adopt_login_path() {
+    let have = std::env::var("PATH").unwrap_or_default();
+    if have.contains("/opt/homebrew/bin") || have.contains("/.nvm/") {
+        return;
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    if let Ok(out) = Command::new(&shell)
+        .args(["-lic", "printf %s \"$PATH\""])
+        .output()
+    {
+        let path = String::from_utf8_lossy(&out.stdout);
+        let path = path.trim();
+        if !path.is_empty() {
+            std::env::set_var("PATH", path);
+        }
+    }
+}
+
 fn main() {
+    adopt_login_path();
     tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -809,9 +1648,12 @@ fn main() {
             status_info,
             list_dirs,
             set_cwd,
-            auth_user,
-            sign_in,
-            sign_out
+            create_worktree,
+            switch_branch,
+            working_diff,
+            search_all,
+            search_answer,
+            read_context
         ])
         .setup(|app| {
             // Overlay, not an app: no Dock icon, no Cmd-Tab entry.
@@ -888,6 +1730,9 @@ fn main() {
                 .build()?;
             tauri::tray::TrayIconBuilder::with_id("hv-tray")
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+                // Template mode: macOS tints the black glyph to match native
+                // menu bar icons (dark on light bars, light on dark bars).
+                .icon_as_template(true)
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "toggle" => toggle_overlay(app),
